@@ -563,14 +563,25 @@ fn parse_assistant(local_id: &str, line: &Value, out: &mut Vec<AdapterEvent>) {
     let Some(content) = message.and_then(|m| m.get("content")).and_then(Value::as_array) else {
         return;
     };
+    // Narration or hand-back? Only `end_turn` gives the model's turn back;
+    // every other reason — `tool_use` above all, which is the overwhelming
+    // majority of assistant messages — means it kept working, so the text in
+    // this message is mid-turn narration and not an answer. Absent on older
+    // transcripts, and then the question stays unanswered (`None`) rather than
+    // guessed.
+    let turn_final = message
+        .and_then(|m| m.get("stop_reason"))
+        .and_then(Value::as_str)
+        .map(|reason| reason == "end_turn");
     for block in content {
-        parse_assistant_block(local_id, message_id, block, out);
+        parse_assistant_block(local_id, message_id, turn_final, block, out);
     }
 }
 
 fn parse_assistant_block(
     local_id: &str,
     message_id: Option<&str>,
+    turn_final: Option<bool>,
     block: &Value,
     out: &mut Vec<AdapterEvent>,
 ) {
@@ -582,6 +593,7 @@ fn parse_assistant_block(
                     "role": "assistant",
                     "text": block.get("text"),
                     "message_id": message_id,
+                    "turn_final": turn_final,
                 }),
             });
         }
@@ -820,6 +832,61 @@ pub use crate::offsets::OffsetStore;
 #[must_use]
 pub fn default_projects_root() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")).join(".claude").join("projects")
+}
+
+#[cfg(test)]
+mod turn_final_tests {
+    use super::*;
+
+    fn text_payloads(line: &str) -> Vec<Value> {
+        let value: Value = serde_json::from_str(line).expect("valid json line");
+        let mut out = Vec::new();
+        parse_assistant("sess1", &value, &mut out);
+        out.into_iter()
+            .filter_map(|ev| match ev {
+                AdapterEvent::Message { payload, .. } if payload["role"] == "assistant" => {
+                    Some(payload)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tool_use_stop_reason_marks_the_text_as_mid_turn() {
+        // The overwhelming majority of assistant messages look like this:
+        // a sentence of narration followed by the tool call it announces.
+        let payloads = text_payloads(
+            r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[
+                {"type":"text","text":"Final state check before reporting."},
+                {"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}"#,
+        );
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["text"], "Final state check before reporting.");
+        assert_eq!(payloads[0]["turn_final"], Value::Bool(false));
+    }
+
+    #[test]
+    fn an_end_turn_stop_reason_marks_the_text_as_the_hand_back() {
+        let payloads = text_payloads(
+            r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[
+                {"type":"text","text":"Rapport final: tout est vert."}]}}"#,
+        );
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["turn_final"], Value::Bool(true));
+    }
+
+    #[test]
+    fn a_missing_stop_reason_leaves_the_question_unanswered() {
+        // Older transcripts carry no stop_reason; guessing one would either
+        // strand a turn or hand back narration, so the hint stays null.
+        let payloads = text_payloads(
+            r#"{"type":"assistant","message":{"content":[
+                {"type":"text","text":"hello"}]}}"#,
+        );
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["turn_final"], Value::Null);
+    }
 }
 
 #[cfg(test)]

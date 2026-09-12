@@ -237,9 +237,14 @@ fn is_bare_enumeration_marker(line: &str) -> bool {
 /// only a clean turn (no error) qualifies — a crashed or errored child is
 /// never nudged. A turn whose tail was a thinking block is nudged even when
 /// the held final text reads complete: that text is stale mid-turn narration.
+/// So is text the adapter marked mid-turn, however finished it reads — a
+/// sentence like "Final state check before reporting." is a perfectly formed
+/// non-answer, and no wording heuristic would catch it.
 fn should_nudge(outcome: &crate::childwatch::ChildOutcome) -> bool {
     outcome.error.is_none()
-        && (outcome.tail_is_thinking || looks_truncated(outcome.final_text.as_deref()))
+        && (outcome.tail_is_thinking
+            || outcome.final_text_mid_turn
+            || looks_truncated(outcome.final_text.as_deref()))
 }
 
 /// Whether the child has produced any evidence of a running turn: a bound
@@ -719,6 +724,7 @@ mod tests {
             error: err.map(str::to_owned),
             local_id: Some("child-7".into()),
             tail_is_thinking: false,
+            final_text_mid_turn: false,
         };
         let ok = reply_frame(&out(Some("verdict: ship"), None));
         assert_eq!(ok["ok"], json!(true));
@@ -919,6 +925,7 @@ mod tests {
             error: err.map(str::to_owned),
             local_id: Some("child-1".into()),
             tail_is_thinking: false,
+            final_text_mid_turn: false,
         };
         assert!(should_nudge(&outcome(Some("Now I need to verify key claims:"), None)));
         assert!(should_nudge(&outcome(None, None)));
@@ -929,12 +936,30 @@ mod tests {
     }
 
     #[test]
+    fn text_the_adapter_marked_mid_turn_is_nudged_however_complete_it_reads() {
+        // "Final state check before reporting." is a well-formed sentence with
+        // no truncation cue at all: only the stop reason tells it apart from an
+        // answer, which is why the wording heuristic cannot carry this alone.
+        let outcome = |mid_turn: bool, err: Option<&str>| crate::childwatch::ChildOutcome {
+            final_text: Some("Final state check before reporting.".to_owned()),
+            error: err.map(str::to_owned),
+            local_id: Some("child-1".to_owned()),
+            tail_is_thinking: false,
+            final_text_mid_turn: mid_turn,
+        };
+        assert!(should_nudge(&outcome(true, None)));
+        assert!(!should_nudge(&outcome(false, None)));
+        assert!(!should_nudge(&outcome(true, Some("crashed"))));
+    }
+
+    #[test]
     fn a_thinking_tail_nudges_even_when_the_held_text_reads_complete() {
         let outcome = |thinking: bool, err: Option<&str>| ChildOutcome {
             final_text: Some("Verified the fix, all tests pass.".to_owned()),
             error: err.map(str::to_owned),
             local_id: Some("child-1".into()),
             tail_is_thinking: thinking,
+            final_text_mid_turn: false,
         };
         assert!(should_nudge(&outcome(true, None)));
         assert!(!should_nudge(&outcome(false, None)));

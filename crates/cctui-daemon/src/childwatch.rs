@@ -23,6 +23,16 @@ use tokio::sync::Notify;
 /// After a done-classified status, how long to keep waiting for the final
 /// assistant text to land (claude's transcript tail can lag the status poll).
 pub const DONE_TEXT_GRACE: Duration = Duration::from_secs(20);
+/// Grace for a done reading taken while the only text in hand is provably
+/// mid-turn narration (the adapter reported a non-`end_turn` stop reason).
+///
+/// The turn is known to be unfinished, so a done status is a lie until proven
+/// otherwise: the only ways it becomes true are a child that died mid-turn or
+/// a status feed that keeps insisting. Waiting is close to free in the normal
+/// case — the real hand-back lands, [`WatchState::final_text`] stops being
+/// mid-turn, and the watch finishes at once. It only delays reporting a child
+/// that genuinely stopped talking mid-turn.
+pub const MID_TURN_DONE_GRACE: Duration = Duration::from_mins(2);
 /// Trust window for early done readings.
 ///
 /// A done classification observed before the child was ever seen working is
@@ -43,6 +53,11 @@ pub struct ChildOutcome {
     /// The turn's last content was a thinking block: the model planned more
     /// work and stopped, so `final_text` is stale mid-turn narration.
     pub tail_is_thinking: bool,
+    /// `final_text` came from a message the model did not end its turn on
+    /// (a non-`end_turn` stop reason): narration it wrote on its way to a
+    /// tool call, not the answer. Never set for an adapter that does not
+    /// report stop reasons.
+    pub final_text_mid_turn: bool,
 }
 
 /// Which event set `blocked`: a resolution clears only its own kind, so a
@@ -56,6 +71,9 @@ enum BlockKind {
 }
 
 /// Everything observed about a watched child so far.
+// Four flags, each answering a different question about the same stream; a
+// struct of enums would hide rather than clarify what each one records.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 struct WatchState {
     local_id: Option<String>,
@@ -69,6 +87,7 @@ struct WatchState {
     ended: bool,
     error: Option<String>,
     tail_is_thinking: bool,
+    final_text_mid_turn: bool,
     tool_errors: u32,
     tokens: u64,
 }
@@ -81,6 +100,7 @@ struct Watch {
 
 /// A point-in-time copy of a watch, plus its age. All policy questions are
 /// answered off this via [`ChildSnapshot::assess`].
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct ChildSnapshot {
     pub local_id: Option<String>,
@@ -94,6 +114,7 @@ pub struct ChildSnapshot {
     error: Option<String>,
     registered_at: Instant,
     tail_is_thinking: bool,
+    final_text_mid_turn: bool,
     tool_errors: u32,
     tokens: u64,
 }
@@ -114,16 +135,24 @@ impl ChildSnapshot {
             error: self.error.clone(),
             local_id: self.local_id.clone(),
             tail_is_thinking: self.tail_is_thinking,
+            final_text_mid_turn: self.final_text_mid_turn,
         }
     }
 
     /// Decide whether the child counts as finished right now.
     ///
     /// Finished when the session ended (or its spawn failed), or when a
-    /// done-classified status has settled: immediately once the final text is
-    /// in, after [`DONE_TEXT_GRACE`] without one, and never off a quiet early
-    /// done reading (see [`QUIET_DONE_MIN_AGE`]) unless text already proves
-    /// the turn ran.
+    /// done-classified status has settled: immediately once a turn-final text
+    /// is in, after [`DONE_TEXT_GRACE`] without one, and never off a quiet
+    /// early done reading (see [`QUIET_DONE_MIN_AGE`]) unless text already
+    /// proves the turn ran.
+    ///
+    /// Text known to be mid-turn narration does not settle anything: a turn
+    /// the model is still in cannot be finished by a status poll that reads
+    /// idle between a tool result and the next block, so that case waits out
+    /// [`MID_TURN_DONE_GRACE`] instead. Without this, the parent gets the
+    /// sentence the child wrote on its way to a tool call instead of its
+    /// report, and the report itself is never delivered.
     #[must_use]
     pub fn assess(&self, now: Instant) -> Assessment {
         if self.ended || self.error.is_some() {
@@ -137,9 +166,12 @@ impl ChildSnapshot {
             let trusted = self.saw_working
                 || self.final_text.is_some()
                 || now.duration_since(self.registered_at) >= QUIET_DONE_MIN_AGE;
-            if trusted
-                && (self.final_text.is_some() || now.duration_since(done_at) >= DONE_TEXT_GRACE)
-            {
+            // Mid-turn narration is not an answer, so it neither settles the
+            // done reading nor shortens its grace.
+            let text_settles = self.final_text.is_some() && !self.final_text_mid_turn;
+            let grace =
+                if self.final_text_mid_turn { MID_TURN_DONE_GRACE } else { DONE_TEXT_GRACE };
+            if trusted && (text_settles || now.duration_since(done_at) >= grace) {
                 return Assessment::Finished(self.outcome());
             }
         }
@@ -265,6 +297,7 @@ impl ChildWatch {
             error: w.state.error.clone(),
             registered_at: w.registered_at,
             tail_is_thinking: w.state.tail_is_thinking,
+            final_text_mid_turn: w.state.final_text_mid_turn,
             tool_errors: w.state.tool_errors,
             tokens: w.state.tokens,
         })
@@ -419,6 +452,7 @@ fn apply_status(
 fn apply_message(w: &mut Watch, payload: &serde_json::Value) {
     if let Some(text) = assistant_text(payload) {
         w.state.final_text = Some(text);
+        w.state.final_text_mid_turn = is_mid_turn(payload);
         w.state.tail_is_thinking = false;
         w.notify.notify_waiters();
     } else if is_thinking_message(payload) {
@@ -432,8 +466,19 @@ fn apply_message(w: &mut Watch, payload: &serde_json::Value) {
         w.state.final_text = None;
         w.state.done_since = None;
         w.state.tail_is_thinking = false;
+        w.state.final_text_mid_turn = false;
         w.state.tool_errors = 0;
     }
+}
+
+/// Whether an assistant message is one the model did not end its turn on.
+///
+/// Reads the adapter's `turn_final` hint: `false` means a stop reason other
+/// than `end_turn` (claude's `tool_use`, above all), so the text is narration
+/// on the way to a tool call. Missing or null — every adapter that does not
+/// report stop reasons — answers `false` here, keeping the old behaviour.
+fn is_mid_turn(payload: &serde_json::Value) -> bool {
+    payload.get("turn_final").and_then(serde_json::Value::as_bool) == Some(false)
 }
 
 fn apply_tool_use(w: &mut Watch, payload: &serde_json::Value) {
@@ -613,6 +658,30 @@ mod tests {
         }
     }
 
+    /// An assistant text block the model wrote on its way to a tool call:
+    /// claude reports `stop_reason: "tool_use"` for it.
+    fn narration(local_id: &str, text: &str) -> AdapterEvent {
+        AdapterEvent::Message {
+            local_id: local_id.to_owned(),
+            payload: json!({ "role": "assistant", "text": text, "turn_final": false }),
+        }
+    }
+
+    /// An assistant text block the model ended its turn on (`end_turn`).
+    fn handback(local_id: &str, text: &str) -> AdapterEvent {
+        AdapterEvent::Message {
+            local_id: local_id.to_owned(),
+            payload: json!({ "role": "assistant", "text": text, "turn_final": true }),
+        }
+    }
+
+    fn tool(local_id: &str, name: &str) -> AdapterEvent {
+        AdapterEvent::ToolUse {
+            local_id: local_id.to_owned(),
+            payload: json!({ "tool": name, "kind": "tool_use" }),
+        }
+    }
+
     fn status(
         local_id: &str,
         tempo: Option<&str>,
@@ -670,6 +739,86 @@ mod tests {
         watch.observe(&status("child-1", None, Some("done"), Some("success")));
         let out = finished(&h).expect("done status + text must finish the watch");
         assert_eq!(out.final_text.as_deref(), Some("report: all good"));
+    }
+
+    #[test]
+    fn a_done_reading_over_mid_turn_narration_does_not_finish_the_watch() {
+        // The incident of 2026-09-12, in the order it happened: the child
+        // narrates ("Final state check before reporting."), calls a tool, and
+        // while it is composing its report the control socket reads idle.
+        // That done status used to finish the watch instantly, handing the
+        // parent the narration — and the report that landed 21 s later went
+        // to nobody.
+        let watch = Arc::new(ChildWatch::default());
+        let h = watch.register("child-1");
+        watch.observe(&started("child-1", None));
+        watch.observe(&status("child-1", Some("active"), Some("working"), None));
+        watch.observe(&narration("child-1", "Final state check before reporting."));
+        watch.observe(&tool("child-1", "Bash"));
+        watch.observe(&status("child-1", None, Some("done"), Some("success")));
+        assert!(
+            finished(&h).is_none(),
+            "narration plus a done reading must not pass for a finished turn",
+        );
+
+        watch.observe(&handback("child-1", "Clean tree. ## Rapport ..."));
+        let out = finished(&h).expect("the turn-final text finishes the watch at once");
+        assert_eq!(out.final_text.as_deref(), Some("Clean tree. ## Rapport ..."));
+        assert!(!out.final_text_mid_turn);
+    }
+
+    #[test]
+    fn mid_turn_narration_is_given_up_on_only_after_the_long_grace() {
+        // A child that really does stop talking mid-turn still has to be
+        // reported, so the done reading wins eventually — just not on
+        // DONE_TEXT_GRACE, which is the window the incident fell inside.
+        let watch = Arc::new(ChildWatch::default());
+        let h = watch.register("child-1");
+        watch.observe(&started("child-1", None));
+        watch.observe(&status("child-1", Some("active"), Some("working"), None));
+        watch.observe(&narration("child-1", "Checking the state before reporting."));
+        watch.observe(&status("child-1", None, Some("done"), Some("success")));
+        let snap = h.snapshot().unwrap();
+        let short = Instant::now() + DONE_TEXT_GRACE + Duration::from_secs(1);
+        assert!(
+            matches!(snap.assess(short), Assessment::Running(_)),
+            "the plain text grace must not release mid-turn narration",
+        );
+        let long = Instant::now() + MID_TURN_DONE_GRACE + Duration::from_secs(1);
+        let Assessment::Finished(out) = snap.assess(long) else {
+            panic!("a child silent past MID_TURN_DONE_GRACE must be reported");
+        };
+        assert!(out.final_text_mid_turn, "the parent must be told the text is not an answer");
+    }
+
+    #[test]
+    fn an_adapter_that_reports_no_stop_reason_keeps_the_old_behaviour() {
+        // codex and opencode send no turn_final hint. Their text must still
+        // settle a done reading immediately, exactly as before.
+        let watch = Arc::new(ChildWatch::default());
+        let h = watch.register("child-1");
+        watch.observe(&started("child-1", None));
+        watch.observe(&status("child-1", Some("active"), Some("working"), None));
+        watch.observe(&msg("child-1", "assistant", "report: all good"));
+        watch.observe(&status("child-1", None, Some("done"), Some("success")));
+        let out = finished(&h).expect("text with no stop reason still finishes the watch");
+        assert_eq!(out.final_text.as_deref(), Some("report: all good"));
+        assert!(!out.final_text_mid_turn);
+    }
+
+    #[test]
+    fn a_follow_up_prompt_clears_the_mid_turn_mark() {
+        let watch = Arc::new(ChildWatch::default());
+        let h = watch.register("child-1");
+        watch.observe(&started("child-1", None));
+        watch.observe(&narration("child-1", "checking one thing first"));
+        watch.observe(&msg("child-1", "user", "write the report now"));
+        watch.observe(&status("child-1", Some("active"), Some("working"), None));
+        watch.observe(&msg("child-1", "assistant", "the report"));
+        watch.observe(&status("child-1", None, Some("done"), Some("success")));
+        let out = finished(&h).expect("a new turn's text must settle the watch");
+        assert_eq!(out.final_text.as_deref(), Some("the report"));
+        assert!(!out.final_text_mid_turn);
     }
 
     #[test]

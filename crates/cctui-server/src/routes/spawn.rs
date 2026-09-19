@@ -771,7 +771,7 @@ pub async fn launch_draft(
         })?;
         let refused = |code: StatusCode, error: String| (code, Json(ApiError { error }));
         match outcome {
-            LaunchOutcome::Launched => {}
+            LaunchOutcome::Sent => {}
             // Nothing sent: it stays queued and the reaper tries again.
             LaunchOutcome::Retry(why) => {
                 return Err(refused(

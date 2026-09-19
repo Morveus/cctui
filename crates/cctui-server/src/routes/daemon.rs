@@ -1200,6 +1200,9 @@ async fn handle_event(
             if !ok {
                 tracing::warn!(%command_id, ?error, "command failed on daemon");
             }
+            // The receipt a queued launch waits for: until it lands, its
+            // request stays in the queue (a no-op for every other command).
+            crate::admission::settle_receipt(state, command_id, ok, error.as_deref()).await;
             let pending = state.pending_commands.remove(&command_id).map(|(_, c)| c);
             let mut session_id = pending.as_ref().and_then(|c| c.session_id.clone());
             // A spawn that never started has no row of its own: write one so

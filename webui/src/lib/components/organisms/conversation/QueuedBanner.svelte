@@ -30,8 +30,10 @@
 			// page turns into it; other adapters mint their own id.
 			if (session.adapter_id !== 'claude-code') onclose();
 		} catch (e) {
+			// A 409 on a session in doubt is the server refusing to guess, not
+			// "already launching": show what it said rather than a wrong reason.
 			toasts.error(
-				e instanceof ApiError && e.status === 409
+				e instanceof ApiError && e.status === 409 && !doubt
 					? m.queued_toast_launch_conflict()
 					: m.queued_toast_launch_failed({ error: errMessage(e) })
 			);
@@ -45,7 +47,7 @@
 		busy = true;
 		try {
 			await actions.discardDraft(session.id);
-			toasts.ok(m.queued_toast_discarded());
+			toasts.ok(doubt ? m.queued_toast_dropped() : m.queued_toast_discarded());
 			onclose();
 		} catch (e) {
 			toasts.error(m.queued_toast_discard_failed({ error: errMessage(e) }));
@@ -59,7 +61,7 @@
 <div class="queued" data-journey="queued-banner">
 	<Callout
 		tone={doubt ? 'danger' : 'warn'}
-		icon={doubt ? 'alert-triangle' : 'clock'}
+		icon={doubt ? 'alert' : 'clock'}
 		title={doubt ? m.queued_uncertain_title() : m.queued_banner_title()}
 	>
 		<Stack gap="var(--sp-2)">
@@ -86,7 +88,7 @@
 					{doubt ? m.queued_launch_anyway() : m.queued_launch_now()}
 				</Button>
 				<Button size="sm" disabled={busy} onclick={() => (confirming = 'discard')}>
-					{m.queued_cancel()}
+					{doubt ? m.queued_drop() : m.queued_cancel()}
 				</Button>
 			</Cluster>
 		{/snippet}
@@ -108,9 +110,9 @@
 	<ConfirmModal
 		open
 		tone="danger"
-		title={m.queued_confirm_discard_title()}
-		message={m.queued_confirm_discard_body()}
-		confirmLabel={m.queued_cancel()}
+		title={doubt ? m.queued_confirm_drop_title() : m.queued_confirm_discard_title()}
+		message={doubt ? m.queued_confirm_drop_body() : m.queued_confirm_discard_body()}
+		confirmLabel={doubt ? m.queued_drop() : m.queued_cancel()}
 		cancelLabel={m.queued_keep_waiting()}
 		{busy}
 		onconfirm={discard}

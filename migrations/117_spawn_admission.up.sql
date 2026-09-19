@@ -22,15 +22,21 @@ CREATE TABLE IF NOT EXISTS spawn_queue (
     -- 'waiting'   : nothing sent, the reaper may launch it;
     -- 'sending'   : an attempt is in flight. Written and committed BEFORE the
     --               command is sent, so no second attempt can start;
-    -- 'uncertain' : the send broke, or the server died mid-attempt: nobody can
-    --               tell whether the daemon got it. The request is kept as is,
-    --               never sent again on its own, and a human settles it.
+    -- 'sent'      : the command was handed to the daemon's connection, which
+    --               is not proof it arrived: the request is KEPT until the
+    --               daemon's receipt for its command_id, or until its session
+    --               registers;
+    -- 'uncertain' : nobody can tell whether the machine got it (send broke,
+    --               server died mid-attempt, no receipt in time). The request
+    --               is kept as is, never sent again on its own, and a human
+    --               settles it.
     state         TEXT NOT NULL DEFAULT 'waiting'
-                  CHECK (state IN ('waiting', 'sending', 'uncertain')),
-    -- When the in-flight attempt started, for the reaper to settle the ones
-    -- whose server died.
-    sending_since TIMESTAMPTZ
+                  CHECK (state IN ('waiting', 'sending', 'sent', 'uncertain')),
+    -- When the attempt started, for the reaper to settle the ones left in
+    -- flight or unacknowledged.
+    attempt_since TIMESTAMPTZ
 );
+CREATE INDEX IF NOT EXISTS idx_spawn_queue_command ON spawn_queue (command_id);
 CREATE INDEX IF NOT EXISTS idx_spawn_queue_machine ON spawn_queue (machine_uuid, queued_at);
 
 -- Launches let through on a machine with a ceiling, so a burst is judged on

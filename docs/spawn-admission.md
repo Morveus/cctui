@@ -37,31 +37,38 @@ a disabling or a demotion in the meantime applies.
 One launch is sent **at most once**. A row is marked `sending` (committed)
 before anything goes out, and a row in that state is never picked up again.
 
-What cannot be decided from the server alone is whether a **broken send**
-reached the daemon: the frame may have been delivered and the answer lost. Such
-a launch is not called a failure and is not silently dropped: the row goes to
-`uncertain`, keeping the whole request, and the session shows **Launch outcome
-unknown** with what to do. The same happens when the server dies mid-send (the
-reaper settles it after 10 minutes).
+Handing the command to the daemon's connection is **not** proof that it
+arrived: that is an in-memory channel, and the server can die before the socket
+flushes, or the daemon before it acts. So the request is kept, in `sent`, until
+one of two proofs:
+
+- the daemon's **receipt** for that launch's `command_id` (an `ok` settles it,
+  a refusal ends the session with what the daemon said);
+- its **session registering** under the queued id (claude-code launches under
+  the id its row was shown with).
+
+Anything else leaves an outcome nobody can decide: a send that broke, a server
+that died mid-attempt, a receipt that never came (10 minutes). Such a launch is
+never called a failure and never silently dropped: the row goes to `uncertain`,
+keeping the whole request, and the session shows **Launch outcome unknown**
+with what to do.
 
 Recovery, in that case:
 
 1. check the machine (is a session already doing that work?);
-2. if it did start, **cancel** the waiting one, it is only a placeholder;
+2. if it did start, **stop tracking** the waiting request. That only removes it
+   from cctui: a session already running on the machine keeps running, and you
+   stop it there if you do not want it;
 3. if it did not, **launch again** from the session's page. That is the only
    thing that sends an uncertain launch a second time, and it is a human
    decision, because doing it blindly could create a duplicate.
 
-A session that did start reconciles its own placeholder: when a session
-registers under the queued id (claude-code), the reaper settles the row as
-launched rather than inventing a failure. Codex mints its own thread id, so an
-uncertain codex launch waits for that human check.
-
 **Not covered yet.** Making this automatic for every adapter needs the daemon to
 deduplicate a repeated `command_id` (persisted across its own restarts) and to
 stamp the session it starts with that id. The `command_id` is already stored
-with the queued row and stays the same across attempts, which is what such a
-daemon would key on.
+with the queued row, indexed, and stays the same across attempts, which is what
+such a daemon would key on. With it, an uncertain launch could simply be sent
+again, and a codex session could be tied back to its request.
 
 ## What does not go through the queue
 

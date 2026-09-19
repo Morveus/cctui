@@ -567,7 +567,8 @@ mod tests {
     #[tokio::test]
     async fn decide_against_the_database() {
         let Some(url) = crate::routes::gateway::test_db_url("admission_decide") else { return };
-        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
+        let pool =
+            sqlx::postgres::PgPoolOptions::new().max_connections(2).connect(&url).await.unwrap();
 
         // No ceiling: admitted, and nothing is recorded.
         let free = machine(&pool, 60, None).await;
@@ -616,11 +617,12 @@ mod tests {
 
         // Deleting the placeholder takes its payload with it.
         sqlx::query("DELETE FROM sessions WHERE id = $1").bind(&sid).execute(&pool).await.unwrap();
-        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM spawn_queue WHERE session_id = $1")
-            .bind(&sid)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let left: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM spawn_queue WHERE session_id = $1")
+                .bind(&sid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(left, 0);
 
         // A silent daemon: no fresh snapshot, so the ceiling cannot be judged.

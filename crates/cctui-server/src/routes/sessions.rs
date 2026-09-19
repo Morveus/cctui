@@ -1754,6 +1754,33 @@ pub async fn send_message(
     Path(session_id): Path<String>,
     Json(req): Json<MessageRequest>,
 ) -> Result<(StatusCode, Json<cctui_proto::api::SpawnResponse>), (StatusCode, Json<ApiError>)> {
+    // A Task-tool subagent is observe-only: it has no worker of its own (the
+    // parent's `Task` call drives it), so no adapter can ever deliver a reply
+    // to it. Accepting one with a 202 claimed a message had been queued while
+    // nothing was written anywhere — the janitor's revive loop burned its
+    // retries on rows that could not answer (claudo/inbox#210). Refuse, and
+    // name the parent, which IS addressable.
+    let subagent: Option<(bool, Option<String>)> = sqlx::query_as(
+        "SELECT COALESCE(metadata->>'subagent', 'false') = 'true', parent_id \
+         FROM sessions WHERE id = $1",
+    )
+    .bind(&session_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+    if let Some((true, parent)) = subagent {
+        let hint = parent
+            .map_or_else(String::new, |p| format!(" Send it to its parent session {p} instead."));
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: format!(
+                    "session {session_id} is a Task subagent and has no worker to \
+                     receive a message.{hint}"
+                ),
+            }),
+        ));
+    }
     // Carry re-minted gateway env so a reply-driven cold-resume revives the
     // worker with a fresh valid token rather than empty env.
     let env = crate::routes::gateway::resume_env_for_session(&state, &session_id).await;

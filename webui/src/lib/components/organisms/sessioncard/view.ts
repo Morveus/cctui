@@ -101,6 +101,8 @@ export function statusLabel(st: string): string {
 			return m.sessions_status_dead();
 		case 'draft':
 			return m.sessions_status_draft();
+		case 'queued':
+			return m.sessions_status_queued();
 		default:
 			return st;
 	}
@@ -138,7 +140,7 @@ export function buildView(
 		livenessClass: livenessClassOf(s, stale),
 		needsInput: s.attention === 'needs_input' && s.status !== 'archived',
 		end: sessionEnd(s),
-		showStatusBadge: s.status === 'new' || s.status === 'archived',
+		showStatusBadge: s.status === 'new' || s.status === 'archived' || s.status === 'queued',
 		branch: branchOf(s),
 		remote: remoteOf(s),
 		prLinks: prLinksOf(s),

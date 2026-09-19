@@ -2,11 +2,13 @@
 	// Settings › Resource monitoring: every machine this instance has a daemon
 	// on, one checkbox each. A ticked machine gets a CPU / memory / disk gauge
 	// in the header strip (ResourceBattery). The list is the same query the
-	// strip reads, so the figures shown here are the live ones.
+	// strip reads, so the figures shown here are the live ones. Each machine also
+	// carries its RAM ceiling for spawns (MemCeilingField).
 	import { Checkbox, Text } from '@dorsk/tsumikit';
 	import SettingGroup from '$lib/components/molecules/SettingGroup.svelte';
 	import SettingRow from '$lib/components/molecules/SettingRow.svelte';
 	import SettingSection from '$lib/components/molecules/SettingSection.svelte';
+	import MemCeilingField from './MemCeilingField.svelte';
 	import { useMachineResources } from '$lib/queries';
 	import { settings } from '$lib/settings.svelte';
 	import { m } from '$lib/paraglide/messages';
@@ -59,9 +61,11 @@
 								>
 								<Text size="xs" tone="faint">{summary(r)}</Text>
 							</span>
+							<MemCeilingField row={r} />
 						</li>
 					{/each}
 				</ul>
+				<div class="ceiling-help"><Text size="xs" tone="faint">{m.settings_mem_ceiling_help()}</Text></div>
 			{/if}
 		</SettingRow>
 	</SettingGroup>
@@ -81,6 +85,9 @@
 		flex-wrap: wrap;
 		align-items: center;
 		gap: var(--sp-1) var(--sp-3);
+	}
+	.ceiling-help {
+		margin: var(--sp-2) 0 0;
 	}
 	.meta {
 		display: inline-flex;

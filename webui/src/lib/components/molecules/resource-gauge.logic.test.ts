@@ -34,6 +34,7 @@ const row = (
   liveness: "online",
   resources: r,
   updated_at: r ? "2026-09-06T10:00:00Z" : null,
+  mem_ceiling_bytes: null,
 });
 
 describe("resourceTone", () => {
@@ -104,6 +105,11 @@ describe("pinnedRows / patchRow", () => {
     expect(out[0].updated_at).toBe("2026-09-06T11:00:00Z");
     expect(out[1]).toBe(rows[1]);
     expect(patchRow(undefined, "a", res(1, 1, 1), "x")).toBeUndefined();
+  });
+  it("keeps the RAM ceiling a live snapshot does not carry", () => {
+    const rows = [{ ...row("a", null), mem_ceiling_bytes: 48 * 1024 ** 3 }];
+    const out = patchRow(rows, "a", res(1, 1, 1), "2026-09-06T11:00:00Z");
+    expect(out?.[0].mem_ceiling_bytes).toBe(48 * 1024 ** 3);
   });
 });
 

@@ -379,6 +379,9 @@ export const sectionsOf = (s: SessionListItem): Section[] => {
 	if (s.status === 'archived') return owner === 'live' ? ['archived'] : ['archived', owner];
 	return [owner];
 };
+/** Queued spawns in the order the server launches them: oldest first. */
+export const queueOrder = (rows: SessionListItem[]): SessionListItem[] =>
+	[...rows].sort((a, b) => (a.registered_at ?? '').localeCompare(b.registered_at ?? ''));
 export const inEnabledSections = (s: SessionListItem, sections: Set<Section>): boolean =>
 	sectionsOf(s).every((sec) => sections.has(sec));
 

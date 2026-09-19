@@ -12,6 +12,7 @@
 	import { toasts } from '$lib/toast.svelte';
 	import { ws } from '$lib/ws.svelte';
 	import { m } from '$lib/paraglide/messages';
+	import { isQueuedSpawn, notifyQueuedSpawn } from '$lib/memCeiling';
 	import { macroProblems, spawnBodyFor } from './macros.logic';
 
 	const actions = useSessionActions();
@@ -39,6 +40,12 @@
 		running = mac.id;
 		try {
 			const res = await actions.spawn(spawnBodyFor(mac), []);
+			if (isQueuedSpawn(res)) {
+				// Held back by the machine's RAM ceiling: nothing to wait for.
+				notifyQueuedSpawn(res);
+				if (res.session_id) void goto(`/sessions/${res.session_id}`);
+				return;
+			}
 			toasts.info(m.macros_toast_started({ title: mac.title }));
 			const result = await ws.awaitSpawn(res.command_id, res.session_id);
 			if (result.ok && res.session_id) {

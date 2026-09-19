@@ -78,6 +78,7 @@ export type * from './MachineResourcesRow';
 export type * from './MachineResources';
 export type * from './MachineRow';
 export type * from './MarkViewedRequest';
+export type * from './MemCeilingRequest';
 export type * from './MeResponse';
 export type * from './MessagePin';
 export type * from './MessageRequest';

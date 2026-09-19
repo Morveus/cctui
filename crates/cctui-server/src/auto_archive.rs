@@ -112,7 +112,7 @@ pub async fn sweep(state: &AppState) {
     let rows = match sqlx::query_as::<_, SignalRow>(
         "SELECT id, tempo, agent_state, activity, soft_limit_reason FROM sessions \
          WHERE metadata->>'auto_archive' = 'true' \
-           AND status NOT IN ('archived', 'draft') \
+           AND status NOT IN ('archived', 'draft', 'queued') \
          LIMIT $1",
     )
     .bind(BATCH)

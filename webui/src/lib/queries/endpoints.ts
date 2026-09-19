@@ -21,6 +21,7 @@ import type { DispatchResponse } from "@bindings/DispatchResponse";
 import type { UserRow } from "@bindings/UserRow";
 import type { MachineRow } from "@bindings/MachineRow";
 import type { MachineResourcesRow } from "@bindings/MachineResourcesRow";
+import type { MemCeilingRequest } from "@bindings/MemCeilingRequest";
 import type { UserTokenRow } from "@bindings/UserTokenRow";
 import type { UserAclsResponse } from "@bindings/UserAclsResponse";
 import type { ApiKeyRow } from "@bindings/ApiKeyRow";
@@ -418,6 +419,12 @@ export const endpoints = {
    *  and the header gauge. */
   machineResources: () =>
     api.get<MachineResourcesRow[]>("/machines/resources"),
+  /** RAM ceiling for spawns on one machine; `null` removes it. Spawns over
+   *  it wait in a queue (`queued` sessions) until memory frees up. */
+  setMemCeiling: (machineId: string, bytes: number | null) =>
+    api.put<void>(`/machines/${machineId}/mem-ceiling`, {
+      mem_ceiling_bytes: bytes,
+    } satisfies MemCeilingRequest),
   /** Every spawnable machine across all active users — for the spawn picker.
    * Excludes server-managed machines (`ephemeral` worker pods and the per-user
    * `dispatch` machine): those aren't somewhere you'd start an interactive

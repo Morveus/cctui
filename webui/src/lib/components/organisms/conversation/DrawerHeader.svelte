@@ -8,6 +8,7 @@
 	import type { SessionListItem } from '@bindings/SessionListItem';
 	import type { Label } from '@bindings/Label';
 	import { statusBadgeTone } from '$lib/format';
+	import { statusLabel } from '../sessioncard/view';
 	import { sessionEnd, sessionEndTitle } from '$lib/sessionEnd';
 	import { branchOf } from '../../../../routes/sessions/sessions.logic';
 	import { fontScale, SCALE_LEVELS } from '$lib/fontscale.svelte';
@@ -332,7 +333,7 @@
 		</div>
 	{/if}
 	<div class="hmeta row row-wrap" data-journey="head-meta">
-		{#if showStatusBadge}<Badge tone={statusBadgeTone(session.status)}>{session.status}</Badge>{/if}
+		{#if showStatusBadge}<Badge tone={statusBadgeTone(session.status)}>{statusLabel(session.status)}</Badge>{/if}
 		{#if end}<Badge tone={end.tone} title={sessionEndTitle(end)} style={end.muted ? 'opacity:0.6' : undefined}>{end.label}</Badge>{/if}
 		<WorkingDir path={session.working_dir} copy title={m.sessions_workdir_copy_title({ path: session.working_dir })} />
 		{#if branch}

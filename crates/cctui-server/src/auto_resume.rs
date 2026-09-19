@@ -151,7 +151,7 @@ const STUCK_SELECT: &str = "WITH last_err AS ( \
      FROM last_err le \
      JOIN sessions s ON s.id = le.session_id \
      LEFT JOIN session_auto_resume r ON r.session_id = le.session_id \
-     WHERE s.status NOT IN ('archived', 'ended', 'failed', 'draft') \
+     WHERE s.status NOT IN ('archived', 'ended', 'failed', 'draft', 'queued') \
        AND COALESCE((SELECT us.data->'autoResumeOnConnectionLoss' = 'true'::jsonb \
                      FROM user_settings us WHERE us.user_id = s.user_id), false) \
        AND NOT EXISTS ( \

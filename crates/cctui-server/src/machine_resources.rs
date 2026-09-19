@@ -73,6 +73,10 @@ pub struct MachineResourcesRow {
     pub resources: Option<MachineResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
+    /// RAM ceiling for spawns on this machine, in bytes. `None` = no ceiling
+    /// (the default): spawns are never held back.
+    #[ts(type = "number | null")]
+    pub mem_ceiling_bytes: Option<u64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -92,6 +96,7 @@ struct Row {
     disk_path: Option<String>,
     load1: Option<f32>,
     updated_at: Option<DateTime<Utc>>,
+    mem_ceiling_bytes: Option<i64>,
 }
 
 /// `GET /api/v1/machines/resources`: the caller's persistent, non-revoked
@@ -104,7 +109,7 @@ pub async fn list(
         "SELECT m.id, m.name, m.display_name, m.hue, m.last_seen_at, \
                 r.cpu_pct, r.mem_pct, r.mem_used_bytes, r.mem_total_bytes, \
                 r.disk_pct, r.disk_used_bytes, r.disk_total_bytes, r.disk_path, r.load1, \
-                r.updated_at \
+                r.updated_at, m.mem_ceiling_bytes \
          FROM machines m LEFT JOIN machine_resources r ON r.machine_id = m.id \
          WHERE (m.user_id = $1 OR $2) AND m.kind = 'persistent' \
            AND m.revoked_at IS NULL AND m.deleted_at IS NULL \
@@ -136,10 +141,58 @@ pub async fn list(
                 liveness: crate::machine_liveness::derive(r.last_seen_at),
                 resources,
                 updated_at: r.updated_at,
+                mem_ceiling_bytes: r.mem_ceiling_bytes.map(|b| b.max(0).unsigned_abs()),
             }
         })
         .collect();
     Ok(Json(out))
+}
+
+/// Body of `PUT /api/v1/machines/{id}/mem-ceiling`.
+#[derive(Debug, serde::Deserialize, TS)]
+#[ts(export)]
+pub struct MemCeilingRequest {
+    /// Bytes; `null` removes the ceiling.
+    #[ts(type = "number | null")]
+    pub mem_ceiling_bytes: Option<u64>,
+}
+
+/// Smallest ceiling accepted: below one session's estimate nothing would ever
+/// launch, which is a typo, not a policy.
+const MIN_CEILING_BYTES: u64 = crate::admission::SESSION_ESTIMATE_BYTES;
+
+/// `PUT /api/v1/machines/{id}/mem-ceiling`: the machine's owner (or an admin)
+/// sets the RAM ceiling above which spawns wait in the queue, or clears it.
+pub async fn set_mem_ceiling(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    axum::extract::Path(machine_id): axum::extract::Path<Uuid>,
+    Json(req): Json<MemCeilingRequest>,
+) -> Result<axum::http::StatusCode, AppError> {
+    if let Some(b) = req.mem_ceiling_bytes
+        && b < MIN_CEILING_BYTES
+    {
+        return Err(AppError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("mem_ceiling_bytes must be at least {MIN_CEILING_BYTES} (one session)"),
+        ));
+    }
+    let ceiling = req.mem_ceiling_bytes.map(|b| i64::try_from(b).unwrap_or(i64::MAX));
+    let res = sqlx::query(
+        "UPDATE machines SET mem_ceiling_bytes = $1 \
+         WHERE id = $2 AND (user_id = $3 OR $4) AND deleted_at IS NULL",
+    )
+    .bind(ceiling)
+    .bind(machine_id)
+    .bind(ctx.user_id)
+    .bind(ctx.is_admin())
+    .execute(&state.pool)
+    .await?;
+    if res.rows_affected() == 0 {
+        return Err(AppError::new(axum::http::StatusCode::NOT_FOUND, "machine not found"));
+    }
+    tracing::info!(%machine_id, ?ceiling, "machine RAM ceiling set");
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

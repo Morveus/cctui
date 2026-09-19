@@ -67,7 +67,7 @@ pub async fn spawn_session(
         return save_draft(&state, &ctx, &req).await;
     }
 
-    dispatch_spawn(&state, &ctx, req, uploads).await
+    crate::admission::spawn_or_queue(&state, &ctx, req, uploads).await
 }
 
 /// Dispatch a spawn to the targeted daemon. Shared by the immediate spawn path
@@ -80,6 +80,33 @@ pub async fn dispatch_spawn(
     ctx: &AuthContext,
     req: SpawnRequest,
     uploads: Vec<cctui_proto::adapter::BootstrapFile>,
+) -> Result<(StatusCode, Json<SpawnResponse>), (StatusCode, Json<ApiError>)> {
+    dispatch_spawn_as(state, ctx, req, uploads, None, None).await
+}
+
+/// A dispatch error from the send itself: the daemon may or may not hold the
+/// command. With [`DAEMON_OFFLINE`], the only errors raised once the send has
+/// started; every other one happens before anything is sent.
+pub const DISCONNECTED_MID_DISPATCH: &str = "daemon disconnected mid-dispatch";
+
+/// The dispatch error for a machine whose daemon cannot be reached. Behind a
+/// peer replica it can also stand for a forward that timed out after
+/// delivery, so it is no proof that nothing was sent either.
+pub const DAEMON_OFFLINE: &str = "daemon for that machine is offline — start `cctui-daemon` first";
+
+/// [`dispatch_spawn`] with ids chosen by the caller: a queued spawn launches
+/// under the id its `queued` row was shown with, so a link to it keeps working
+/// once the session is live (claude-code only; the other adapters mint their
+/// own id and ignore it), and with the `command_id` stored with it, the same
+/// on every attempt.
+#[allow(clippy::too_many_lines)]
+pub async fn dispatch_spawn_as(
+    state: &AppState,
+    ctx: &AuthContext,
+    req: SpawnRequest,
+    uploads: Vec<cctui_proto::adapter::BootstrapFile>,
+    preset_session_id: Option<Uuid>,
+    preset_command_id: Option<Uuid>,
 ) -> Result<(StatusCode, Json<SpawnResponse>), (StatusCode, Json<ApiError>)> {
     // Validate env keys: shell-style `^[A-Z_][A-Z0-9_]*$`.
     for key in req.env.keys() {
@@ -128,9 +155,9 @@ pub async fn dispatch_spawn(
     // mints its own thread id and ignores the pre-minted id, so its tokens
     // still fall back to command_id keying (account_name stays unresolved for
     // codex until a codex-side reconcile lands).
-    let command_id = Uuid::new_v4();
+    let command_id = preset_command_id.unwrap_or_else(Uuid::new_v4);
     let is_claude = adapter_id == "claude-code";
-    let pre_session_id = is_claude.then(Uuid::new_v4);
+    let pre_session_id = is_claude.then(|| preset_session_id.unwrap_or_else(Uuid::new_v4));
     // The id the gateway session token is bound to: the pre-minted real session
     // id for claude, else the command_id (legacy behaviour).
     let token_session_id = pre_session_id.unwrap_or(command_id).to_string();
@@ -379,15 +406,12 @@ pub async fn dispatch_spawn(
     if let Err(err) = state.bus.command_daemon(machine_uuid, frame).await {
         state.pending_commands.remove(&command_id);
         return Err(match err {
-            crate::bus::BusError::NoDaemon(_) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ApiError {
-                    error: "daemon for that machine is offline — start `cctui-daemon` first".into(),
-                }),
-            ),
+            crate::bus::BusError::NoDaemon(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError { error: DAEMON_OFFLINE.into() }))
+            }
             _ => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(ApiError { error: "daemon disconnected mid-dispatch".into() }),
+                Json(ApiError { error: DISCONNECTED_MID_DISPATCH.into() }),
             ),
         });
     }
@@ -738,6 +762,56 @@ pub async fn launch_draft(
     let Some((status, metadata)) = row else {
         return Err((StatusCode::NOT_FOUND, Json(ApiError { error: "draft not found".into() })));
     };
+    // A queued spawn: the human overrides the RAM ceiling and launches it now.
+    if status == "queued" {
+        use crate::admission::LaunchOutcome;
+        let outcome = crate::admission::launch_now(&state, &session_id).await.map_err(|e| {
+            tracing::error!("db error (launch queued): {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "database error".into() }))
+        })?;
+        let refused = |code: StatusCode, error: String| (code, Json(ApiError { error }));
+        match outcome {
+            LaunchOutcome::Sent => {}
+            // Nothing sent: it stays queued and the reaper tries again.
+            LaunchOutcome::Retry(why) => {
+                return Err(refused(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("not launched yet: {why}"),
+                ));
+            }
+            // Ended as spawn_failed, never retried.
+            LaunchOutcome::Failed(why) => {
+                return Err(refused(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("launch failed: {why}"),
+                ));
+            }
+            // The send broke: kept in doubt, never resent on its own.
+            LaunchOutcome::Uncertain(why) => {
+                return Err(refused(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "the launch may or may not have reached the machine ({why}): check                          there, then launch again or cancel it"
+                    ),
+                ));
+            }
+            LaunchOutcome::NotLaunchable => {
+                return Err(refused(
+                    StatusCode::CONFLICT,
+                    "this spawn is no longer waiting (already launching or launched)".into(),
+                ));
+            }
+        }
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(SpawnResponse {
+                command_id: Uuid::parse_str(&session_id).unwrap_or_else(|_| Uuid::nil()),
+                status: "dispatched".into(),
+                account: None,
+                session_id: Uuid::parse_str(&session_id).ok(),
+            }),
+        ));
+    }
     if status != "draft" {
         return Err(bad_request("session is not a draft"));
     }
@@ -753,9 +827,9 @@ pub async fn launch_draft(
     req.env = launch.env;
     req.save_draft = false;
 
-    let outcome = dispatch_spawn(&state, &ctx, req, Vec::new()).await?;
+    let outcome = crate::admission::spawn_or_queue(&state, &ctx, req, Vec::new()).await?;
 
-    // Drop the draft only after a successful dispatch; the live session is born
+    // Drop the draft only after a successful dispatch (or queueing); the live session is born
     // from the daemon's registration with its own id.
     if let Err(e) = sqlx::query("DELETE FROM sessions WHERE id = $1 AND status = 'draft'")
         .bind(&session_id)
@@ -768,13 +842,14 @@ pub async fn launch_draft(
     Ok(outcome)
 }
 
-/// `POST /api/v1/sessions/{id}/discard`. Delete a draft session row.
-/// Only acts on `draft` rows so it can never delete a real session.
+/// `POST /api/v1/sessions/{id}/discard`. Delete a draft or queued session
+/// row (a queued one takes its `spawn_queue` payload with it). Only acts on
+/// those two statuses so it can never delete a real session.
 pub async fn discard_draft(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
-    let res = sqlx::query("DELETE FROM sessions WHERE id = $1 AND status = 'draft'")
+    let res = sqlx::query("DELETE FROM sessions WHERE id = $1 AND status IN ('draft', 'queued')")
         .bind(&session_id)
         .execute(&state.pool)
         .await

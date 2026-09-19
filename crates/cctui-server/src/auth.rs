@@ -277,6 +277,73 @@ impl AuthConfig {
         None
     }
 
+    /// Re-derive, from the database as it is now, the context a request
+    /// authenticated earlier as (`user_id`, `key_id`) would get today. For work
+    /// accepted then run later (a queued spawn): `None` once the key or its
+    /// user has been revoked, disabled or has expired, and scopes re-intersected
+    /// from the current ACLs, so a demotion takes effect. Same rules as
+    /// [`Self::validate`], by key identity instead of token hash.
+    ///
+    /// The env admin fallback (`nil`/`nil`, no seeded row) stays valid only
+    /// while an env admin token is configured.
+    pub async fn revalidate(
+        &self,
+        user_id: Uuid,
+        key_id: Uuid,
+    ) -> Result<Option<AuthContext>, sqlx::Error> {
+        if user_id.is_nil() && key_id.is_nil() {
+            return Ok((!self.admin_tokens.is_empty()).then(|| AuthContext {
+                user_id,
+                key_id,
+                machine_id: None,
+                scopes: Scope::all().into_iter().collect(),
+            }));
+        }
+        // Unified keys. A key that exists there but is no longer live is final:
+        // no legacy fallback for it.
+        let unified: Option<(Option<Uuid>, bool)> = sqlx::query_as(
+            "SELECT k.machine_id, (k.revoked_at IS NULL \
+                 AND (k.expires_at IS NULL OR k.expires_at > now()) \
+                 AND u.revoked_at IS NULL AND u.disabled_at IS NULL) \
+             FROM auth_keys k JOIN users u ON u.id = k.user_id \
+             WHERE k.id = $1 AND k.user_id = $2",
+        )
+        .bind(key_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some((machine_id, live)) = unified {
+            if !live {
+                return Ok(None);
+            }
+            let scopes = self.effective_scopes(key_id, user_id).await;
+            return Ok(Some(AuthContext { user_id, key_id, machine_id, scopes }));
+        }
+        // Legacy identities, as `validate_legacy` synthesizes them: a machine
+        // key (key id = machine id), a user key (key id = user id), a user token.
+        let legacy: Option<(Option<Uuid>,)> = sqlx::query_as(
+            "SELECT m.id FROM machines m JOIN users u ON u.id = m.user_id \
+             WHERE m.id = $1 AND m.user_id = $2 AND m.revoked_at IS NULL \
+               AND u.revoked_at IS NULL AND u.disabled_at IS NULL \
+             UNION ALL \
+             SELECT NULL::uuid FROM users u WHERE u.id = $2 AND $1 = $2 \
+               AND u.revoked_at IS NULL AND u.disabled_at IS NULL \
+             UNION ALL \
+             SELECT NULL::uuid FROM user_tokens t JOIN users u ON u.id = t.user_id \
+             WHERE t.id = $1 AND t.user_id = $2 AND t.revoked_at IS NULL \
+               AND (t.expires_at IS NULL OR t.expires_at > now()) \
+               AND u.revoked_at IS NULL AND u.disabled_at IS NULL \
+             LIMIT 1",
+        )
+        .bind(key_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((machine_id,)) = legacy else { return Ok(None) };
+        let scopes = self.ceiling_scopes(user_id).await;
+        Ok(Some(AuthContext { user_id, key_id, machine_id, scopes }))
+    }
+
     /// Resolve a token hash against the unified `auth_keys` table, gating on the
     /// owning user being live (revoked/disabled cascades) and the key itself
     /// being live (not revoked/expired). Scopes = `key_acls` ∩ `user_acls`.

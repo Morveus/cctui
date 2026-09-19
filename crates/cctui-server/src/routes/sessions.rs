@@ -218,6 +218,8 @@ fn sticky_status(row_status: &str) -> Option<SessionStatus> {
         "ended" | "failed" => Some(SessionStatus::Inactive),
         // Draft: staged-not-running, never re-derived from heartbeat.
         "draft" => Some(SessionStatus::Draft),
+        // Queued: waiting for RAM, launched by the reaper, not heartbeat-driven.
+        "queued" => Some(SessionStatus::Queued),
         _ => None,
     }
 }
@@ -232,10 +234,12 @@ pub fn resolve_status_liveness(
         || (derive_status(registered_at, last_heartbeat), derive_liveness(last_heartbeat)),
         |s| {
             // Archived keeps its real liveness dot; ended/failed are terminal → Dead.
-            let liveness = if matches!(s, SessionStatus::Archived) {
-                derive_liveness(last_heartbeat)
-            } else {
-                Liveness::Dead
+            // Queued is waiting, not over: `Stale` keeps clients that read
+            // `Dead` as "finished" from giving up on it before it launches.
+            let liveness = match s {
+                SessionStatus::Archived => derive_liveness(last_heartbeat),
+                SessionStatus::Queued => Liveness::Stale,
+                _ => Liveness::Dead,
             };
             (s, liveness)
         },
@@ -2856,6 +2860,16 @@ mod tests {
     };
     use cctui_proto::models::{Attention, Liveness};
     use chrono::{Duration, Utc};
+
+    #[test]
+    fn a_queued_session_is_waiting_not_dead() {
+        let old = Utc::now() - Duration::hours(3);
+        let (status, liveness) = super::resolve_status_liveness("queued", old, old);
+        assert_eq!(status, cctui_proto::models::SessionStatus::Queued);
+        assert_eq!(liveness, Liveness::Stale, "clients read Dead as finished");
+        let (_, ended) = super::resolve_status_liveness("ended", old, old);
+        assert_eq!(ended, Liveness::Dead);
+    }
 
     fn bare_session(id: &str) -> cctui_proto::api::SessionListItem {
         serde_json::from_value(serde_json::json!({

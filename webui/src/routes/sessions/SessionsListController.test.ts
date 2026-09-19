@@ -79,6 +79,31 @@ describe('SessionsListController — buckets', () => {
 		expect(ctl.groups.flatMap((g) => g.sessions.map((s) => s.id))).toEqual(['w']);
 	});
 
+	it('pulls queued spawns out of the buckets, oldest first, with the live section', () => {
+		const { ctl, setItems } = make();
+		setItems([
+			session({ id: 'q2', status: 'queued', registered_at: '2026-09-19T10:05:00Z' }),
+			session({ id: 'q1', status: 'queued', registered_at: '2026-09-19T10:00:00Z' }),
+			session({ id: 'w', bucket: 'working' })
+		]);
+		expect(ctl.queuedRows.map((s) => s.id)).toEqual(['q1', 'q2']);
+		expect(ctl.groups.flatMap((g) => g.sessions.map((s) => s.id))).toEqual(['w']);
+		expect(ctl.hasLiveRows).toBe(true);
+	});
+
+	it('hides queued spawns when the live section is off', () => {
+		const { ctl, setItems, setSections } = make();
+		setSections(new Set<Section>(['drafts']));
+		setItems([session({ id: 'q', status: 'queued' })]);
+		expect(ctl.queuedRows).toEqual([]);
+	});
+
+	it('counts a lone queued spawn as something to show', () => {
+		const { ctl, setItems } = make();
+		setItems([session({ id: 'q', status: 'queued' })]);
+		expect(ctl.hasLiveRows).toBe(true);
+	});
+
 	it('applies the created sort within a bucket', () => {
 		const { ctl, setItems, setSort } = make();
 		setSort('created');

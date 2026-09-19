@@ -7,6 +7,7 @@ import {
 	groupRows,
 	matchesUnreadFilter,
 	nest,
+	queueOrder,
 	rangeIds,
 	sortSessions,
 	type Dimension,
@@ -54,9 +55,19 @@ export class SessionsListController {
 		matchesUnreadFilter(s, this.#in.sections());
 
 	draftRows = $derived.by(() => this.#in.items().filter((s) => s.status === 'draft'));
+	// Spawns held back by their machine's RAM ceiling, in the order the reaper
+	// will launch them. They ride with the live section, in their own group.
+	queuedRows = $derived.by(() =>
+		this.#in.sections().has('live')
+			? queueOrder(this.#in.items().filter((s) => s.status === 'queued' && this.#keep(s)))
+			: []
+	);
 
 	#liveNest = $derived.by(() =>
-		nest([...this.#in.items().filter((s) => s.status !== 'draft'), ...this.#in.pinnedArchivedKids()])
+		nest([
+			...this.#in.items().filter((s) => s.status !== 'draft' && s.status !== 'queued'),
+			...this.#in.pinnedArchivedKids()
+		])
 	);
 	get topLevel(): SessionListItem[] {
 		return this.#liveNest.topLevel;
@@ -86,6 +97,7 @@ export class SessionsListController {
 			: groupRows(this.#sort(this.#liveTopFiltered), this.#in.groupBy())
 	);
 	get hasLiveRows(): boolean {
+		if (this.queuedRows.length > 0) return true;
 		return bucketed(this.#in.groupBy())
 			? this.groups.some((g) => g.sessions.length > 0)
 			: this.groupedSections.length > 0;

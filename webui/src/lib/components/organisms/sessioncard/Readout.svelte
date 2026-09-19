@@ -27,7 +27,7 @@
 	);
 </script>
 
-{#if !view.draft}
+{#if !view.draft && s.status !== 'queued'}
 	<TokenUsage usage={s.token_usage} cold={s.cache_cold} sum={view.rollup ? view.rollup.tokens : null} {compact} />
 {/if}
 {#if spread}<span class="gap"></span>{/if}

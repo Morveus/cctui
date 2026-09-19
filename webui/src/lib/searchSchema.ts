@@ -68,7 +68,7 @@ export function buildSessionSearchSchema(fetchValues: FetchValues): Schema {
 				label: m.search_field_status(),
 				type: 'enum',
 				operators: ['eq', 'ne', 'in'],
-				options: ['new', 'active', 'inactive', 'archived', 'draft'].map((v) => ({
+				options: ['new', 'active', 'inactive', 'archived', 'draft', 'queued'].map((v) => ({
 					value: v,
 					label: v
 				}))

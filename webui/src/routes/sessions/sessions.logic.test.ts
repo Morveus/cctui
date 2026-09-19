@@ -29,6 +29,7 @@ import {
 	serializeHiddenSections,
 	toggleHiddenSection,
 	pickFreshSession,
+	queueOrder,
 	rangeIds,
 	scriptPrefill,
 	sectionsOf,
@@ -842,6 +843,7 @@ describe('sectionsOf / inEnabledSections', () => {
 		expect(sectionsOf(session({ status: 'active', pinned: true }))).toEqual(['starred']);
 		expect(sectionsOf(session({ status: 'active', ...dispatched }))).toEqual(['dispatched']);
 		expect(sectionsOf(session({ status: 'draft' }))).toEqual(['drafts']);
+		expect(sectionsOf(session({ status: 'queued' }))).toEqual(['live']);
 	});
 
 	it('keeps starred/dispatched ownership on archived rows', () => {
@@ -915,5 +917,17 @@ describe('groupChildren', () => {
 
 	it('has no groups for a parent with no children', () => {
 		expect(groupChildren([])).toEqual([]);
+	});
+});
+
+describe('queueOrder', () => {
+	it('lists queued spawns oldest first, as the server launches them', () => {
+		const rows = [
+			session({ id: 'b', status: 'queued', registered_at: '2026-09-19T10:05:00Z' }),
+			session({ id: 'a', status: 'queued', registered_at: '2026-09-19T10:00:00Z' }),
+			session({ id: 'c', status: 'queued', registered_at: null })
+		];
+		expect(queueOrder(rows).map((s) => s.id)).toEqual(['c', 'a', 'b']);
+		expect(rows.map((s) => s.id)).toEqual(['b', 'a', 'c']);
 	});
 });

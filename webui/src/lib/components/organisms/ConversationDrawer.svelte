@@ -33,6 +33,7 @@
 	import Conversation from './conversation/Conversation.svelte';
 	import AccountSwitchModal from './conversation/AccountSwitchModal.svelte';
 	import ConversationComposer from './conversation/ConversationComposer.svelte';
+	import QueuedBanner from './conversation/QueuedBanner.svelte';
 	import BookmarkSaveModal from './bookmarks/BookmarkSaveModal.svelte';
 	import type { Line, MsgCategory, ViewOpts } from './conversation/types';
 	import { parseViewOpts } from './conversation/filters';
@@ -77,6 +78,9 @@
 
 	const id = $derived(session.id);
 	const archived = $derived(session.status === 'archived');
+	// Held back by its machine's RAM ceiling: nothing runs yet, so the drawer
+	// shows why and the overrides instead of a conversation and a composer.
+	const queued = $derived(session.status === 'queued');
 	const needsInput = $derived(session.attention === 'needs_input' && !archived);
 	// Liveness dot next to the title, mirroring SessionCard.
 	const livenessClass = $derived(
@@ -88,7 +92,9 @@
 					? 'dot-stale'
 					: 'dot-dead'
 	);
-	const showStatusBadge = $derived(session.status === 'new' || session.status === 'archived');
+	const showStatusBadge = $derived(
+		session.status === 'new' || session.status === 'archived' || session.status === 'queued'
+	);
 	const qc = useQueryClient();
 
 	// Session diagnose panel, opened from the toolbar or a failure toast's
@@ -521,7 +527,7 @@
 				overlay
 				multiple
 				label={m.composer_drop_files()}
-				disabled={!supportsAttachments || archived}
+				disabled={!supportsAttachments || archived || queued}
 				onfiles={(f) => composer?.addFiles(f)}
 				onactive={(a) => composer?.setDragActive(a)}
 			>
@@ -555,6 +561,9 @@
 				onDeleteLabel={deleteLabel}
 			/>
 
+			{#if queued}
+				<QueuedBanner {session} {onclose} />
+			{:else}
 			<DrawerToolbar
 				hitCount={hits.count}
 				hitIndex={hits.index}
@@ -650,6 +659,7 @@
 				onFork={fork.openDialog}
 				onResume={sa.resume}
 			/>
+			{/if}
 			</Dropzone>
 		</div>
 

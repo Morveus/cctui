@@ -36,6 +36,7 @@ export function createProbes(qc: QueryClient): Probes {
 			(await machines()).filter((m) => m.kind !== 'ephemeral' && !m.revoked_at).length,
 		sessions: async () => (await sessions()).sessions.length > 0,
 		'sessions.drafts': async () => (await sessions()).sessions.filter((s) => s.status === 'draft').length,
+		'sessions.queued': async () => (await sessions()).sessions.filter((s) => s.status === 'queued').length,
 		'sessions.live': async () => (await stats()).live > 0
 	};
 }

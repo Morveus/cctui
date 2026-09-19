@@ -15,4 +15,9 @@ hue: number | null, liveness: MachineLiveness,
  * `None` until the machine's daemon has sent a heartbeat carrying a
  * snapshot (older daemon, non-Linux host): the gauge shows "?" then.
  */
-resources: MachineResources | null, updated_at: string | null, };
+resources: MachineResources | null, updated_at: string | null, 
+/**
+ * RAM ceiling for spawns on this machine, in bytes. `None` = no ceiling
+ * (the default): spawns are never held back.
+ */
+mem_ceiling_bytes: number | null, };

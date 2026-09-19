@@ -15,5 +15,9 @@
  *   payload in `metadata.draft` but has no `command_id`, no daemon dispatch,
  *   and no heartbeat — excluded from liveness/reaping. An explicit Launch
  *   mints env fresh, dispatches a normal spawn, and removes the draft.
+ * - `Queued`: a spawn held back because its machine was over the RAM ceiling
+ *   set for it. The figures that held it back ride in `metadata.queued`; the
+ *   reaper launches it once the machine is back under its ceiling, and the
+ *   live session then registers under the same id (claude-code) or its own.
  */
-export type SessionStatus = "new" | "active" | "inactive" | "archived" | "draft";
+export type SessionStatus = "new" | "active" | "inactive" | "archived" | "draft" | "queued";

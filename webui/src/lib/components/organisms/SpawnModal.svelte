@@ -21,6 +21,8 @@
 	} from '$lib/queries';
 	import { ws, type SpawnProbeHit } from '$lib/ws.svelte';
 	import { toasts } from '$lib/toast.svelte';
+	import { goto } from '$app/navigation';
+	import { isQueuedSpawn, notifyQueuedSpawn } from '$lib/memCeiling';
 	import { isSubmitChord, submitChordLabel } from '$lib/platform';
 	import {
 		drafts,
@@ -652,6 +654,16 @@
 			profile_id: profile?.id
 		});
 		rememberProfileUse(profile);
+		if (isQueuedSpawn(res)) {
+			// Held back by the machine's RAM ceiling: a queued session row, no
+			// command result will ever come for it. It is not a failure.
+			notifyQueuedSpawn(res, (sid) => void goto(`/sessions/${sid}`));
+			discardMirror();
+			resetForm();
+			onspawned();
+			onclose();
+			return;
+		}
 		toasts.info(m.spawn_toast_spawning());
 		const sessionId = res.session_id ?? null;
 		const result = await ws.awaitSpawn(res.command_id, sessionId, {

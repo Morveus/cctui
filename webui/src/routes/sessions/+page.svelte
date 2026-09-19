@@ -82,6 +82,7 @@
 		toGroupDimension
 	} from './sessions.logic';
 	import { SessionsListController } from './SessionsListController.svelte';
+	import { isQueuedSpawn, notifyQueuedSpawn, queuedPreview } from '$lib/memCeiling';
 
 	// Two layouts: list (compact rows, centered column) and card (detailed 3-up
 	// grid released to the full window). Grid is top-level only (subagents stay
@@ -581,9 +582,10 @@
 	async function launchDraft(s: SessionListItem) {
 		launchingDraft = s.id;
 		try {
-			await actions.launchDraft(s.id);
+			const res = await actions.launchDraft(s.id);
 			clearSpawnSlot(s.machine_id, s.working_dir);
-			toasts.ok(m.sessions_toast_draft_launched());
+			if (isQueuedSpawn(res)) notifyQueuedSpawn(res, (sid) => void openById(sid));
+			else toasts.ok(m.sessions_toast_draft_launched());
 		} catch (e) {
 			toasts.error(m.sessions_toast_launch_failed({ error: errMessage(e) }));
 		} finally {
@@ -914,6 +916,22 @@
 	{/each}
 {/snippet}
 
+<!-- Spawns waiting for RAM: opening one shows why and the overrides. -->
+{#snippet queuedItems(rows: SessionListItem[], grid: boolean)}
+	{#each rows as s (s.id)}
+		<div class="parent-row">
+			<SessionCard
+				session={s}
+				variant={grid ? 'card' : 'row'}
+				{showMachine}
+				accentHue={accentOf(s)}
+				preview={queuedPreview(s)}
+				onopen={openFromCard}
+			/>
+		</div>
+	{/each}
+{/snippet}
+
 {#snippet loadMore()}
 	{#if pageError}
 		<Callout tone="danger">{m.sessions_search_failed({ error: pageError })}</Callout>
@@ -1018,6 +1036,21 @@
 	{/snippet}
 {/snippet}
 
+{#snippet queuedSection()}
+	{#if list.queuedRows.length > 0}
+		<div class="section" data-journey="section" data-journey-key="queued">
+			{@render groupHeader('queued', m.sessions_section_queued(), list.queuedRows.length, {})}
+			{#if !hiddenSections.has('queued')}
+				{#if cardView}
+					<div class="card-grid">{@render queuedItems(list.queuedRows, true)}</div>
+				{:else}
+					{@render queuedItems(list.queuedRows, false)}
+				{/if}
+			{/if}
+		</div>
+	{/if}
+{/snippet}
+
 {#snippet liveSections()}
 		{#if sessions.isLoading}
 			<div class="placeholder"><Spinner label={m.common_loading()} /></div>
@@ -1026,6 +1059,7 @@
 				<Text tone="muted">{m.sessions_empty_sections()}</Text>
 			</div>
 		{:else if groupBy !== 'status'}
+			{@render queuedSection()}
 			{#each list.groupedSections as g (g.key)}
 				{@const key = `dim:${g.key}`}
 				<div class="section">
@@ -1040,6 +1074,7 @@
 				</div>
 			{/each}
 		{:else}
+			{@render queuedSection()}
 			{#each list.groups as g (g.key)}
 				<div class="section" data-journey="section" data-journey-key={g.key}>
 					{@render groupHeader(g.key, g.label, g.sessions.length, {

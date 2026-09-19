@@ -50,6 +50,7 @@ describe('probes', () => {
 		expect(await probes['machines.enrolled']()).toBe(0);
 		expect(await probes.sessions()).toBe(false);
 		expect(await probes['sessions.drafts']()).toBe(0);
+		expect(await probes['sessions.queued']()).toBe(0);
 		expect(await probes['sessions.live']()).toBe(false);
 	});
 
@@ -78,6 +79,14 @@ describe('probes', () => {
 		expect(await probes.sessions()).toBe(true);
 		expect(await probes['sessions.drafts']()).toBe(1);
 		expect(await probes['sessions.live']()).toBe(false);
+	});
+
+	it('counts queued spawns apart from drafts', async () => {
+		api.sessions.mockResolvedValue({
+			sessions: [session({ status: 'queued' }), session({ id: 'd', status: 'draft' })]
+		});
+		expect(await probes['sessions.queued']()).toBe(1);
+		expect(await probes['sessions.drafts']()).toBe(1);
 	});
 
 	it('reads live from the stats endpoint, accounts and pools from their lists', async () => {

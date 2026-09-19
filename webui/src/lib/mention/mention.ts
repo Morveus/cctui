@@ -42,7 +42,8 @@ export function mentionableSessions(
     (s) =>
       s.id !== excludeId &&
       s.status !== "archived" &&
-      s.status !== "draft",
+      s.status !== "draft" &&
+      s.status !== "queued",
   );
 }
 

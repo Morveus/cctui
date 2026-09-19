@@ -786,10 +786,19 @@ pub async fn launch_draft(
                     format!("launch failed: {why}"),
                 ));
             }
-            LaunchOutcome::NotQueued => {
+            // The send broke: kept in doubt, never resent on its own.
+            LaunchOutcome::Uncertain(why) => {
                 return Err(refused(
                     StatusCode::CONFLICT,
-                    "this spawn is no longer queued (already launching or launched)".into(),
+                    format!(
+                        "the launch may or may not have reached the machine ({why}): check                          there, then launch again or cancel it"
+                    ),
+                ));
+            }
+            LaunchOutcome::NotLaunchable => {
+                return Err(refused(
+                    StatusCode::CONFLICT,
+                    "this spawn is no longer waiting (already launching or launched)".into(),
                 ));
             }
         }

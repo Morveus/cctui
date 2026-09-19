@@ -19,10 +19,17 @@ CREATE TABLE IF NOT EXISTS spawn_queue (
     queued_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- Stable id of the launch command, the same on every attempt.
     command_id    UUID NOT NULL,
-    -- Set, and committed, before the command is sent: a claimed row is never
-    -- sent again, so a crash between the send and the cleanup cannot launch
-    -- the same work twice. The reaper reconciles claims left behind.
-    claimed_at    TIMESTAMPTZ
+    -- 'waiting'   : nothing sent, the reaper may launch it;
+    -- 'sending'   : an attempt is in flight. Written and committed BEFORE the
+    --               command is sent, so no second attempt can start;
+    -- 'uncertain' : the send broke, or the server died mid-attempt: nobody can
+    --               tell whether the daemon got it. The request is kept as is,
+    --               never sent again on its own, and a human settles it.
+    state         TEXT NOT NULL DEFAULT 'waiting'
+                  CHECK (state IN ('waiting', 'sending', 'uncertain')),
+    -- When the in-flight attempt started, for the reaper to settle the ones
+    -- whose server died.
+    sending_since TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_spawn_queue_machine ON spawn_queue (machine_uuid, queued_at);
 

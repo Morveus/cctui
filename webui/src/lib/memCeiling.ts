@@ -78,6 +78,26 @@ export function queuedFigures(s: Pick<SessionListItem, 'metadata'>): QueuedFigur
 }
 
 /** "47,2 Go utilisés (+3 Go lancés à l'instant) · plafond 45 Go". */
+/** What the server records on a launch whose outcome nobody can tell. */
+export interface LaunchUncertain {
+	why: string;
+	help: string;
+	since?: string;
+}
+
+/**
+ * The doubt left by an interrupted launch, if any: the command may or may not
+ * have reached the machine, so cctui keeps the request and never sends it
+ * again on its own.
+ */
+export function launchUncertain(s: Pick<SessionListItem, 'metadata'>): LaunchUncertain | null {
+	const raw = (s.metadata as Record<string, unknown> | null)?.launch_uncertain;
+	if (!raw || typeof raw !== 'object') return null;
+	const u = raw as Record<string, unknown>;
+	if (typeof u.why !== 'string' || typeof u.help !== 'string') return null;
+	return { why: u.why, help: u.help, since: typeof u.since === 'string' ? u.since : undefined };
+}
+
 export function queuedSummary(f: QueuedFigures, locale: Locale = getLocale()): string {
 	const opts = { locale };
 	const used = fmtGiB(f.mem_used_bytes, locale);

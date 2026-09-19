@@ -9,12 +9,15 @@
 	import { useSessionActions } from '$lib/queries';
 	import { m } from '$lib/paraglide/messages';
 	import { toasts } from '$lib/toast.svelte';
-	import { queuedFigures, queuedSummary } from '$lib/memCeiling';
+	import { launchUncertain, queuedFigures, queuedSummary } from '$lib/memCeiling';
 
 	let { session, onclose }: { session: SessionListItem; onclose: () => void } = $props();
 
 	const actions = useSessionActions();
 	const figures = $derived(queuedFigures(session));
+	// An interrupted launch: nobody can say whether the machine got it, so the
+	// request is kept and only a human decides what happens next.
+	const doubt = $derived(launchUncertain(session));
 	let confirming = $state<'launch' | 'discard' | null>(null);
 	let busy = $state(false);
 
@@ -54,10 +57,20 @@
 </script>
 
 <div class="queued" data-journey="queued-banner">
-	<Callout tone="warn" icon="clock" title={m.queued_banner_title()}>
+	<Callout
+		tone={doubt ? 'danger' : 'warn'}
+		icon={doubt ? 'alert-triangle' : 'clock'}
+		title={doubt ? m.queued_uncertain_title() : m.queued_banner_title()}
+	>
 		<Stack gap="var(--sp-2)">
-			<Text size="sm">{m.queued_banner_body()}</Text>
-			{#if figures}
+			<Text size="sm">{doubt ? m.queued_uncertain_body({ why: doubt.why }) : m.queued_banner_body()}</Text>
+			{#if doubt && doubt.since}
+				<Text size="xs" tone="faint"
+					>{m.queued_uncertain_since()}
+					<Timestamp value={doubt.since} mode="relative" tone="faint" size="xs" /></Text
+				>
+			{/if}
+			{#if figures && !doubt}
 				<Text size="sm" weight="semibold">{queuedSummary(figures)}</Text>
 				{#if figures.checked_at}
 					<Text size="xs" tone="faint"
@@ -70,7 +83,7 @@
 		{#snippet actions()}
 			<Cluster gap="var(--sp-2)">
 				<Button size="sm" variant="primary" disabled={busy} onclick={() => (confirming = 'launch')}>
-					{m.queued_launch_now()}
+					{doubt ? m.queued_launch_anyway() : m.queued_launch_now()}
 				</Button>
 				<Button size="sm" disabled={busy} onclick={() => (confirming = 'discard')}>
 					{m.queued_cancel()}
@@ -84,9 +97,9 @@
 	<ConfirmModal
 		open
 		tone="warn"
-		title={m.queued_confirm_launch_title()}
-		message={m.queued_confirm_launch_body()}
-		confirmLabel={m.queued_launch_now()}
+		title={doubt ? m.queued_confirm_relaunch_title() : m.queued_confirm_launch_title()}
+		message={doubt ? m.queued_confirm_relaunch_body() : m.queued_confirm_launch_body()}
+		confirmLabel={doubt ? m.queued_launch_anyway() : m.queued_launch_now()}
 		{busy}
 		onconfirm={launchNow}
 		oncancel={() => (confirming = null)}

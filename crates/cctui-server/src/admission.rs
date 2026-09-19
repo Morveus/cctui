@@ -15,6 +15,14 @@
 //!
 //! The decision runs under a row lock on the machine, so two replicas or two
 //! concurrent requests never let the same headroom through twice.
+//!
+//! One launch is sent at most once: a row is marked `sending` (committed)
+//! before anything goes out, and such a row is never picked up again. A send
+//! that broke, or a server that died mid-send, leaves an outcome nobody can
+//! decide: the row goes to `uncertain`, keeping the request whole, and only a
+//! human sends it again. A session that registered under the queued id
+//! reconciles its own placeholder instead of being called failed. See
+//! `docs/spawn-admission.md`.
 
 use std::collections::BTreeMap;
 
@@ -326,38 +334,42 @@ enum DispatchError {
     /// Nothing was sent, and never will be as stored: revoked caller, lost
     /// rights, gone machine or account, corrupt payload.
     Rejected(String),
-    /// The send itself failed: the daemon may or may not have the command.
+    /// The send itself broke: the daemon may or may not have the command.
     Unknown(String),
 }
 
 /// What became of one launch attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchOutcome {
-    /// Sent to the daemon; the queued row is gone.
+    /// Handed to the daemon; the queued row is gone.
     Launched,
-    /// Not sent; still queued, tried again later.
+    /// Nothing was sent; still waiting, tried again later.
     Retry(String),
-    /// Ended as `spawn_failed`, never tried again.
+    /// Nothing was sent and nothing will be: ended as `spawn_failed`.
     Failed(String),
-    /// Not waiting (any more): absent, or claimed by another attempt.
-    NotQueued,
+    /// The send broke: nobody can say whether the daemon got it. The request
+    /// is kept, nothing is sent again on its own, a human settles it.
+    Uncertain(String),
+    /// Not waiting (any more): absent, in flight, or already uncertain.
+    NotLaunchable,
 }
 
-/// End detail of a launch whose send outcome is unknown.
-const UNKNOWN_OUTCOME: &str =
-    "launch interrupted, it may or may not have started: check the machine before launching again";
+/// What a session in doubt carries, on its `metadata.launch_uncertain`, and
+/// what the UI shows: nothing was lost, nothing was resent.
+const UNCERTAIN_HELP: &str = "the launch was interrupted and may or may not have reached the \
+                              machine: check there, then relaunch or cancel it";
 
-/// A claim older than this belongs to an attempt that died between the send
-/// and the cleanup (a send takes seconds): the reaper reconciles it.
-const CLAIM_GRACE_SECS: f64 = 600.0;
+/// An attempt in flight longer than this had its server die under it (a send
+/// takes seconds): the reaper settles it.
+const SENDING_GRACE_SECS: f64 = 600.0;
 
-/// Take the row for one attempt. The claim is committed before anything is
-/// sent, and a claimed row is never handed out again: whatever happens after
-/// this point, the command goes out at most once.
+/// Take the row for one attempt, marking it in flight. The mark is committed
+/// before anything is sent, so a second attempt can never start behind this
+/// one's back: the command goes out at most once per row.
 async fn claim(pool: &sqlx::PgPool, session_id: &str) -> Result<Option<QueuedRow>, sqlx::Error> {
     sqlx::query_as(
-        "UPDATE spawn_queue SET claimed_at = now() \
-         WHERE session_id = $1 AND claimed_at IS NULL \
+        "UPDATE spawn_queue SET state = 'sending', sending_since = now() \
+         WHERE session_id = $1 AND state = 'waiting' \
          RETURNING session_id, machine_uuid, caller_id, caller_key_id, request, env_enc, \
                    uploads, command_id",
     )
@@ -366,12 +378,14 @@ async fn claim(pool: &sqlx::PgPool, session_id: &str) -> Result<Option<QueuedRow
     .await
 }
 
-/// Give a claim back: only for an attempt that sent nothing.
+/// Put a row back in the queue: only for an attempt that sent nothing.
 async fn release(pool: &sqlx::PgPool, session_id: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE spawn_queue SET claimed_at = NULL WHERE session_id = $1")
-        .bind(session_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE spawn_queue SET state = 'waiting', sending_since = NULL WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -388,15 +402,18 @@ async fn finish_launched(pool: &sqlx::PgPool, session_id: &str) -> Result<(), sq
         .bind(session_id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE sessions SET metadata = metadata - 'queued' WHERE id = $1")
-        .bind(session_id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE sessions SET metadata = metadata - 'queued' - 'launch_uncertain' WHERE id = $1",
+    )
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await
 }
 
-/// The spawn will not be sent (again): the placeholder becomes an ended
-/// `spawn_failed` session carrying why, so the human sees it.
+/// Nothing was sent and nothing will be: the placeholder becomes an ended
+/// `spawn_failed` session carrying why, so the human sees it. Only ever used
+/// when the outcome is known, never on a doubt.
 async fn end_failed(pool: &sqlx::PgPool, session_id: &str, why: &str) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM spawn_queue WHERE session_id = $1")
@@ -415,8 +432,36 @@ async fn end_failed(pool: &sqlx::PgPool, session_id: &str, why: &str) -> Result<
     tx.commit().await
 }
 
+/// Nobody can say whether the daemon got this one. The request stays whole in
+/// the queue, in `uncertain`: no drain will send it again, and the session is
+/// flagged for a human to check the machine and then relaunch or cancel.
+async fn mark_uncertain(
+    pool: &sqlx::PgPool,
+    session_id: &str,
+    why: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE spawn_queue SET state = 'uncertain', sending_since = NULL WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE sessions SET metadata = jsonb_set(metadata, '{launch_uncertain}', $2) \
+         WHERE id = $1 AND status = 'queued'",
+    )
+    .bind(session_id)
+    .bind(json!({ "why": why, "help": UNCERTAIN_HELP, "since": chrono::Utc::now().to_rfc3339() }))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    tracing::warn!(session = %session_id, %why, "queued spawn in doubt: kept, never resent alone");
+    Ok(())
+}
+
 /// One attempt: claim, send through `dispatch`, then settle the row by what
-/// the send says. Only a send known not to have happened is retried.
+/// the send says. Only a send known not to have happened is ever retried.
 async fn launch_with<F>(
     pool: &sqlx::PgPool,
     session_id: &str,
@@ -426,7 +471,7 @@ where
     F: AsyncFnOnce(QueuedRow) -> Result<(), DispatchError>,
 {
     let Some(row) = claim(pool, session_id).await? else {
-        return Ok(LaunchOutcome::NotQueued);
+        return Ok(LaunchOutcome::NotLaunchable);
     };
     match dispatch(row).await {
         Ok(()) => {
@@ -442,15 +487,14 @@ where
             Ok(LaunchOutcome::Failed(why))
         }
         Err(DispatchError::Unknown(why)) => {
-            let why = format!("{UNKNOWN_OUTCOME} ({why})");
-            end_failed(pool, session_id, &why).await?;
-            Ok(LaunchOutcome::Failed(why))
+            mark_uncertain(pool, session_id, &why).await?;
+            Ok(LaunchOutcome::Uncertain(why))
         }
     }
 }
 
 /// [`launch_with`] for an explicit "launch now": the RAM it is about to take
-/// is recorded only when it did go out.
+/// is recorded only when the command did go out.
 async fn launch_now_with<F>(
     pool: &sqlx::PgPool,
     session_id: &str,
@@ -464,7 +508,7 @@ where
             .bind(session_id)
             .fetch_optional(pool)
             .await?;
-    let Some(machine) = machine else { return Ok(LaunchOutcome::NotQueued) };
+    let Some(machine) = machine else { return Ok(LaunchOutcome::NotLaunchable) };
     let outcome = launch_with(pool, session_id, dispatch).await?;
     if outcome == LaunchOutcome::Launched {
         sqlx::query("INSERT INTO machine_admissions (machine_uuid) VALUES ($1)")
@@ -475,39 +519,69 @@ where
     Ok(outcome)
 }
 
-/// Claims left by an attempt that died between the send and the cleanup:
-/// a claude-code session that registered under the queued id did start; for
-/// the rest nobody can tell, so they end as `spawn_failed` for a human to
-/// check, and are never sent again. Returns the ids settled.
-async fn reconcile_stale_claims(pool: &sqlx::PgPool) -> Result<Vec<String>, sqlx::Error> {
-    let stale: Vec<String> = sqlx::query_scalar(
-        "SELECT session_id FROM spawn_queue \
-         WHERE claimed_at < now() - make_interval(secs => $1)",
+/// A human decides to send an uncertain launch again, having checked the
+/// machine: back to `waiting`, for the drain or for "launch now".
+pub async fn retry_uncertain(pool: &sqlx::PgPool, session_id: &str) -> Result<bool, sqlx::Error> {
+    let done = sqlx::query(
+        "UPDATE spawn_queue SET state = 'waiting', sending_since = NULL \
+         WHERE session_id = $1 AND state = 'uncertain'",
     )
-    .bind(CLAIM_GRACE_SECS)
-    .fetch_all(pool)
+    .bind(session_id)
+    .execute(pool)
     .await?;
-    for id in &stale {
-        let started: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM sessions WHERE id = $1 AND status <> 'queued')",
-        )
-        .bind(id)
-        .fetch_one(pool)
-        .await?;
-        if started {
-            finish_launched(pool, id).await?;
-        } else {
-            tracing::warn!(session = %id, "queued spawn claim left behind: ended, not resent");
-            end_failed(pool, id, UNKNOWN_OUTCOME).await?;
-        }
+    if done.rows_affected() == 0 {
+        return Ok(false);
     }
-    Ok(stale)
+    sqlx::query("UPDATE sessions SET metadata = metadata - 'launch_uncertain' WHERE id = $1")
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    Ok(true)
 }
 
-/// The next row of `machine` the drain may try: oldest first, unclaimed.
+/// Reconcile what the last attempt left behind, and settle the sessions in
+/// doubt that turned out to have started.
+///
+/// A session that registered under the queued id did start (claude-code
+/// launches under the id its row was shown with): its placeholder is settled
+/// as launched, never as failed. An attempt whose server died mid-flight, and
+/// whose session did not register, becomes `uncertain`: the request is kept
+/// whole and nothing is sent again without a human. Returns the ids settled.
+async fn reconcile(pool: &sqlx::PgPool) -> Result<Vec<String>, sqlx::Error> {
+    let mut settled = Vec::new();
+    // Whatever their state, rows whose session is live did start.
+    let started: Vec<String> = sqlx::query_scalar(
+        "SELECT q.session_id FROM spawn_queue q JOIN sessions s ON s.id = q.session_id \
+         WHERE s.status <> 'queued'",
+    )
+    .fetch_all(pool)
+    .await?;
+    for id in started {
+        finish_launched(pool, &id).await?;
+        tracing::info!(session = %id, "queued spawn reconciled: its session is live");
+        settled.push(id);
+    }
+    // In flight with no server left to finish it: nobody can say whether it
+    // was sent. Kept in doubt rather than lost or called failed.
+    let stranded: Vec<String> = sqlx::query_scalar(
+        "SELECT session_id FROM spawn_queue \
+         WHERE state = 'sending' AND sending_since < now() - make_interval(secs => $1)",
+    )
+    .bind(SENDING_GRACE_SECS)
+    .fetch_all(pool)
+    .await?;
+    for id in stranded {
+        mark_uncertain(pool, &id, "the server stopped while the launch was being sent").await?;
+        settled.push(id);
+    }
+    Ok(settled)
+}
+
+/// The next row of `machine` the drain may try: oldest first, waiting only
+/// (never one in flight, never one in doubt).
 async fn next_head(pool: &sqlx::PgPool, machine: Uuid) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar(
-        "SELECT session_id FROM spawn_queue WHERE machine_uuid = $1 AND claimed_at IS NULL \
+        "SELECT session_id FROM spawn_queue WHERE machine_uuid = $1 AND state = 'waiting' \
          ORDER BY queued_at LIMIT 1",
     )
     .bind(machine)
@@ -560,7 +634,7 @@ async fn dispatch_row(state: &AppState, row: QueuedRow) -> Result<(), DispatchEr
     if !machine_live {
         return Err(DispatchError::Rejected("machine revoked or deleted".into()));
     }
-    // Nothing is sent to a daemon nobody holds: that is the retryable case. A
+    // Nothing reaches a daemon nobody holds: that is the retryable case. A
     // failure of the send itself is not, whatever it says.
     let reachable = state.bus.daemon_connected(row.machine_uuid)
         || crate::machine_liveness::derive(last_seen) == MachineLiveness::Online;
@@ -589,7 +663,7 @@ async fn dispatch_row(state: &AppState, row: QueuedRow) -> Result<(), DispatchEr
     }
 }
 
-/// Tell the UIs the row left the queue (launched or ended), and log it.
+/// Tell the UIs what happened to the row, and log it.
 fn announce(state: &AppState, session_id: &str, outcome: &LaunchOutcome) {
     match outcome {
         LaunchOutcome::Launched => tracing::info!(session = %session_id, "queued spawn launched"),
@@ -599,12 +673,21 @@ fn announce(state: &AppState, session_id: &str, outcome: &LaunchOutcome) {
         LaunchOutcome::Retry(why) => {
             tracing::debug!(session = %session_id, %why, "queued spawn not launched yet");
         }
-        LaunchOutcome::NotQueued => {}
+        LaunchOutcome::Uncertain(_) | LaunchOutcome::NotLaunchable => {}
     }
-    if matches!(outcome, LaunchOutcome::Launched | LaunchOutcome::Failed(_)) {
-        state
-            .bus
-            .publish_server(ServerEvent::SessionDeregistered { session_id: session_id.to_owned() });
+    match outcome {
+        LaunchOutcome::Launched | LaunchOutcome::Failed(_) => {
+            state.bus.publish_server(ServerEvent::SessionDeregistered {
+                session_id: session_id.to_owned(),
+            });
+        }
+        LaunchOutcome::Uncertain(_) => {
+            state.bus.publish_server(ServerEvent::Status {
+                session_id: session_id.to_owned(),
+                status: SessionStatus::Queued,
+            });
+        }
+        LaunchOutcome::Retry(_) | LaunchOutcome::NotLaunchable => {}
     }
 }
 
@@ -616,8 +699,10 @@ async fn launch(state: &AppState, session_id: &str) -> Result<LaunchOutcome, sql
 }
 
 /// `POST /sessions/{id}/launch` on a queued session: the human overrides the
-/// ceiling and launches it now.
+/// ceiling and launches it now. A session in doubt is sent again only here,
+/// on that explicit decision, after the human has checked the machine.
 pub async fn launch_now(state: &AppState, session_id: &str) -> Result<LaunchOutcome, sqlx::Error> {
+    retry_uncertain(&state.pool, session_id).await?;
     let outcome =
         launch_now_with(&state.pool, session_id, async |row| dispatch_row(state, row).await)
             .await?;
@@ -625,9 +710,9 @@ pub async fn launch_now(state: &AppState, session_id: &str) -> Result<LaunchOutc
     Ok(outcome)
 }
 
-/// Reaper step: settle claims left behind, launch what each machine's ceiling
-/// now lets through, oldest first, refresh the figures shown on what still
-/// waits, and forget old admission records.
+/// Reaper step: reconcile what the last attempts left behind, launch what each
+/// machine's ceiling now lets through, oldest first, refresh the figures shown
+/// on what still waits, and forget old admission records.
 pub async fn drain(state: &AppState) {
     if let Err(e) = drain_inner(state).await {
         tracing::warn!(%e, "spawn queue drain failed");
@@ -638,21 +723,22 @@ async fn drain_inner(state: &AppState) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM machine_admissions WHERE admitted_at < now() - interval '1 hour'")
         .execute(&state.pool)
         .await?;
-    for id in reconcile_stale_claims(&state.pool).await? {
+    for id in reconcile(&state.pool).await? {
         state.bus.publish_server(ServerEvent::SessionDeregistered { session_id: id });
     }
-    let machines: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT machine_uuid FROM spawn_queue WHERE claimed_at IS NULL",
-    )
-    .fetch_all(&state.pool)
-    .await?;
+    let machines: Vec<Uuid> =
+        sqlx::query_scalar("SELECT DISTINCT machine_uuid FROM spawn_queue WHERE state = 'waiting'")
+            .fetch_all(&state.pool)
+            .await?;
     for machine in machines {
         for _ in 0..DRAIN_PER_TICK {
             let Some(head) = next_head(&state.pool, machine).await? else { break };
             match decide(&state.pool, machine, true).await? {
                 Decision::Admit => match launch(state, &head).await? {
                     LaunchOutcome::Launched => {}
-                    LaunchOutcome::Failed(_) | LaunchOutcome::NotQueued => {
+                    LaunchOutcome::Failed(_)
+                    | LaunchOutcome::Uncertain(_)
+                    | LaunchOutcome::NotLaunchable => {
                         forget_admission(&state.pool, machine).await;
                     }
                     LaunchOutcome::Retry(_) => {
@@ -742,15 +828,16 @@ mod tests {
     }
 
     /// A queued spawn on `machine`: its placeholder session and its queue row.
-    async fn queue_row(pool: &sqlx::PgPool, machine: Uuid) -> String {
+    async fn queue_row(pool: &sqlx::PgPool, machine: Uuid, adapter: &str) -> String {
         let sid = Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO sessions (id, machine_id, machine_uuid, working_dir, status) \
-             VALUES ($1, $2, $3, '/tmp', 'queued')",
+            "INSERT INTO sessions (id, machine_id, machine_uuid, working_dir, status, adapter_id) \
+             VALUES ($1, $2, $3, '/tmp', 'queued', $4)",
         )
         .bind(&sid)
         .bind(machine.to_string())
         .bind(machine)
+        .bind(adapter)
         .execute(pool)
         .await
         .unwrap();
@@ -770,12 +857,36 @@ mod tests {
         sid
     }
 
-    async fn session_state(pool: &sqlx::PgPool, sid: &str) -> Option<(String, Option<String>)> {
-        sqlx::query_as("SELECT status, end_reason FROM sessions WHERE id = $1")
+    #[allow(clippy::type_complexity)]
+    async fn session_row(
+        pool: &sqlx::PgPool,
+        sid: &str,
+    ) -> Option<(String, Option<String>, serde_json::Value)> {
+        sqlx::query_as("SELECT status, end_reason, metadata FROM sessions WHERE id = $1")
             .bind(sid)
             .fetch_optional(pool)
             .await
             .unwrap()
+    }
+
+    async fn queue_state(pool: &sqlx::PgPool, sid: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT state FROM spawn_queue WHERE session_id = $1")
+            .bind(sid)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Age the in-flight attempt past the grace, as if its server had died.
+    async fn age_attempt(pool: &sqlx::PgPool, sid: &str) {
+        sqlx::query(
+            "UPDATE spawn_queue SET sending_since = now() - interval '1 hour' \
+             WHERE session_id = $1",
+        )
+        .bind(sid)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn in_queue(pool: &sqlx::PgPool, sid: &str) -> bool {
@@ -826,7 +937,7 @@ mod tests {
 
         // A queued spawn makes newcomers wait behind it, not the drain.
         let q = machine(&pool, 10, Some(45)).await;
-        let sid = queue_row(&pool, q).await;
+        let sid = queue_row(&pool, q, "claude-code").await;
         assert!(matches!(decide(&pool, q, false).await.unwrap(), Decision::Hold(_)));
         assert_eq!(decide(&pool, q, true).await.unwrap(), Decision::Admit);
 
@@ -853,33 +964,15 @@ mod tests {
         assert_eq!(decide(&pool, stale, false).await.unwrap(), Decision::Admit);
     }
 
-    /// Review P1: a crash after the send and before the cleanup must not send
-    /// the same work again, neither on the next drain nor on "launch now".
+    /// Review P1, crash BEFORE the send: the request is kept whole, nothing
+    /// is sent behind the human's back, and it is never called failed.
     #[tokio::test]
-    async fn a_launch_interrupted_after_the_send_is_never_sent_again() {
+    async fn a_launch_whose_server_died_before_sending_is_kept_in_doubt() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let Some(pool) = test_pool("admission_no_replay").await else { return };
+        let Some(pool) = test_pool("admission_crash_before_send").await else { return };
         let m = machine(&pool, 10, Some(45)).await;
-        let sid = queue_row(&pool, m).await;
+        let sid = queue_row(&pool, m, "claude-code").await;
         let sent = AtomicUsize::new(0);
-
-        // The claim is durable before the send: another connection sees it
-        // from inside the dispatch.
-        let seen_claimed = {
-            let row = claim(&pool, &sid).await.unwrap().expect("queued row");
-            let committed: bool = sqlx::query_scalar(
-                "SELECT claimed_at IS NOT NULL FROM spawn_queue WHERE session_id = $1",
-            )
-            .bind(&row.session_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            sent.fetch_add(1, Ordering::SeqCst);
-            committed
-        };
-        assert!(seen_claimed, "claimed and committed before the command goes out");
-        // ... and the server dies here: no cleanup ran.
-
         let sent = &sent;
         let count = || {
             async move |_row: QueuedRow| -> Result<(), DispatchError> {
@@ -887,101 +980,142 @@ mod tests {
                 Ok(())
             }
         };
-        assert_eq!(next_head(&pool, m).await.unwrap(), None, "the drain skips a claimed row");
-        assert_eq!(launch_with(&pool, &sid, count()).await.unwrap(), LaunchOutcome::NotQueued);
-        assert_eq!(
-            launch_now_with(&pool, &sid, count()).await.unwrap(),
-            LaunchOutcome::NotQueued,
-            "launch now does not resend it either"
-        );
 
-        // Too early to reconcile: the attempt may still be running.
-        assert!(reconcile_stale_claims(&pool).await.unwrap().is_empty());
-        sqlx::query(
-            "UPDATE spawn_queue SET claimed_at = now() - interval '1 hour' WHERE session_id = $1",
-        )
-        .bind(&sid)
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert_eq!(reconcile_stale_claims(&pool).await.unwrap(), vec![sid.clone()]);
-        assert!(!in_queue(&pool, &sid).await);
-        let (status, reason) = session_state(&pool, &sid).await.expect("placeholder kept");
-        assert_eq!((status.as_str(), reason.as_deref()), ("ended", Some("spawn_failed")));
-        assert_eq!(launch_with(&pool, &sid, count()).await.unwrap(), LaunchOutcome::NotQueued);
-        assert_eq!(sent.load(Ordering::SeqCst), 1, "sent exactly once");
+        // The attempt marks the row in flight, durably, and the server dies
+        // right there: another connection already sees `sending`.
+        claim(&pool, &sid).await.unwrap().expect("waiting row");
+        assert_eq!(queue_state(&pool, &sid).await.as_deref(), Some("sending"));
+        assert_eq!(next_head(&pool, m).await.unwrap(), None, "no second attempt starts");
+        assert_eq!(launch_with(&pool, &sid, count()).await.unwrap(), LaunchOutcome::NotLaunchable);
+
+        // Too early to settle: the attempt may still be running.
+        assert!(reconcile(&pool).await.unwrap().is_empty());
+        age_attempt(&pool, &sid).await;
+        // A restart changes nothing: the state is in the database, not in the
+        // process. Reconciling keeps the request, in doubt, not failed.
+        let after_restart = test_pool("admission_crash_before_send").await.unwrap();
+        assert!(reconcile(&after_restart).await.unwrap().contains(&sid));
+        assert_eq!(queue_state(&pool, &sid).await.as_deref(), Some("uncertain"));
+        let (status, reason, meta) = session_row(&pool, &sid).await.expect("session kept");
+        assert_eq!(status, "queued", "still waiting, not ended");
+        assert!(reason.is_none(), "never a failure that did not happen");
+        assert!(meta["launch_uncertain"]["help"].is_string(), "the UI is told what to do");
+        assert!(in_queue(&pool, &sid).await, "the request is kept whole");
+
+        // No drain, and no "launch now", sends it again on its own.
+        assert_eq!(next_head(&pool, m).await.unwrap(), None);
+        assert_eq!(launch_with(&pool, &sid, count()).await.unwrap(), LaunchOutcome::NotLaunchable);
+        assert_eq!(sent.load(Ordering::SeqCst), 0, "nothing was ever sent");
+
+        // Only the human, having checked the machine, sends it again.
+        assert!(retry_uncertain(&pool, &sid).await.unwrap());
+        assert_eq!(launch_now_with(&pool, &sid, count()).await.unwrap(), LaunchOutcome::Launched);
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
     }
 
-    /// A claude-code session that registered under the queued id did start:
-    /// reconciling its left-behind claim keeps the live session.
+    /// Review P1, crash AFTER the send: a session that registered is
+    /// reconciled as launched (no false failure), whatever the adapter, and
+    /// the daemon may have restarted meanwhile.
     #[tokio::test]
-    async fn a_left_behind_claim_whose_session_registered_is_settled_as_launched() {
+    async fn a_session_that_registered_reconciles_its_placeholder() {
         let Some(pool) = test_pool("admission_reconcile_live").await else { return };
         let m = machine(&pool, 10, Some(45)).await;
-        let sid = queue_row(&pool, m).await;
-        claim(&pool, &sid).await.unwrap().expect("queued row");
-        // The worker registered (the daemon upsert flips the row to active).
+        let sid = queue_row(&pool, m, "claude-code").await;
+        claim(&pool, &sid).await.unwrap().expect("waiting row");
+        // The command went out, then the server died: the worker registered on
+        // its own (the daemon upsert flips the placeholder to active), which
+        // also covers the daemon having restarted and re-registered it.
         sqlx::query("UPDATE sessions SET status = 'active' WHERE id = $1")
             .bind(&sid)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE spawn_queue SET claimed_at = now() - interval '1 hour'")
-            .execute(&pool)
-            .await
-            .unwrap();
-        reconcile_stale_claims(&pool).await.unwrap();
-        assert!(!in_queue(&pool, &sid).await);
-        assert_eq!(session_state(&pool, &sid).await.unwrap().0, "active");
+        age_attempt(&pool, &sid).await;
+        assert!(reconcile(&pool).await.unwrap().contains(&sid));
+        assert!(!in_queue(&pool, &sid).await, "settled: it did start");
+        let (status, reason, meta) = session_row(&pool, &sid).await.unwrap();
+        assert_eq!(status, "active", "the live session is kept as it is");
+        assert!(reason.is_none());
+        assert!(meta.get("queued").is_none(), "the waiting figures are gone");
     }
 
-    /// Only a send known not to have happened is retried; a send that broke
-    /// half-way ends the row instead.
+    /// A codex spawn cannot be recognised by its id (codex mints its own), so
+    /// an interrupted send stays in doubt: kept, visible, never resent alone,
+    /// and never reported as a failure that did not happen.
     #[tokio::test]
-    async fn not_sent_is_retried_and_a_broken_send_is_not() {
+    async fn an_interrupted_codex_launch_stays_in_doubt_rather_than_failed() {
+        let Some(pool) = test_pool("admission_codex_doubt").await else { return };
+        let m = machine(&pool, 10, Some(45)).await;
+        let sid = queue_row(&pool, m, "codex").await;
+        let broken = async |_row: QueuedRow| Err(DispatchError::Unknown("peer timeout".into()));
+        let LaunchOutcome::Uncertain(why) = launch_with(&pool, &sid, broken).await.unwrap() else {
+            panic!("a broken send is not a failure and not a success");
+        };
+        assert_eq!(why, "peer timeout");
+        assert_eq!(queue_state(&pool, &sid).await.as_deref(), Some("uncertain"));
+        let (status, reason, _) = session_row(&pool, &sid).await.unwrap();
+        assert_eq!(status, "queued");
+        assert!(reason.is_none(), "not a failure: nobody knows yet");
+        // It is the codex thread that will tell: until a human settles it,
+        // neither the drain nor a reconcile touches it.
+        assert_eq!(next_head(&pool, m).await.unwrap(), None);
+        assert!(reconcile(&pool).await.unwrap().is_empty());
+        assert!(in_queue(&pool, &sid).await);
+    }
+
+    /// Only a send known not to have happened is retried on its own.
+    #[tokio::test]
+    async fn nothing_sent_is_retried_and_a_rejection_ends_it() {
         let Some(pool) = test_pool("admission_retry").await else { return };
         let m = machine(&pool, 10, Some(45)).await;
-        let sid = queue_row(&pool, m).await;
+        let sid = queue_row(&pool, m, "claude-code").await;
 
         let offline = async |_row: QueuedRow| Err(DispatchError::NotSent("offline".into()));
         assert_eq!(
             launch_with(&pool, &sid, offline).await.unwrap(),
             LaunchOutcome::Retry("offline".into())
         );
-        assert_eq!(next_head(&pool, m).await.unwrap(), Some(sid.clone()), "claim given back");
+        assert_eq!(next_head(&pool, m).await.unwrap(), Some(sid.clone()), "back in the queue");
 
-        let broken = async |_row: QueuedRow| Err(DispatchError::Unknown("peer timeout".into()));
-        let LaunchOutcome::Failed(why) = launch_with(&pool, &sid, broken).await.unwrap() else {
-            panic!("an unknown send outcome must not be retried");
-        };
-        assert!(why.starts_with(UNKNOWN_OUTCOME));
+        // Nothing was sent and nothing will be: that one is a real failure.
+        let gone = async |_row: QueuedRow| Err(DispatchError::Rejected("account gone".into()));
+        assert_eq!(
+            launch_with(&pool, &sid, gone).await.unwrap(),
+            LaunchOutcome::Failed("account gone".into())
+        );
         assert!(!in_queue(&pool, &sid).await);
-        assert_eq!(session_state(&pool, &sid).await.unwrap().0, "ended");
-        let sent_again = async |_row: QueuedRow| Ok(());
-        assert_eq!(launch_with(&pool, &sid, sent_again).await.unwrap(), LaunchOutcome::NotQueued);
+        let (status, reason, _) = session_row(&pool, &sid).await.unwrap();
+        assert_eq!((status.as_str(), reason.as_deref()), ("ended", Some("spawn_failed")));
     }
 
-    /// Review P2: a permanent failure is reported as such by "launch now",
-    /// and reserves no RAM; a real launch does.
+    /// Review P2: "launch now" says what really happened, and reserves RAM
+    /// only for a launch that went out.
     #[tokio::test]
-    async fn launch_now_reports_a_permanent_failure_and_reserves_nothing() {
+    async fn launch_now_reports_the_real_outcome_and_reserves_nothing_otherwise() {
         let Some(pool) = test_pool("admission_launch_now").await else { return };
         let m = machine(&pool, 10, Some(45)).await;
 
-        let failed = queue_row(&pool, m).await;
+        let failed = queue_row(&pool, m, "claude-code").await;
         let gone = async |_row: QueuedRow| Err(DispatchError::Rejected("account gone".into()));
         assert_eq!(
             launch_now_with(&pool, &failed, gone).await.unwrap(),
             LaunchOutcome::Failed("account gone".into())
         );
         assert_eq!(admissions(&pool, m).await, 0, "nothing launched, nothing reserved");
-        assert_eq!(session_state(&pool, &failed).await.unwrap().1.as_deref(), Some("spawn_failed"));
 
-        let ok = queue_row(&pool, m).await;
+        let doubtful = queue_row(&pool, m, "codex").await;
+        let broken = async |_row: QueuedRow| Err(DispatchError::Unknown("cut".into()));
+        assert_eq!(
+            launch_now_with(&pool, &doubtful, broken).await.unwrap(),
+            LaunchOutcome::Uncertain("cut".into())
+        );
+        assert_eq!(admissions(&pool, m).await, 0, "a doubt reserves nothing either");
+
+        let ok = queue_row(&pool, m, "claude-code").await;
         let sent = async |_row: QueuedRow| Ok(());
         assert_eq!(launch_now_with(&pool, &ok, sent).await.unwrap(), LaunchOutcome::Launched);
         assert_eq!(admissions(&pool, m).await, 1);
-        assert_eq!(session_state(&pool, &ok).await, None, "placeholder gone once launched");
+        assert_eq!(session_row(&pool, &ok).await, None, "placeholder gone once launched");
     }
 
     /// Review P1: the queue keeps who asked, not their rights. At launch the
@@ -998,6 +1132,14 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        for scope in ["read", "dispatch", "admin"] {
+            sqlx::query("INSERT INTO user_acls (user_id, scope) VALUES ($1, $2)")
+                .bind(uid)
+                .bind(scope)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
         let key = async || -> Uuid {
             let kid: Uuid = sqlx::query_scalar(
                 "INSERT INTO auth_keys (user_id, key_hash, kind) VALUES ($1, $2, 'user') \
@@ -1018,19 +1160,10 @@ mod tests {
             }
             kid
         };
-        for scope in ["read", "dispatch", "admin"] {
-            sqlx::query("INSERT INTO user_acls (user_id, scope) VALUES ($1, $2)")
-                .bind(uid)
-                .bind(scope)
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
         let k1 = key().await;
-        let ctx = auth.revalidate(uid, k1).await.unwrap().expect("live key");
-        assert!(ctx.is_admin());
+        assert!(auth.revalidate(uid, k1).await.unwrap().expect("live key").is_admin());
 
-        // Demoted: the admin scope frozen at queue time no longer counts.
+        // Demoted: the admin scope held at queue time no longer counts.
         sqlx::query("DELETE FROM user_acls WHERE user_id = $1 AND scope = 'admin'")
             .bind(uid)
             .execute(&pool)
@@ -1073,7 +1206,7 @@ mod tests {
         let down = std::fs::read_to_string(format!("{dir}/117_spawn_admission.down.sql")).unwrap();
         assert!(up.contains("mem_ceiling_bytes"));
         assert!(up.contains("CREATE TABLE IF NOT EXISTS spawn_queue"));
-        assert!(up.contains("claimed_at") && up.contains("caller_key_id"));
+        assert!(up.contains("uncertain") && up.contains("caller_key_id"));
         assert!(down.contains("DROP TABLE IF EXISTS spawn_queue"));
     }
 }

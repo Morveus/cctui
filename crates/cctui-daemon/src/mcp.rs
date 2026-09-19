@@ -18,7 +18,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -28,8 +28,21 @@ pub const TOOL_NAME: &str = "CctuiAgent";
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Socket line protocol revision: ≥2 tells the daemon this relay understands
-/// interim `progress` frames before the final result line.
-const SOCKET_PROTO: u64 = 2;
+/// interim `progress` frames before the final result line; ≥3 that it reads
+/// the `attached` frame naming the child and can reattach with `follow_agent`.
+const SOCKET_PROTO: u64 = 3;
+
+/// How long the relay keeps trying to reach the daemon again after the socket
+/// died under a call in flight. An auto-update `execve` rebinds the socket
+/// within a few seconds; a service restart can take longer.
+const REATTACH_WINDOW: Duration = Duration::from_mins(3);
+
+/// Pause between reconnect attempts inside [`REATTACH_WINDOW`].
+const REATTACH_RETRY: Duration = Duration::from_secs(2);
+
+/// Ceiling on reattaches for one tool call. A daemon restarting in a loop must
+/// surface as an error, not as a call that never returns.
+const REATTACH_MAX: u32 = 5;
 
 /// Ceiling on a single tool call, and the default when the call names none.
 /// Generous: a child review session can legitimately run for many minutes.
@@ -222,56 +235,73 @@ fn handle_request(session_id: &str, sock: &Path, req: &Value, outbox: &Outbox) -
     }
 }
 
-/// Send the tool call to the daemon, forwarding interim progress frames, and
-/// block on the final result line. Every failure returns text: the model must
-/// see an error, never a hang.
-fn call_daemon(
-    session_id: &str,
-    sock: &Path,
-    args: &Value,
+/// One connection's worth of a call: either the daemon answered, or the
+/// socket died under us before it could.
+enum Leg {
+    /// Final result: the text the model sees, and whether it is an error.
+    Done(String, bool),
+    /// The daemon went away mid-call (EOF, reset). The child it was following
+    /// is untouched — only this wait died.
+    Dropped,
+}
+
+/// Drive one connection to the daemon: send `request`, forward interim
+/// progress frames, record the child id the daemon announces, and stop at the
+/// first final frame.
+fn run_leg(
+    stream: &UnixStream,
+    request: &Value,
     token: Option<&Value>,
     outbox: &Outbox,
-) -> (String, bool) {
-    let timeout = resolve_timeout(args.get("timeout_secs").and_then(Value::as_u64));
-    let request = json!({
-        "kind": "spawn_agent",
-        "session_id": session_id,
-        "args": args,
-        "timeout_secs": timeout.as_secs(),
-        "proto": SOCKET_PROTO,
-    });
-    let stream = match UnixStream::connect(sock) {
-        Ok(s) => s,
-        Err(err) => {
-            return (
-                format!("CctuiAgent unavailable: cannot reach the cctui daemon ({err})"),
-                true,
-            );
-        }
-    };
-    // Outlive the daemon's own wait so the daemon's timeout message wins.
-    let _ = stream.set_read_timeout(Some(timeout + Duration::from_secs(30)));
-    let mut writer = &stream;
+    seq: &mut u64,
+    child: &mut Option<String>,
+) -> Leg {
+    let mut writer = stream;
     if writeln!(writer, "{request}").and_then(|()| writer.flush()).is_err() {
-        return ("CctuiAgent failed: could not send the request to the daemon".to_owned(), true);
+        return Leg::Dropped;
     }
-    let mut reader = BufReader::new(&stream);
-    let mut seq: u64 = 0;
+    let mut reader = BufReader::new(stream);
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
-            return (
-                "CctuiAgent failed: the daemon closed the connection without a result".to_owned(),
-                true,
-            );
+        match reader.read_line(&mut line) {
+            // EOF: the daemon closed without a result. On this machine that is
+            // the auto-update re-exec (`execve` drops every open connection at
+            // once), which is why whole fan-outs used to die together.
+            Ok(0) => return Leg::Dropped,
+            Ok(_) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return Leg::Dropped;
+            }
+            // A read timeout is NOT a restart: the daemon owes us a result and
+            // did not send one. Reattaching here would loop forever.
+            Err(err) => {
+                return Leg::Done(
+                    format!("CctuiAgent failed: lost the daemon connection ({err})"),
+                    true,
+                );
+            }
+        }
+        if line.trim().is_empty() {
+            return Leg::Dropped;
         }
         let Ok(frame) = serde_json::from_str::<Value>(&line) else {
-            return ("CctuiAgent failed: malformed daemon reply".to_owned(), true);
+            return Leg::Done("CctuiAgent failed: malformed daemon reply".to_owned(), true);
         };
+        if let Some(id) = frame.get("attached").and_then(Value::as_str) {
+            *child = Some(id.to_owned());
+            continue;
+        }
         if let Some(progress) = frame.get("progress").and_then(Value::as_str) {
             if let Some(token) = token {
-                seq += 1;
-                outbox.send(&progress_notification(token, seq, progress));
+                *seq += 1;
+                outbox.send(&progress_notification(token, *seq, progress));
             }
             continue;
         }
@@ -281,8 +311,107 @@ fn call_daemon(
             .and_then(Value::as_str)
             .unwrap_or("no output")
             .to_owned();
-        return (text, !ok);
+        return Leg::Done(text, !ok);
     }
+}
+
+/// Reconnect to the daemon socket, tolerating the window in which the binary
+/// has been swapped but the new process has not bound the socket yet.
+fn reconnect(sock: &Path, window: Duration, retry: Duration) -> Option<UnixStream> {
+    let deadline = Instant::now() + window;
+    loop {
+        if let Ok(s) = UnixStream::connect(sock) {
+            return Some(s);
+        }
+        if Instant::now() + retry >= deadline {
+            return None;
+        }
+        std::thread::sleep(retry);
+    }
+}
+
+/// The message a call returns when the daemon vanished before it had even
+/// named the child. Nothing can be reattached: there is no id to reattach to.
+fn restarted_before_attach() -> String {
+    "CctuiAgent failed: the cctui daemon restarted (auto-update re-exec) while this call was      starting, before it named the child session, so there is nothing to reattach to. THIS IS      NOT THE CHILD CRASHING. Check cctui for a child session under this one; if none appeared,      call CctuiAgent again."
+        .to_owned()
+}
+
+/// Send the tool call to the daemon and block on its final result, forwarding
+/// interim progress frames. When the daemon restarts mid-call (auto-update
+/// re-exec closes every agent-tool connection at once), reconnect and reattach
+/// to the same child with `follow_agent` instead of failing the call: the
+/// child never stopped, only the wait did. Every failure returns text — the
+/// model must see an error, never a hang.
+fn call_daemon(
+    session_id: &str,
+    sock: &Path,
+    args: &Value,
+    token: Option<&Value>,
+    outbox: &Outbox,
+) -> (String, bool) {
+    let timeout = resolve_timeout(args.get("timeout_secs").and_then(Value::as_u64));
+    let mut request = json!({
+        "kind": "spawn_agent",
+        "session_id": session_id,
+        "args": args,
+        "timeout_secs": timeout.as_secs(),
+        "proto": SOCKET_PROTO,
+    });
+    let mut stream = match UnixStream::connect(sock) {
+        Ok(s) => s,
+        Err(err) => {
+            return (
+                format!("CctuiAgent unavailable: cannot reach the cctui daemon ({err})"),
+                true,
+            );
+        }
+    };
+    let mut seq: u64 = 0;
+    let mut child: Option<String> = None;
+    for attempt in 0..=REATTACH_MAX {
+        // Outlive the daemon's own wait so the daemon's timeout message wins.
+        let _ = stream.set_read_timeout(Some(timeout + Duration::from_secs(30)));
+        match run_leg(&stream, &request, token, outbox, &mut seq, &mut child) {
+            Leg::Done(text, is_error) => return (text, is_error),
+            Leg::Dropped => {}
+        }
+        let Some(id) = child.clone() else { return (restarted_before_attach(), true) };
+        if attempt == REATTACH_MAX {
+            return (
+                format!(
+                    "CctuiAgent failed: the cctui daemon kept restarting under this call                      ({REATTACH_MAX} reattaches). Child session {id} is unaffected and its work                      is on disk; follow it in cctui, or call CctuiAgent again with session_id                      {id:?} once the daemon is stable."
+                ),
+                true,
+            );
+        }
+        if let Some(token) = token {
+            seq += 1;
+            outbox.send(&progress_notification(
+                token,
+                seq,
+                &format!("the cctui daemon restarted; reattaching to child session {id}"),
+            ));
+        }
+        let Some(fresh) = reconnect(sock, REATTACH_WINDOW, REATTACH_RETRY) else {
+            return (
+                format!(
+                    "CctuiAgent failed: the cctui daemon restarted and did not come back within                      {}s. Child session {id} is still running on its own and its work is on                      disk; follow it in cctui.",
+                    REATTACH_WINDOW.as_secs(),
+                ),
+                true,
+            );
+        };
+        stream = fresh;
+        request = json!({
+            "kind": "follow_agent",
+            "session_id": session_id,
+            "args": { "session_id": id },
+            "timeout_secs": timeout.as_secs(),
+            "proto": SOCKET_PROTO,
+        });
+    }
+    unreachable!("the loop returns on its last iteration")
 }
 
 /// Serve MCP on stdio until the client closes it.
@@ -503,5 +632,116 @@ mod tests {
             server["args"],
             json!(["mcp-agent", "--session", "sess-1", "--sock", "/run/cctui/agent.sock"])
         );
+    }
+
+    /// A stub daemon: each accepted connection is handed to `serve`, which
+    /// reads the one request line and writes whatever the scenario dictates.
+    /// Returns the socket path; the listener thread stops when `rounds` are
+    /// served.
+    fn stub_daemon(
+        dir: &std::path::Path,
+        rounds: usize,
+        mut serve: impl FnMut(usize, &Value, &mut dyn Write) -> bool + Send + 'static,
+    ) -> std::path::PathBuf {
+        use std::os::unix::net::UnixListener;
+        let sock = dir.join("agent.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            for round in 0..rounds {
+                let Ok((stream, _)) = listener.accept() else { return };
+                let mut line = String::new();
+                if BufReader::new(&stream).read_line(&mut line).is_err() {
+                    return;
+                }
+                let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                let mut out = &stream;
+                if !serve(round, &req, &mut out) {
+                    // Close without a result — exactly what an auto-update
+                    // `execve` does to every open connection.
+                    drop(stream);
+                }
+            }
+        });
+        sock
+    }
+
+    /// claudo/inbox#210, fresh symptom: the daemon auto-updates and re-execs,
+    /// every agent-tool connection dies at once, and each parent's `CctuiAgent`
+    /// call used to return "the daemon closed the connection without a
+    /// result" — a hard failure for a child that never stopped running. The
+    /// relay must reattach to the same child instead, and must not re-prompt
+    /// it.
+    #[test]
+    fn a_daemon_restart_mid_call_reattaches_to_the_child_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorder = Arc::clone(&seen);
+        let sock = stub_daemon(dir.path(), 2, move |round, req, out| {
+            recorder.lock().unwrap().push(req.clone());
+            if round == 0 {
+                // Name the child, then die mid-call.
+                writeln!(out, "{}", json!({ "attached": "child-42" })).unwrap();
+                out.flush().unwrap();
+                return false;
+            }
+            writeln!(out, "{}", json!({ "ok": true, "result": "verdict: ship" })).unwrap();
+            out.flush().unwrap();
+            true
+        });
+
+        let (text, is_error) = call_daemon(
+            "parent-1",
+            &sock,
+            &json!({ "prompt": "review", "model": "claude-opus-5" }),
+            None,
+            &Outbox::new(),
+        );
+        assert!(!is_error, "a daemon restart must not fail the call: {text}");
+        assert_eq!(text, "verdict: ship");
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "the relay must come back for a second leg");
+        assert_eq!(seen[0]["kind"], "spawn_agent");
+        assert_eq!(seen[1]["kind"], "follow_agent", "the second leg reattaches, never respawns");
+        assert_eq!(seen[1]["args"]["session_id"], "child-42");
+        assert!(
+            seen[1]["args"].get("prompt").is_none(),
+            "a reattach must send the child nothing: {}",
+            seen[1],
+        );
+    }
+
+    /// Without a child id there is nothing to reattach to, so the call still
+    /// fails — but it must say the daemon restarted, not blame the child.
+    #[test]
+    fn a_restart_before_the_child_is_named_fails_with_an_honest_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = stub_daemon(dir.path(), 1, |_round, _req, _out| false);
+        let (text, is_error) = call_daemon(
+            "parent-1",
+            &sock,
+            &json!({ "prompt": "review", "model": "claude-opus-5" }),
+            None,
+            &Outbox::new(),
+        );
+        assert!(is_error);
+        assert!(text.contains("restarted"), "{text}");
+        assert!(text.contains("NOT THE CHILD CRASHING"), "{text}");
+    }
+
+    /// A relay that cannot tell a restart from a plain result would reattach
+    /// forever. A final frame ends the call on the first leg.
+    #[test]
+    fn a_result_on_the_first_leg_ends_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = stub_daemon(dir.path(), 1, |_round, _req, out| {
+            writeln!(out, "{}", json!({ "ok": false, "error": "child agent failed" })).unwrap();
+            out.flush().unwrap();
+            true
+        });
+        let (text, is_error) =
+            call_daemon("parent-1", &sock, &json!({ "prompt": "x" }), None, &Outbox::new());
+        assert!(is_error);
+        assert_eq!(text, "child agent failed");
     }
 }

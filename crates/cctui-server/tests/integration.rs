@@ -90,6 +90,76 @@ async fn register_and_list_session() {
     assert_eq!(resp.status(), 204);
 }
 
+/// claudo/inbox#210: a Task subagent has no worker, so a message can never
+/// reach it. The route used to answer 202 anyway and the janitor counted
+/// phantom revives; it must refuse instead.
+#[tokio::test]
+#[ignore = "requires running server"]
+async fn a_message_to_a_subagent_is_refused_not_accepted() {
+    let client = Client::new();
+    let base = server_url();
+
+    let u: serde_json::Value = client
+        .post(format!("{base}/api/v1/admin/users"))
+        .bearer_auth(admin_token())
+        .json(&json!({"name": format!("sub-{}", uuid_like())}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let user_key = u["key"].as_str().unwrap().to_string();
+
+    let m: serde_json::Value = client
+        .post(format!("{base}/api/v1/enroll"))
+        .bearer_auth(&user_key)
+        .json(&json!({"hostname": format!("sub-host-{}", uuid_like())}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let machine_key = m["machine_key"].as_str().unwrap().to_string();
+
+    let body: serde_json::Value = client
+        .post(format!("{base}/api/v1/sessions/register"))
+        .bearer_auth(&machine_key)
+        .json(&json!({
+            "machine_id": "sub-host",
+            "working_dir": "/tmp/test",
+            "metadata": {"subagent": true, "agent_type": "general-purpose"}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session_id = body["session_id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{base}/api/v1/sessions/{session_id}/message"))
+        .bearer_auth(admin_token())
+        .json(&json!({"content": "continue"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409, "a subagent must refuse a message, never accept it");
+    let err: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        err["error"].as_str().unwrap_or_default().contains("subagent"),
+        "the refusal must say why: {err}"
+    );
+
+    let _ = client
+        .post(format!("{base}/api/v1/sessions/{session_id}/deregister"))
+        .bearer_auth(&machine_key)
+        .send()
+        .await;
+}
+
 #[tokio::test]
 #[ignore = "requires running server"]
 async fn auth_rejects_bad_token() {

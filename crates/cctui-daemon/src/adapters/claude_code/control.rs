@@ -412,13 +412,24 @@ struct PendingPerm {
     needs: String,
 }
 
-/// How many consecutive idle polls mark a subagent's transcript as done.
-/// Subagents run to completion without waiting for input, so a quiescent
-/// transcript reliably signals the subagent has finished (~30s at the 2s
-/// default poll). Lifecycle end never arrives over the control socket
-/// (subagents aren't `list` jobs), so quiescence is the primary signal,
-/// with parent-session end as a backstop.
+/// How many consecutive idle polls end a subagent whose transcript tail reads
+/// finished. Lifecycle end never arrives over the control socket (subagents
+/// aren't `list` jobs), so the tail is all we have; ~30s at the 2s poll.
+///
+/// Quiescence ALONE is not completion. A subagent waiting on the model
+/// (extended thinking after a `tool_result`) or on a slow tool writes nothing
+/// for tens of seconds while very much alive, and ending it there marked live
+/// subagents `completed` about 30s after their last tool. Because
+/// `ended_subagents` blocks re-discovery, every later line of a subagent
+/// killed that way was dropped on the floor. The tail verdict
+/// (`Driver::tail_verdict`) and the parent's `tool_result`
+/// (`SubagentState::parent_resolved`) are what actually decide.
 const SUBAGENT_IDLE_TICKS_TO_END: u32 = 15;
+
+/// Backstop for a subagent no other signal can close: no `toolUseId` in its
+/// sidecar (nothing to correlate in the parent transcript), a tail that reads
+/// mid-turn, and a parent that keeps running. 30min at the 2s default poll.
+const SUBAGENT_STUCK_TICKS_TO_END: u32 = 900;
 
 #[derive(Debug, Clone)]
 struct TranscriptLocation {
@@ -437,6 +448,18 @@ struct SubagentState {
     parent_local_id: String,
     /// Consecutive polls during which the transcript did not grow.
     idle_ticks: u32,
+    /// The parent `Task` call this subagent answers (`toolUseId` in the
+    /// `.meta.json` sidecar). The parent's `tool_result` for it is the one
+    /// authoritative end-of-life signal we get.
+    tool_use_id: Option<String>,
+    /// That `tool_result` has been seen in the parent transcript: the Task
+    /// tool returned, so the subagent is over whatever its own tail says.
+    parent_resolved: bool,
+    /// The last tail batch left the turn open (a tool call in flight, a
+    /// `tool_result` the model still owes an answer to, a thinking block).
+    /// Such a subagent is working, however long its transcript stays quiet.
+    /// True on discovery: a subagent that just appeared is running.
+    tail_pending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2730,6 +2753,12 @@ impl Driver {
                             ),
                         );
                     }
+                    // A parent's `tool_result` closes the `Task` call it
+                    // answers, and with it the subagent that ran the call.
+                    // Read before emitting (which consumes `events`).
+                    for evt in &events {
+                        self.note_parent_tool_result(evt);
+                    }
                     for evt in events {
                         self.emit(evt).await;
                     }
@@ -2926,6 +2955,46 @@ impl Driver {
         }
     }
 
+    /// Whether a tailed event leaves the turn OPEN (`Some(true)`), closes it
+    /// (`Some(false)`), or says nothing (`None`, e.g. token usage or the model
+    /// id, which ride along with every assistant line).
+    ///
+    /// Only a plain assistant message closes a turn. A tool call is awaiting
+    /// its result, a `tool_result` is awaiting the model, and a thinking block
+    /// is the model mid-flight — each of them can sit silent for minutes.
+    fn tail_verdict(evt: &AdapterEvent) -> Option<bool> {
+        match evt {
+            AdapterEvent::ToolUse { .. } => Some(true),
+            AdapterEvent::Message { payload, .. } => {
+                match payload.get("role").and_then(serde_json::Value::as_str) {
+                    Some("assistant") => Some(false),
+                    Some(_) => Some(true),
+                    None => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Note a parent's `tool_result`: it closes the `Task` call that spawned
+    /// the subagent carrying the same `toolUseId`. This is the authoritative
+    /// end — it closes a finished subagent on the next poll instead of waiting
+    /// out the idle window, and it closes one whose own tail stopped mid-turn.
+    fn note_parent_tool_result(&mut self, evt: &AdapterEvent) {
+        let AdapterEvent::ToolUse { payload, .. } = evt else { return };
+        if payload.get("kind").and_then(serde_json::Value::as_str) != Some("tool_result") {
+            return;
+        }
+        let Some(id) = payload.get("tool_use_id").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        for st in self.subagents.values_mut() {
+            if st.tool_use_id.as_deref() == Some(id) {
+                st.parent_resolved = true;
+            }
+        }
+    }
+
     /// Discover and tail Task-tool subagents for every live parent session.
     /// Each subagent transcript lives at
     /// `<encoded-cwd>/<parent-session-id>/subagents/agent-<agentId>.jsonl`
@@ -2951,7 +3020,13 @@ impl Driver {
                 if !self.subagents.contains_key(&agent_id) {
                     self.subagents.insert(
                         agent_id.clone(),
-                        SubagentState { parent_local_id: parent_id.clone(), idle_ticks: 0 },
+                        SubagentState {
+                            parent_local_id: parent_id.clone(),
+                            idle_ticks: 0,
+                            tool_use_id: meta.as_ref().and_then(|m| m.tool_use_id.clone()),
+                            parent_resolved: false,
+                            tail_pending: true,
+                        },
                     );
                     self.emit(AdapterEvent::SessionStarted {
                         local_id: agent_id.clone(),
@@ -2975,6 +3050,9 @@ impl Driver {
                 match transcript::tail_once(&path, &agent_id, off) {
                     Ok((events, new_off)) => {
                         let grew = new_off != off;
+                        // Read the tail's last meaningful event before
+                        // `events` is consumed by the emit loop below.
+                        let verdict = events.iter().rev().find_map(Self::tail_verdict);
                         if grew {
                             self.offsets.set(agent_id.clone(), new_off);
                             self.server_marks.insert(agent_id.clone(), new_off);
@@ -2992,6 +3070,9 @@ impl Driver {
                         }
                         if let Some(st) = self.subagents.get_mut(&agent_id) {
                             st.idle_ticks = if grew { 0 } else { st.idle_ticks + 1 };
+                            if let Some(pending) = verdict {
+                                st.tail_pending = pending;
+                            }
                         }
                     }
                     Err(err) => {
@@ -3001,12 +3082,19 @@ impl Driver {
             }
         }
 
-        // Quiescence-based end: a subagent whose transcript has not grown for
-        // SUBAGENT_IDLE_TICKS_TO_END consecutive polls has finished.
+        // End of life, in order of trust: the parent's `Task` call returned;
+        // or a transcript that reads finished has stayed quiet for the idle
+        // window; or the stuck backstop fired. A tail that reads mid-turn is
+        // work in flight and is never ended by quiescence alone — that is what
+        // used to kill live subagents 30s after their last tool.
         let done: Vec<String> = self
             .subagents
             .iter()
-            .filter(|(_, st)| st.idle_ticks >= SUBAGENT_IDLE_TICKS_TO_END)
+            .filter(|(_, st)| {
+                st.parent_resolved
+                    || (st.idle_ticks >= SUBAGENT_IDLE_TICKS_TO_END && !st.tail_pending)
+                    || st.idle_ticks >= SUBAGENT_STUCK_TICKS_TO_END
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for agent_id in done {
@@ -4901,6 +4989,137 @@ mod tests {
         }
         assert_eq!(started_again, 0, "quiescent subagent must not be re-announced");
         assert_eq!(ended, 1, "subagent should end exactly once on quiescence");
+    }
+
+    /// Write (or rewrite) a parent session's own transcript. Byte offsets
+    /// make a rewrite with the same prefix behave as an append.
+    fn write_parent(d: &Driver, parent_short: &str, lines: &[&str]) {
+        use std::io::Write;
+        let sess = format!("{parent_short}-uuid");
+        let path = transcript::transcript_path(&d.cfg.projects_root, "/tmp", &sess);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&path).unwrap();
+        for l in lines {
+            f.write_all(l.as_bytes()).unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+    }
+
+    const SUB_TOOL_USE: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_inner","name":"Bash","input":{}}]}}"#;
+    const SUB_TOOL_RESULT: &str = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_inner","content":"ok"}]}}"#;
+    const SUB_FINAL_TEXT: &str =
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}"#;
+
+    #[tokio::test]
+    async fn a_subagent_waiting_on_the_model_is_not_ended_by_quiescence() {
+        // Ticket claudo/inbox#210. A subagent whose last transcript line is a
+        // `tool_result` owes the model a turn: it writes NOTHING while the
+        // model thinks, and 30s of extended thinking is routine. Ending it on
+        // bare quiescence marked live subagents `completed` about 30s after
+        // their last tool, and `ended_subagents` then dropped every later
+        // line. Measured on the 2026-09-17 sessions: last line at
+        // 13:26:20.965Z, cctui ended the session at 13:26:51.415Z, and the
+        // subagent went on to write 516 more lines until 14:14:59Z.
+        let (mut d, mut rx) = driver();
+        write_subagent(&d, "abcd1234", "deadbeefcafe00002", &[SUB_TOOL_USE, SUB_TOOL_RESULT]);
+        d.apply_snapshot(vec![snap("abcd1234", "working", None)]).await;
+        while rx.try_recv().is_ok() {}
+
+        for _ in 0..(SUBAGENT_IDLE_TICKS_TO_END + 5) {
+            d.apply_snapshot(vec![snap("abcd1234", "working", None)]).await;
+        }
+        while let Ok(evt) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    &evt,
+                    AdapterEvent::SessionEnded { local_id, .. }
+                        if local_id == "deadbeefcafe00002"
+                ),
+                "a subagent mid-turn must stay alive however long its transcript stays quiet"
+            );
+        }
+
+        // Its answer finally lands: the tail now reads finished, so the idle
+        // window ends it for real.
+        write_subagent(
+            &d,
+            "abcd1234",
+            "deadbeefcafe00002",
+            &[SUB_TOOL_USE, SUB_TOOL_RESULT, SUB_FINAL_TEXT],
+        );
+        let mut ended = 0;
+        for _ in 0..(SUBAGENT_IDLE_TICKS_TO_END + 2) {
+            d.apply_snapshot(vec![snap("abcd1234", "working", None)]).await;
+            while let Ok(evt) = rx.try_recv() {
+                if matches!(
+                    &evt,
+                    AdapterEvent::SessionEnded { local_id, .. }
+                        if local_id == "deadbeefcafe00002"
+                ) {
+                    ended += 1;
+                }
+            }
+        }
+        assert_eq!(ended, 1, "a finished subagent still ends exactly once");
+    }
+
+    #[tokio::test]
+    async fn a_subagent_ends_when_the_parent_records_its_tool_result() {
+        // The authoritative end: the parent's `Task` call returned. It closes
+        // the subagent on the next poll — no idle window to wait out — even
+        // though the subagent's own tail stopped mid-turn.
+        let (mut d, mut rx) = driver();
+        write_parent(
+            &d,
+            "abcd1234",
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_task1","name":"Task","input":{}}]}}"#,
+            ],
+        );
+        write_subagent(&d, "abcd1234", "deadbeefcafe00003", &[SUB_TOOL_USE, SUB_TOOL_RESULT]);
+        let parent_path =
+            transcript::transcript_path(&d.cfg.projects_root, "/tmp", "abcd1234-uuid");
+        std::fs::write(
+            transcript::subagents_dir(&parent_path).join("agent-deadbeefcafe00003.meta.json"),
+            br#"{"agentType":"general-purpose","description":"child","toolUseId":"toolu_task1"}"#,
+        )
+        .unwrap();
+        d.apply_snapshot(vec![snap("abcd1234", "working", None)]).await;
+        while rx.try_recv().is_ok() {}
+
+        // Still mid-turn, still alive.
+        d.apply_snapshot(vec![snap("abcd1234", "working", None)]).await;
+        while let Ok(evt) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    &evt,
+                    AdapterEvent::SessionEnded { local_id, .. }
+                        if local_id == "deadbeefcafe00003"
+                ),
+                "the Task call has not returned yet"
+            );
+        }
+
+        // The parent records the Task's result → the child is over.
+        write_parent(
+            &d,
+            "abcd1234",
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_task1","name":"Task","input":{}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_task1","content":"report"}]}}"#,
+            ],
+        );
+        d.apply_snapshot(vec![snap("abcd1234", "working", None)]).await;
+        let mut ended = 0;
+        while let Ok(evt) = rx.try_recv() {
+            if matches!(
+                &evt,
+                AdapterEvent::SessionEnded { local_id, .. } if local_id == "deadbeefcafe00003"
+            ) {
+                ended += 1;
+            }
+        }
+        assert_eq!(ended, 1, "the parent's tool_result ends the subagent at once");
     }
 
     #[tokio::test]

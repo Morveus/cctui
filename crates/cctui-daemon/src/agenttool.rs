@@ -24,6 +24,10 @@ use crate::client::ServerClient;
 /// Cadence of progress frames to the relay while a child runs.
 const PROGRESS_EVERY: Duration = Duration::from_secs(15);
 
+/// Relay protocol from which the daemon announces the child id in an
+/// `attached` frame, and accepts a `follow_agent` reattach.
+const ATTACH_PROTO: u64 = 3;
+
 /// A child that has shown no sign of life at all by this point never reached
 /// its first model call — waiting out `timeout_secs` only delays the failure.
 const SILENT_CHILD_GRACE: Duration = Duration::from_secs(90);
@@ -45,6 +49,11 @@ pub fn socket_path() -> PathBuf {
 enum CallKind {
     Spawn(SpawnChildRequest),
     Message(MessageChildRequest),
+    /// Reattach to a child that is already running and follow it to the end,
+    /// sending it nothing. The relay issues this after the socket died under
+    /// it (daemon re-exec on auto-update): the child never stopped, only the
+    /// wait did, so resuming the wait must not re-prompt the child.
+    Follow(String),
 }
 
 struct Call {
@@ -101,13 +110,17 @@ fn parse_call(line: &str) -> Result<Call, String> {
     let session_id = resolve_session_alias(&session_id);
     let args = v.get("args").cloned().unwrap_or_else(|| json!({}));
     let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or("").to_owned();
-    if prompt.trim().is_empty() {
-        return Err("prompt is required".to_owned());
-    }
     let timeout = crate::mcp::resolve_timeout(v.get("timeout_secs").and_then(Value::as_u64));
     let proto = v.get("proto").and_then(Value::as_u64).unwrap_or(1);
     let kind = match v.get("kind").and_then(Value::as_str) {
+        // A reattach carries no prompt by construction: it resumes a wait.
+        Some("follow_agent") => CallKind::Follow(
+            string_arg(&args, "session_id").ok_or("follow_agent needs the child session_id")?,
+        ),
         Some("spawn_agent") => {
+            if prompt.trim().is_empty() {
+                return Err("prompt is required".to_owned());
+            }
             if let Some(child) = string_arg(&args, "session_id") {
                 CallKind::Message(MessageChildRequest { session_id: child, prompt })
             } else {
@@ -188,6 +201,10 @@ fn dispatch_note(kind: &CallKind, timeout: Duration) -> String {
         CallKind::Message(req) => format!(
             "\n\n[follow-up to child {} · runs on the child's original model, `model` is ignored here · follow window {}s]",
             req.session_id,
+            timeout.as_secs(),
+        ),
+        CallKind::Follow(child) => format!(
+            "\n\n[reattached to child {child} after the daemon restarted · nothing was re-sent to it · follow window {}s]",
             timeout.as_secs(),
         ),
     }
@@ -367,7 +384,24 @@ async fn run_call(
             );
             (handle, req.session_id.clone())
         }
+        CallKind::Follow(child) => {
+            let handle = watch.register_bound(child);
+            tracing::info!(
+                parent = %call.session_id,
+                child = %child,
+                "CctuiAgent reattaching to a running child",
+            );
+            (handle, child.clone())
+        }
     };
+    // Tell the relay which child this call is now following, BEFORE the first
+    // wait. A daemon re-exec closes this socket without a result, and the
+    // relay can only resume the wait if it already knows the child's id —
+    // waiting for the first 15s progress frame loses every call that dies in
+    // the first quarter-minute.
+    if call.proto >= ATTACH_PROTO {
+        let _ = write_line(out, &json!({ "attached": child_id })).await;
+    }
     let result =
         follow_child_with(&handle, &child_id, call.timeout, SILENT_CHILD_GRACE, call.proto, out)
             .await;
@@ -702,6 +736,31 @@ mod tests {
         assert!(parse_call(&no_session.to_string()).is_err());
         assert!(parse_call("not json").is_err());
         assert!(parse_call(&json!({ "kind": "other" }).to_string()).is_err());
+    }
+
+    /// claudo/inbox#210: after a daemon re-exec the relay reattaches to the
+    /// child it was already following. A reattach carries no prompt — sending
+    /// one would make the child redo work — so the parser must accept it
+    /// without one, and must refuse one that names no child.
+    #[test]
+    fn a_follow_agent_call_reattaches_to_a_child_without_a_prompt() {
+        let line = json!({
+            "kind": "follow_agent",
+            "session_id": "parent-1",
+            "proto": 3,
+            "args": { "session_id": "child-42" },
+        })
+        .to_string();
+        let call = parse_call(&line).unwrap();
+        assert_eq!(call.session_id, "parent-1");
+        let CallKind::Follow(child) = call.kind else { panic!("expected a reattach") };
+        assert_eq!(child, "child-42");
+
+        let no_child = json!({ "kind": "follow_agent", "session_id": "parent-1", "args": {} });
+        assert!(
+            parse_call(&no_child.to_string()).is_err(),
+            "a reattach that names no child has nothing to follow"
+        );
     }
 
     #[test]

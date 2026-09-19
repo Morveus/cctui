@@ -1,5 +1,6 @@
 mod account_pick;
 mod account_resolve;
+mod admission;
 mod auth;
 mod authz;
 mod auto_archive;
@@ -1273,6 +1274,14 @@ fn build_api_routes() -> Routes {
             Authenticated,
         )
         .add(
+            &[Method::PUT],
+            "/machines/{machine_id}/mem-ceiling",
+            "Set or clear the machine's RAM ceiling: spawns over it wait in a queue.",
+            put(machine_resources::set_mem_ceiling),
+            Authn::Bearer,
+            Authenticated,
+        )
+        .add(
             &[GET],
             "/machines/{machine_id}/status",
             "Machine connectivity/liveness snapshot (remote-enroll verification).",
@@ -1563,11 +1572,11 @@ async fn auto_archive_stale(state: &AppState) {
             i64::try_from(state.config.archive_after_secs).unwrap_or(i64::MAX),
         );
     match sqlx::query_scalar::<_, String>(
-        // Drafts are staged-not-running — never auto-archive them.
+        // Drafts and queued spawns are not running: never auto-archive them.
         "UPDATE sessions SET status = 'archived', \
              ended_at = COALESCE(ended_at, now()), \
              end_reason = COALESCE(end_reason, 'reaped_inactive') \
-         WHERE status NOT IN ('archived', 'draft') AND pinned = false AND last_heartbeat < $1 \
+         WHERE status NOT IN ('archived', 'draft', 'queued') AND pinned = false AND last_heartbeat < $1 \
          RETURNING id",
     )
     .bind(cutoff)
@@ -1603,6 +1612,7 @@ async fn reaper_task(state: AppState) {
 
         auto_archive_stale(&state).await;
         auto_archive::sweep(&state).await;
+        admission::drain(&state).await;
 
         // Soft-delete ephemeral (dispatch/worker) machines that have gone
         // quiet past the TTL — pods that died before self-deenroll.

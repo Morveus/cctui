@@ -67,7 +67,7 @@ pub async fn spawn_session(
         return save_draft(&state, &ctx, &req).await;
     }
 
-    dispatch_spawn(&state, &ctx, req, uploads).await
+    crate::admission::spawn_or_queue(&state, &ctx, req, uploads).await
 }
 
 /// Dispatch a spawn to the targeted daemon. Shared by the immediate spawn path
@@ -80,6 +80,21 @@ pub async fn dispatch_spawn(
     ctx: &AuthContext,
     req: SpawnRequest,
     uploads: Vec<cctui_proto::adapter::BootstrapFile>,
+) -> Result<(StatusCode, Json<SpawnResponse>), (StatusCode, Json<ApiError>)> {
+    dispatch_spawn_as(state, ctx, req, uploads, None).await
+}
+
+/// [`dispatch_spawn`] with the session id chosen by the caller: a queued spawn
+/// launches under the id its `queued` row was shown with, so a link to it
+/// keeps working once the session is live (claude-code only; the other
+/// adapters mint their own id and ignore it).
+#[allow(clippy::too_many_lines)]
+pub async fn dispatch_spawn_as(
+    state: &AppState,
+    ctx: &AuthContext,
+    req: SpawnRequest,
+    uploads: Vec<cctui_proto::adapter::BootstrapFile>,
+    preset_session_id: Option<Uuid>,
 ) -> Result<(StatusCode, Json<SpawnResponse>), (StatusCode, Json<ApiError>)> {
     // Validate env keys: shell-style `^[A-Z_][A-Z0-9_]*$`.
     for key in req.env.keys() {
@@ -130,7 +145,7 @@ pub async fn dispatch_spawn(
     // codex until a codex-side reconcile lands).
     let command_id = Uuid::new_v4();
     let is_claude = adapter_id == "claude-code";
-    let pre_session_id = is_claude.then(Uuid::new_v4);
+    let pre_session_id = is_claude.then(|| preset_session_id.unwrap_or_else(Uuid::new_v4));
     // The id the gateway session token is bound to: the pre-minted real session
     // id for claude, else the command_id (legacy behaviour).
     let token_session_id = pre_session_id.unwrap_or(command_id).to_string();
@@ -738,6 +753,30 @@ pub async fn launch_draft(
     let Some((status, metadata)) = row else {
         return Err((StatusCode::NOT_FOUND, Json(ApiError { error: "draft not found".into() })));
     };
+    // A queued spawn: the human overrides the RAM ceiling and launches it now.
+    if status == "queued" {
+        let launched = crate::admission::launch_now(&state, &session_id).await.map_err(|e| {
+            tracing::error!("db error (launch queued): {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "database error".into() }))
+        })?;
+        if !launched {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "queued spawn is already launching or could not launch".into(),
+                }),
+            ));
+        }
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(SpawnResponse {
+                command_id: Uuid::parse_str(&session_id).unwrap_or_else(|_| Uuid::nil()),
+                status: "dispatched".into(),
+                account: None,
+                session_id: Uuid::parse_str(&session_id).ok(),
+            }),
+        ));
+    }
     if status != "draft" {
         return Err(bad_request("session is not a draft"));
     }
@@ -753,9 +792,9 @@ pub async fn launch_draft(
     req.env = launch.env;
     req.save_draft = false;
 
-    let outcome = dispatch_spawn(&state, &ctx, req, Vec::new()).await?;
+    let outcome = crate::admission::spawn_or_queue(&state, &ctx, req, Vec::new()).await?;
 
-    // Drop the draft only after a successful dispatch; the live session is born
+    // Drop the draft only after a successful dispatch (or queueing); the live session is born
     // from the daemon's registration with its own id.
     if let Err(e) = sqlx::query("DELETE FROM sessions WHERE id = $1 AND status = 'draft'")
         .bind(&session_id)
@@ -768,13 +807,14 @@ pub async fn launch_draft(
     Ok(outcome)
 }
 
-/// `POST /api/v1/sessions/{id}/discard`. Delete a draft session row.
-/// Only acts on `draft` rows so it can never delete a real session.
+/// `POST /api/v1/sessions/{id}/discard`. Delete a draft or queued session
+/// row (a queued one takes its `spawn_queue` payload with it). Only acts on
+/// those two statuses so it can never delete a real session.
 pub async fn discard_draft(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
-    let res = sqlx::query("DELETE FROM sessions WHERE id = $1 AND status = 'draft'")
+    let res = sqlx::query("DELETE FROM sessions WHERE id = $1 AND status IN ('draft', 'queued')")
         .bind(&session_id)
         .execute(&state.pool)
         .await

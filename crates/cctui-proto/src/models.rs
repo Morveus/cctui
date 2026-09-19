@@ -16,6 +16,10 @@ use ts_rs::TS;
 ///   payload in `metadata.draft` but has no `command_id`, no daemon dispatch,
 ///   and no heartbeat — excluded from liveness/reaping. An explicit Launch
 ///   mints env fresh, dispatches a normal spawn, and removes the draft.
+/// - `Queued`: a spawn held back because its machine was over the RAM ceiling
+///   set for it. The figures that held it back ride in `metadata.queued`; the
+///   reaper launches it once the machine is back under its ceiling, and the
+///   live session then registers under the same id (claude-code) or its own.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +29,7 @@ pub enum SessionStatus {
     Inactive,
     Archived,
     Draft,
+    Queued,
 }
 
 /// Coarse liveness tier for the sessions-list status dot.

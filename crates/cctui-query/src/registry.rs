@@ -50,7 +50,7 @@ pub static FIELDS: &[FieldDef] = &[
         aliases: &[],
         ty: FieldType::Enum,
         default_op: FilterOp::Eq,
-        enum_values: &["new", "active", "inactive", "archived", "draft"],
+        enum_values: &["new", "active", "inactive", "archived", "draft", "queued"],
     },
     FieldDef {
         name: "model",

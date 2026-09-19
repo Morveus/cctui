@@ -130,7 +130,10 @@ impl Registry {
                 // Archived sessions are deregistered, so this is defensive;
                 // either way there's nothing to demote. Drafts are
                 // never registered in memory, so this arm is also defensive.
-                SessionStatus::Inactive | SessionStatus::Archived | SessionStatus::Draft => false,
+                SessionStatus::Inactive
+                | SessionStatus::Archived
+                | SessionStatus::Draft
+                | SessionStatus::Queued => false,
             };
             if should_demote {
                 handle.session.status = SessionStatus::Inactive;

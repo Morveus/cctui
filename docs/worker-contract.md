@@ -1179,6 +1179,29 @@ inspection in the UI rather than being silently reaped.
 `adapter` accepts the spellings a model is likely to produce: `claude_code` /
 `claude` → `claude-code`, `codex-cli` → `codex`.
 
+### Surviving a daemon restart mid-call
+
+The relay talks to the daemon over a Unix socket, and an auto-update re-exec
+(`execve`) drops **every** open agent-tool connection at once — which used to
+fail every in-flight call together with `the daemon closed the connection
+without a result`, while the children themselves kept running.
+
+Socket protocol 3 makes the wait resumable:
+
+- the daemon writes an `{"attached": "<child-id>"}` frame as soon as the child
+  is known, before the first wait, so the relay always has an id to come back
+  to — not only after the first 15s progress frame;
+- on EOF the relay reconnects (up to 3min, 5 reattaches) and issues
+  `{"kind": "follow_agent", "args": {"session_id": "<child-id>"}}`, which
+  reattaches to the running child and **sends it nothing**: re-prompting would
+  make it redo work;
+- a read timeout is never treated as a restart — the daemon owes a result
+  there, and reattaching would loop forever.
+
+When the daemon dies before naming the child, or keeps restarting, the call
+still fails, but the text says the daemon restarted and points at the child
+rather than blaming it.
+
 ### Registration
 
 Only **claude sessions** get the tool today. At launch the daemon writes a

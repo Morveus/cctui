@@ -42,16 +42,29 @@ arrived: that is an in-memory channel, and the server can die before the socket
 flushes, or the daemon before it acts. So the request is kept, in `sent`, until
 one of two proofs:
 
-- the daemon's **receipt** for that launch's `command_id` (an `ok` settles it,
-  a refusal ends the session with what the daemon said);
+- the daemon's **positive receipt** for that launch's `command_id`;
 - its **session registering** under the queued id (claude-code launches under
   the id its row was shown with).
 
+A *negative* receipt is not a proof either: the daemon reports the same untyped
+error whether its control socket refused the spawn or answered too late, and in
+the second case the worker may be running. Such a receipt puts the request in
+doubt, with what the daemon said, instead of declaring a failure.
+
 Anything else leaves an outcome nobody can decide: a send that broke, a server
-that died mid-attempt, a receipt that never came (10 minutes). Such a launch is
+that died mid-attempt, a receipt that never came (10 minutes), a negative
+receipt. Such a launch is
 never called a failure and never silently dropped: the row goes to `uncertain`,
 keeping the whole request, and the session shows **Launch outcome unknown**
 with what to do.
+
+While a launch is on its way (command sent, answer not back), the session says
+so rather than showing a wait for RAM, and cancelling it uses the same
+non-destructive wording as an uncertain one: it drops cctui's request, it does
+not stop anything already running on the machine.
+
+A receipt only counts for the machine whose daemon authenticated it: a session
+id is not an authorisation secret.
 
 Recovery, in that case:
 
@@ -68,7 +81,10 @@ deduplicate a repeated `command_id` (persisted across its own restarts) and to
 stamp the session it starts with that id. The `command_id` is already stored
 with the queued row, indexed, and stays the same across attempts, which is what
 such a daemon would key on. With it, an uncertain launch could simply be sent
-again, and a codex session could be tied back to its request.
+again, and a codex session could be tied back to its request. A daemon that
+also typed its command errors (refused before starting / answer lost after
+dispatch) would let a proven refusal end the session straight away, instead of
+asking a human.
 
 ## What does not go through the queue
 

@@ -78,6 +78,16 @@ export function queuedFigures(s: Pick<SessionListItem, 'metadata'>): QueuedFigur
 }
 
 /** "47,2 Go utilisés (+3 Go lancés à l'instant) · plafond 45 Go". */
+/**
+ * Set while a launch is on its way to the machine: the command has left, and
+ * the answer has not come back yet. Such a session is no longer merely waiting
+ * for RAM, and cancelling it cannot promise that nothing will start.
+ */
+export function launchInflight(s: Pick<SessionListItem, 'metadata'>): boolean {
+	const raw = (s.metadata as Record<string, unknown> | null)?.launch_inflight;
+	return !!raw && typeof raw === 'object';
+}
+
 /** What the server records on a launch whose outcome nobody can tell. */
 export interface LaunchUncertain {
 	why: string;

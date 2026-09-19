@@ -1018,6 +1018,8 @@
 	"queued_figures_with_recent": "{used} utilisés (+{recent} lancés à l'instant) · plafond {ceiling}",
 	"queued_keep_waiting": "Laisser en attente",
 	"queued_launch_now": "Lancer maintenant",
+	"queued_inflight_title": "Lancement en cours d'envoi",
+	"queued_inflight_body": "Le lancement a été envoyé à la machine et cctui attend sa confirmation. La session apparaît ici dès qu'elle démarre.",
 	"queued_drop": "Ne plus suivre",
 	"queued_confirm_drop_title": "Ne plus suivre ce lancement ?",
 	"queued_confirm_drop_body": "Cela retire seulement la demande en attente de cctui. Si la machine a bien démarré la session, celle-ci continue de tourner là-bas : vérifiez la machine et arrêtez-la vous-même si vous n'en voulez pas.",

@@ -369,7 +369,7 @@ const ATTEMPT_GRACE_SECS: f64 = 600.0;
 /// before anything is sent, so a second attempt can never start behind this
 /// one's back: the command goes out at most once per row.
 async fn claim(pool: &sqlx::PgPool, session_id: &str) -> Result<Option<QueuedRow>, sqlx::Error> {
-    sqlx::query_as(
+    let row: Option<QueuedRow> = sqlx::query_as(
         "UPDATE spawn_queue SET state = 'sending', attempt_since = now() \
          WHERE session_id = $1 AND state = 'waiting' \
          RETURNING session_id, machine_uuid, caller_id, caller_key_id, request, env_enc, \
@@ -377,7 +377,35 @@ async fn claim(pool: &sqlx::PgPool, session_id: &str) -> Result<Option<QueuedRow
     )
     .bind(session_id)
     .fetch_optional(pool)
-    .await
+    .await?;
+    if row.is_some() {
+        // From here on the launch may be on its way: the UI must stop calling
+        // this a wait for RAM, and cancelling must stop promising that nothing
+        // will ever start.
+        set_inflight(pool, session_id, true).await?;
+    }
+    Ok(row)
+}
+
+/// Flag, or clear, "a launch is on its way" on the placeholder session, so the
+/// UI can be honest about a request that may already be running.
+async fn set_inflight(pool: &sqlx::PgPool, session_id: &str, on: bool) -> Result<(), sqlx::Error> {
+    if on {
+        sqlx::query(
+            "UPDATE sessions SET metadata = jsonb_set(metadata, '{launch_inflight}', $2) \
+             WHERE id = $1 AND status = 'queued'",
+        )
+        .bind(session_id)
+        .bind(json!({ "since": chrono::Utc::now().to_rfc3339() }))
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query("UPDATE sessions SET metadata = metadata - 'launch_inflight' WHERE id = $1")
+            .bind(session_id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Put a row back in the queue: only for an attempt that sent nothing.
@@ -388,6 +416,7 @@ async fn release(pool: &sqlx::PgPool, session_id: &str) -> Result<(), sqlx::Erro
     .bind(session_id)
     .execute(pool)
     .await?;
+    set_inflight(pool, session_id, false).await?;
     Ok(())
 }
 
@@ -406,7 +435,8 @@ async fn finish_launched(pool: &sqlx::PgPool, session_id: &str) -> Result<(), sq
         .execute(&mut *tx)
         .await?;
     sqlx::query(
-        "UPDATE sessions SET metadata = metadata - 'queued' - 'launch_uncertain' WHERE id = $1",
+        "UPDATE sessions SET metadata = \
+           metadata - 'queued' - 'launch_uncertain' - 'launch_inflight' WHERE id = $1",
     )
     .bind(session_id)
     .execute(&mut *tx)
@@ -425,7 +455,8 @@ async fn end_failed(pool: &sqlx::PgPool, session_id: &str, why: &str) -> Result<
         .await?;
     sqlx::query(
         "UPDATE sessions SET status = 'ended', ended_at = now(), \
-           end_reason = 'spawn_failed', end_detail = $2, metadata = metadata - 'queued' \
+           end_reason = 'spawn_failed', end_detail = $2, \
+           metadata = metadata - 'queued' - 'launch_inflight' \
          WHERE id = $1 AND status = 'queued'",
     )
     .bind(session_id)
@@ -440,8 +471,12 @@ async fn end_failed(pool: &sqlx::PgPool, session_id: &str, why: &str) -> Result<
 /// daemon's receipt for its `command_id` or until its session registers. A
 /// `sent` row is never picked up by a drain.
 async fn mark_sent(pool: &sqlx::PgPool, session_id: &str) -> Result<(), sqlx::Error> {
+    // Only from `sending`: a receipt can land between the send and this
+    // update, and a settled or doubtful row must not be dragged back to
+    // `sent`. It changes no decision, it keeps the state truthful.
     sqlx::query(
-        "UPDATE spawn_queue SET state = 'sent', attempt_since = now() WHERE session_id = $1",
+        "UPDATE spawn_queue SET state = 'sent', attempt_since = now() \
+         WHERE session_id = $1 AND state = 'sending'",
     )
     .bind(session_id)
     .execute(pool)
@@ -465,7 +500,8 @@ async fn mark_uncertain(
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "UPDATE sessions SET metadata = jsonb_set(metadata, '{launch_uncertain}', $2) \
+        "UPDATE sessions SET metadata = \
+           jsonb_set(metadata, '{launch_uncertain}', $2) - 'launch_inflight' \
          WHERE id = $1 AND status = 'queued'",
     )
     .bind(session_id)
@@ -557,42 +593,76 @@ pub async fn retry_uncertain(pool: &sqlx::PgPool, session_id: &str) -> Result<bo
 }
 
 /// The queued launch a receipt belongs to, if any: receipts also come back
-/// for every spawn that never went through the queue.
+/// for every spawn that never went through the queue. Scoped to the machine
+/// whose authenticated daemon sent it, so no daemon can settle, or cast doubt
+/// on, a launch waiting for another machine.
 async fn queued_of_command(
     pool: &sqlx::PgPool,
+    machine: Uuid,
     command_id: Uuid,
 ) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar("SELECT session_id FROM spawn_queue WHERE command_id = $1")
-        .bind(command_id)
-        .fetch_optional(pool)
-        .await
+    sqlx::query_scalar(
+        "SELECT session_id FROM spawn_queue WHERE command_id = $1 AND machine_uuid = $2",
+    )
+    .bind(command_id)
+    .bind(machine)
+    .fetch_optional(pool)
+    .await
 }
 
-/// The daemon's receipt for a launch cctui sent: the proof the queue waits
-/// for. `ok` settles the row as launched; a refusal ends the placeholder with
-/// what the daemon said, since that one did not start. Unknown command ids
-/// (every spawn that never went through the queue) are ignored.
+/// Apply a daemon receipt to the launch it belongs to. `Ok(None)` when the
+/// command never went through the queue (every other spawn's receipt).
+///
+/// A positive receipt is the proof the queue waits for: the request is done.
+/// A **negative** one is not proof of anything: the daemon reports the same
+/// untyped error for a control socket that refused the spawn and for one that
+/// answered too late or not at all, and in the second case the worker may well
+/// be running (`DeferredDispatch::send` in the claude-code adapter). So a
+/// negative receipt puts the request in doubt, keeping it whole, with what the
+/// daemon said, rather than declaring a failure that may not have happened.
+/// Returns the session id and whether the request is now settled for good.
+async fn apply_receipt(
+    pool: &sqlx::PgPool,
+    machine: Uuid,
+    command_id: Uuid,
+    ok: bool,
+    error: Option<&str>,
+) -> Result<Option<(String, bool)>, sqlx::Error> {
+    let Some(session_id) = queued_of_command(pool, machine, command_id).await? else {
+        return Ok(None);
+    };
+    if ok {
+        finish_launched(pool, &session_id).await?;
+        return Ok(Some((session_id, true)));
+    }
+    let why = match error {
+        Some(e) => format!(
+            "the machine answered: {e}. That answer also covers a reply lost or too late after \
+             the launch was dispatched, so it does not say the session did not start"
+        ),
+        None => "the machine answered without saying what happened".to_owned(),
+    };
+    mark_uncertain(pool, &session_id, &why).await?;
+    Ok(Some((session_id, false)))
+}
+
+/// [`apply_receipt`], then tell the UIs. Receipts for spawns that never
+/// queued are ignored.
 pub async fn settle_receipt(state: &AppState, command_id: Uuid, ok: bool, error: Option<&str>) {
-    let session_id = match queued_of_command(&state.pool, command_id).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return,
-        Err(e) => {
-            tracing::warn!(%e, %command_id, "could not look up the queued launch of a receipt");
-            return;
-        }
-    };
-    let settled = if ok {
-        finish_launched(&state.pool, &session_id).await
-    } else {
-        let why = error.unwrap_or("the machine refused the launch");
-        end_failed(&state.pool, &session_id, why).await
-    };
-    match settled {
-        Ok(()) => {
+    match apply_receipt(&state.pool, command_id, ok, error).await {
+        Ok(None) => {}
+        Ok(Some((session_id, done))) => {
             tracing::info!(session = %session_id, %command_id, ok, "queued launch acknowledged");
-            state.bus.publish_server(ServerEvent::SessionDeregistered { session_id });
+            if done {
+                state.bus.publish_server(ServerEvent::SessionDeregistered { session_id });
+            } else {
+                state.bus.publish_server(ServerEvent::Status {
+                    session_id,
+                    status: SessionStatus::Queued,
+                });
+            }
         }
-        Err(e) => tracing::warn!(%e, session = %session_id, "settling an acknowledged launch"),
+        Err(e) => tracing::warn!(%e, %command_id, "settling an acknowledged launch"),
     }
 }
 
@@ -741,12 +811,15 @@ fn announce(state: &AppState, session_id: &str, outcome: &LaunchOutcome) {
                 session_id: session_id.to_owned(),
             });
         }
-        LaunchOutcome::Sent | LaunchOutcome::Uncertain(_) => {
+        LaunchOutcome::Uncertain(_) => {
             state.bus.publish_server(ServerEvent::Status {
                 session_id: session_id.to_owned(),
                 status: SessionStatus::Queued,
             });
         }
+        // Sent: the placeholder already shows as waiting, and its receipt
+        // (or its session registering) is what changes the picture.
+        LaunchOutcome::Sent => {}
         LaunchOutcome::Retry(_) | LaunchOutcome::NotLaunchable => {}
     }
 }
@@ -1057,12 +1130,13 @@ mod tests {
         assert_eq!(launch_with(&pool, &sid, count()).await.unwrap(), LaunchOutcome::NotLaunchable);
 
         // Too early to settle: the attempt may still be running.
-        assert!(reconcile(&pool).await.unwrap().is_empty());
+        reconcile(&pool).await.unwrap();
+        assert_eq!(queue_state(&pool, &sid).await.as_deref(), Some("sending"), "left alone");
         age_attempt(&pool, &sid).await;
         // A restart changes nothing: the state is in the database, not in the
         // process. Reconciling keeps the request, in doubt, not failed.
         let after_restart = test_pool("admission_crash_before_send").await.unwrap();
-        assert!(reconcile(&after_restart).await.unwrap().contains(&sid));
+        reconcile(&after_restart).await.unwrap();
         assert_eq!(queue_state(&pool, &sid).await.as_deref(), Some("uncertain"));
         let (status, reason, meta) = session_row(&pool, &sid).await.expect("session kept");
         assert_eq!(status, "queued", "still waiting, not ended");
@@ -1103,39 +1177,112 @@ mod tests {
         // The server dies before any receipt: kept, in doubt, never resent.
         age_attempt(&pool, &sid).await;
         let after_restart = test_pool("admission_awaits_receipt").await.unwrap();
-        assert!(reconcile(&after_restart).await.unwrap().contains(&sid));
+        reconcile(&after_restart).await.unwrap();
         assert_eq!(queue_state(&pool, &sid).await.as_deref(), Some("uncertain"));
         assert!(in_queue(&pool, &sid).await);
         let (status, reason, meta) = session_row(&pool, &sid).await.unwrap();
         assert_eq!(status, "queued");
         assert!(reason.is_none(), "unacknowledged is not failed");
         assert!(meta["launch_uncertain"]["why"].is_string());
-        assert_eq!(queued_of_command(&pool, command).await.unwrap().as_deref(), Some(sid.as_str()));
+        assert_eq!(
+            queued_of_command(&pool, m, command).await.unwrap().as_deref(),
+            Some(sid.as_str())
+        );
     }
 
-    /// The receipt is the proof: it settles the row, one way or the other,
-    /// and a receipt for a spawn that never queued is ignored.
+    /// A positive receipt is the proof the request waits for. A negative one
+    /// is not: the daemon reports the same untyped error whether the spawn was
+    /// refused or its reply came too late, so the request is kept in doubt
+    /// with what the daemon said. A receipt for a spawn that never queued is
+    /// ignored.
     #[tokio::test]
-    async fn a_receipt_settles_the_request_it_belongs_to() {
+    async fn a_receipt_settles_or_casts_doubt_but_never_invents_a_failure() {
         let Some(pool) = test_pool("admission_receipt").await else { return };
         let m = machine(&pool, 10, Some(45)).await;
+        let handed_over = async |_row: QueuedRow| Ok(());
 
         let ok = queue_row(&pool, m, "codex").await;
-        let handed_over = async |_row: QueuedRow| Ok(());
+        let ok_command = command_of(&pool, &ok).await;
         launch_with(&pool, &ok, handed_over).await.unwrap();
-        finish_launched(&pool, &ok).await.unwrap();
+        assert_eq!(
+            apply_receipt(&pool, m, ok_command, true, None).await.unwrap(),
+            Some((ok.clone(), true))
+        );
         assert!(!in_queue(&pool, &ok).await, "acknowledged: the request is done");
         assert_eq!(session_row(&pool, &ok).await, None, "the placeholder made way");
 
-        let refused = queue_row(&pool, m, "codex").await;
+        // The claude-code adapter reports this same shape for a dispatch whose
+        // reply timed out, after the worker may already have started.
+        let doubtful = queue_row(&pool, m, "codex").await;
+        let doubtful_command = command_of(&pool, &doubtful).await;
         let handed_over = async |_row: QueuedRow| Ok(());
-        launch_with(&pool, &refused, handed_over).await.unwrap();
-        end_failed(&pool, &refused, "claude: no such working directory").await.unwrap();
-        assert!(!in_queue(&pool, &refused).await);
-        let (status, reason, _) = session_row(&pool, &refused).await.unwrap();
-        assert_eq!((status.as_str(), reason.as_deref()), ("ended", Some("spawn_failed")));
+        launch_with(&pool, &doubtful, handed_over).await.unwrap();
+        assert_eq!(
+            apply_receipt(&pool, m, doubtful_command, false, Some("dispatch spawn: timed out"))
+                .await
+                .unwrap(),
+            Some((doubtful.clone(), false))
+        );
+        assert_eq!(queue_state(&pool, &doubtful).await.as_deref(), Some("uncertain"));
+        assert!(in_queue(&pool, &doubtful).await, "the request is kept whole");
+        let (status, reason, meta) = session_row(&pool, &doubtful).await.unwrap();
+        assert_eq!(status, "queued");
+        assert!(reason.is_none(), "a negative receipt is not proof of a failure");
+        let why = meta["launch_uncertain"]["why"].as_str().unwrap();
+        assert!(why.contains("timed out"), "the human reads what the machine said: {why}");
 
-        assert_eq!(queued_of_command(&pool, Uuid::new_v4()).await.unwrap(), None);
+        assert_eq!(apply_receipt(&pool, m, Uuid::new_v4(), true, None).await.unwrap(), None);
+    }
+
+    /// A receipt only speaks for the machine whose daemon authenticated it: a
+    /// session id is not a secret, and another machine must not be able to
+    /// settle, or cast doubt on, a launch waiting elsewhere.
+    #[tokio::test]
+    async fn a_receipt_from_another_machine_changes_nothing() {
+        let Some(pool) = test_pool("admission_receipt_scope").await else { return };
+        let mine = machine(&pool, 10, Some(45)).await;
+        let other = machine(&pool, 10, Some(45)).await;
+        let sid = queue_row(&pool, mine, "codex").await;
+        let command = command_of(&pool, &sid).await;
+        let handed_over = async |_row: QueuedRow| Ok(());
+        launch_with(&pool, &sid, handed_over).await.unwrap();
+
+        assert_eq!(queued_of_command(&pool, other, command).await.unwrap(), None);
+        assert_eq!(apply_receipt(&pool, other, command, true, None).await.unwrap(), None);
+        assert_eq!(apply_receipt(&pool, other, command, false, Some("nope")).await.unwrap(), None);
+        assert_eq!(queue_state(&pool, &sid).await.as_deref(), Some("sent"), "untouched");
+        assert!(in_queue(&pool, &sid).await);
+
+        // Its own machine settles it.
+        assert!(apply_receipt(&pool, mine, command, true, None).await.unwrap().is_some());
+        assert!(!in_queue(&pool, &sid).await);
+    }
+
+    /// While a launch is on its way, the session says so, so the UI stops
+    /// calling it a wait for RAM and stops promising nothing will start.
+    #[tokio::test]
+    async fn a_launch_on_its_way_is_flagged_on_the_session() {
+        let Some(pool) = test_pool("admission_inflight").await else { return };
+        let m = machine(&pool, 10, Some(45)).await;
+        let sid = queue_row(&pool, m, "codex").await;
+        assert!(session_row(&pool, &sid).await.unwrap().2.get("launch_inflight").is_none());
+
+        // Nothing sent: the flag goes with the row back to the queue.
+        let offline = async |_row: QueuedRow| Err(DispatchError::NotSent("offline".into()));
+        launch_with(&pool, &sid, offline).await.unwrap();
+        assert!(session_row(&pool, &sid).await.unwrap().2.get("launch_inflight").is_none());
+
+        let handed_over = async |_row: QueuedRow| Ok(());
+        launch_with(&pool, &sid, handed_over).await.unwrap();
+        let meta = session_row(&pool, &sid).await.unwrap().2;
+        assert!(meta["launch_inflight"]["since"].is_string(), "the UI knows it is on its way");
+
+        // A doubt replaces it, so the UI shows one state, not two.
+        let command = command_of(&pool, &sid).await;
+        apply_receipt(&pool, m, command, false, Some("dispatch spawn: timed out")).await.unwrap();
+        let meta = session_row(&pool, &sid).await.unwrap().2;
+        assert!(meta.get("launch_inflight").is_none());
+        assert!(meta["launch_uncertain"]["why"].is_string());
     }
 
     /// Review P1, crash AFTER the send: a session that registered is
@@ -1156,7 +1303,7 @@ mod tests {
             .await
             .unwrap();
         age_attempt(&pool, &sid).await;
-        assert!(reconcile(&pool).await.unwrap().contains(&sid));
+        reconcile(&pool).await.unwrap();
         assert!(!in_queue(&pool, &sid).await, "settled: it did start");
         let (status, reason, meta) = session_row(&pool, &sid).await.unwrap();
         assert_eq!(status, "active", "the live session is kept as it is");
@@ -1184,7 +1331,8 @@ mod tests {
         // It is the codex thread that will tell: until a human settles it,
         // neither the drain nor a reconcile touches it.
         assert_eq!(next_head(&pool, m).await.unwrap(), None);
-        assert!(reconcile(&pool).await.unwrap().is_empty());
+        reconcile(&pool).await.unwrap();
+        assert_eq!(queue_state(&pool, &sid).await.as_deref(), Some("uncertain"), "still in doubt");
         assert!(in_queue(&pool, &sid).await);
     }
 
@@ -1239,8 +1387,11 @@ mod tests {
         let ok = queue_row(&pool, m, "claude-code").await;
         let sent = async |_row: QueuedRow| Ok(());
         assert_eq!(launch_now_with(&pool, &ok, sent).await.unwrap(), LaunchOutcome::Sent);
-        assert_eq!(admissions(&pool, m).await, 1);
-        assert_eq!(session_row(&pool, &ok).await, None, "placeholder gone once launched");
+        assert_eq!(admissions(&pool, m).await, 1, "the RAM it is about to take is counted");
+        // Sent is not proof: the request and its placeholder stay until the
+        // receipt, or until the session registers.
+        assert_eq!(queue_state(&pool, &ok).await.as_deref(), Some("sent"));
+        assert_eq!(session_row(&pool, &ok).await.unwrap().0, "queued");
     }
 
     /// Review P1: the queue keeps who asked, not their rights. At launch the

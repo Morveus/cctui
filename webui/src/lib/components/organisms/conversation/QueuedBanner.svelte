@@ -9,7 +9,7 @@
 	import { useSessionActions } from '$lib/queries';
 	import { m } from '$lib/paraglide/messages';
 	import { toasts } from '$lib/toast.svelte';
-	import { launchUncertain, queuedFigures, queuedSummary } from '$lib/memCeiling';
+	import { launchInflight, launchUncertain, queuedFigures, queuedSummary } from '$lib/memCeiling';
 
 	let { session, onclose }: { session: SessionListItem; onclose: () => void } = $props();
 
@@ -18,6 +18,12 @@
 	// An interrupted launch: nobody can say whether the machine got it, so the
 	// request is kept and only a human decides what happens next.
 	const doubt = $derived(launchUncertain(session));
+	// The command has left for the machine and no answer has come back: it is
+	// no longer a wait for RAM, and it may already be running over there.
+	const inflight = $derived(!doubt && launchInflight(session));
+	// Both states mean a session may exist on the machine, so cancelling only
+	// drops cctui's request and never promises to stop anything.
+	const mayHaveStarted = $derived(doubt !== null || inflight);
 	let confirming = $state<'launch' | 'discard' | null>(null);
 	let busy = $state(false);
 
@@ -33,7 +39,7 @@
 			// A 409 on a session in doubt is the server refusing to guess, not
 			// "already launching": show what it said rather than a wrong reason.
 			toasts.error(
-				e instanceof ApiError && e.status === 409 && !doubt
+				e instanceof ApiError && e.status === 409 && !mayHaveStarted
 					? m.queued_toast_launch_conflict()
 					: m.queued_toast_launch_failed({ error: errMessage(e) })
 			);
@@ -47,7 +53,7 @@
 		busy = true;
 		try {
 			await actions.discardDraft(session.id);
-			toasts.ok(doubt ? m.queued_toast_dropped() : m.queued_toast_discarded());
+			toasts.ok(mayHaveStarted ? m.queued_toast_dropped() : m.queued_toast_discarded());
 			onclose();
 		} catch (e) {
 			toasts.error(m.queued_toast_discard_failed({ error: errMessage(e) }));
@@ -62,17 +68,27 @@
 	<Callout
 		tone={doubt ? 'danger' : 'warn'}
 		icon={doubt ? 'alert' : 'clock'}
-		title={doubt ? m.queued_uncertain_title() : m.queued_banner_title()}
+		title={doubt
+			? m.queued_uncertain_title()
+			: inflight
+				? m.queued_inflight_title()
+				: m.queued_banner_title()}
 	>
 		<Stack gap="var(--sp-2)">
-			<Text size="sm">{doubt ? m.queued_uncertain_body({ why: doubt.why }) : m.queued_banner_body()}</Text>
+			<Text size="sm"
+				>{doubt
+					? m.queued_uncertain_body({ why: doubt.why })
+					: inflight
+						? m.queued_inflight_body()
+						: m.queued_banner_body()}</Text
+			>
 			{#if doubt && doubt.since}
 				<Text size="xs" tone="faint"
 					>{m.queued_uncertain_since()}
 					<Timestamp value={doubt.since} mode="relative" tone="faint" size="xs" /></Text
 				>
 			{/if}
-			{#if figures && !doubt}
+			{#if figures && !doubt && !inflight}
 				<Text size="sm" weight="semibold">{queuedSummary(figures)}</Text>
 				{#if figures.checked_at}
 					<Text size="xs" tone="faint"
@@ -84,11 +100,18 @@
 		</Stack>
 		{#snippet actions()}
 			<Cluster gap="var(--sp-2)">
-				<Button size="sm" variant="primary" disabled={busy} onclick={() => (confirming = 'launch')}>
-					{doubt ? m.queued_launch_anyway() : m.queued_launch_now()}
-				</Button>
+				{#if !inflight}
+					<Button
+						size="sm"
+						variant="primary"
+						disabled={busy}
+						onclick={() => (confirming = 'launch')}
+					>
+						{doubt ? m.queued_launch_anyway() : m.queued_launch_now()}
+					</Button>
+				{/if}
 				<Button size="sm" disabled={busy} onclick={() => (confirming = 'discard')}>
-					{doubt ? m.queued_drop() : m.queued_cancel()}
+					{mayHaveStarted ? m.queued_drop() : m.queued_cancel()}
 				</Button>
 			</Cluster>
 		{/snippet}
@@ -110,9 +133,9 @@
 	<ConfirmModal
 		open
 		tone="danger"
-		title={doubt ? m.queued_confirm_drop_title() : m.queued_confirm_discard_title()}
-		message={doubt ? m.queued_confirm_drop_body() : m.queued_confirm_discard_body()}
-		confirmLabel={doubt ? m.queued_drop() : m.queued_cancel()}
+		title={mayHaveStarted ? m.queued_confirm_drop_title() : m.queued_confirm_discard_title()}
+		message={mayHaveStarted ? m.queued_confirm_drop_body() : m.queued_confirm_discard_body()}
+		confirmLabel={mayHaveStarted ? m.queued_drop() : m.queued_cancel()}
 		cancelLabel={m.queued_keep_waiting()}
 		{busy}
 		onconfirm={discard}

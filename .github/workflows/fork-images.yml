@@ -38,19 +38,35 @@ jobs:
   images:
     runs-on: ubuntu-latest
     steps:
+      # Checked out at the workflow's own commit first: the tag a dispatch
+      # names is data, and is validated before anything is checked out from it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Resolve version and namespace
         id: ctx
+        env:
+          # Through the environment, never interpolated into the script: an
+          # input is untrusted text, not shell.
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          OWNER: ${{ github.repository_owner }}
+          REF: ${{ github.ref }}
         run: |
-          tag="${{ github.event.inputs.tag }}"
-          [ -n "$tag" ] || tag="${GITHUB_REF#refs/tags/}"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
-          # ghcr namespaces are lowercase; the owner's login may not be.
-          echo "ns=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" \
-            >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          tag="${INPUT_TAG:-${REF#refs/tags/}}"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "refusing: '$tag' is not a vX.Y.Z tag" >&2
+            exit 1
+          fi
+          git checkout --detach "refs/tags/$tag"
+          {
+            echo "version=${tag#v}"
+            # The commit actually built, which a dispatch's github.sha is not.
+            echo "sha=$(git rev-parse --short=12 HEAD)"
+            # ghcr namespaces are lowercase; the owner's login may not be.
+            echo "ns=$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
@@ -71,7 +87,7 @@ jobs:
           platforms: linux/amd64
           push: true
           build-args: |
-            CCTUI_GIT_HASH=${{ github.sha }}
+            CCTUI_GIT_HASH=${{ steps.ctx.outputs.sha }}
           tags: ghcr.io/${{ steps.ctx.outputs.ns }}/cctui:${{ steps.ctx.outputs.version }}
 
       - name: Build + push webui image
@@ -96,4 +112,6 @@ jobs:
             echo "ghcr.io/${{ steps.ctx.outputs.ns }}/cctui@${{ steps.server.outputs.digest }}"
             echo "ghcr.io/${{ steps.ctx.outputs.ns }}/cctui-ui@${{ steps.webui.outputs.digest }}"
             echo '```'
+            echo
+            echo "Built from ${{ steps.ctx.outputs.sha }}."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -635,13 +635,15 @@ async fn apply_receipt(
         finish_launched(pool, &session_id).await?;
         return Ok(Some((session_id, true)));
     }
-    let why = match error {
-        Some(e) => format!(
-            "the machine answered: {e}. That answer also covers a reply lost or too late after \
-             the launch was dispatched, so it does not say the session did not start"
-        ),
-        None => "the machine answered without saying what happened".to_owned(),
-    };
+    let why = error.map_or_else(
+        || "the machine answered without saying what happened".to_owned(),
+        |e| {
+            format!(
+                "the machine answered: {e}. That answer also covers a reply lost or too late \
+                 after the launch was dispatched, so it does not say the session did not start"
+            )
+        },
+    );
     mark_uncertain(pool, &session_id, &why).await?;
     Ok(Some((session_id, false)))
 }
@@ -833,10 +835,10 @@ fn announce(state: &AppState, session_id: &str, outcome: &LaunchOutcome) {
                 status: SessionStatus::Queued,
             });
         }
-        // Sent: the placeholder already shows as waiting, and its receipt
-        // (or its session registering) is what changes the picture.
-        LaunchOutcome::Sent => {}
-        LaunchOutcome::Retry(_) | LaunchOutcome::NotLaunchable => {}
+        // Sent: the placeholder already shows as waiting, and its receipt (or
+        // its session registering) is what changes the picture. Retry and
+        // NotLaunchable leave the list exactly as it was.
+        LaunchOutcome::Sent | LaunchOutcome::Retry(_) | LaunchOutcome::NotLaunchable => {}
     }
 }
 

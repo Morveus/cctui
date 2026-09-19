@@ -1,0 +1,99 @@
+name: fork images
+
+# The server + webui images for THIS fork's own namespace.
+#
+# `release.yml` also builds images, but its tags are hardcoded to
+# `ghcr.io/dorskfr/...`: on a fork that job can only fail, since its token
+# cannot write to the upstream namespace. This workflow publishes the same two
+# images under the fork owner's namespace instead, so a release no longer needs
+# a local `make image/release` on a machine whose disk a Cargo build fills.
+#
+# Deliberately no `:latest`: a deployment pins an immutable digest, and a
+# moving tag only makes it harder to tell what is running.
+#
+# First run of a new package: ghcr creates it PRIVATE. A cluster that pulls
+# anonymously (ours does, it has no imagePullSecrets) needs the package set to
+# public once, by hand, in the owner's package settings. Until then, keep
+# deploying the images pushed to the internal registry.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.15.10)"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fork-images-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve version and namespace
+        id: ctx
+        run: |
+          tag="${{ github.event.inputs.tag }}"
+          [ -n "$tag" ] || tag="${GITHUB_REF#refs/tags/}"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          # ghcr namespaces are lowercase; the owner's login may not be.
+          echo "ns=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" \
+            >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: Log in to ghcr
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # linux/amd64 only, like the local builds the cluster runs today.
+      - name: Build + push server image
+        id: server
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            CCTUI_GIT_HASH=${{ github.sha }}
+          tags: ghcr.io/${{ steps.ctx.outputs.ns }}/cctui:${{ steps.ctx.outputs.version }}
+
+      - name: Build + push webui image
+        id: webui
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: webui/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            CLIENT_VERSION=${{ steps.ctx.outputs.version }}
+          tags: ghcr.io/${{ steps.ctx.outputs.ns }}/cctui-ui:${{ steps.ctx.outputs.version }}
+
+      # The digests a deployment should pin, rather than the tags above.
+      - name: Digests to pin
+        run: |
+          {
+            echo "### Images ${{ steps.ctx.outputs.version }}"
+            echo
+            echo '```'
+            echo "ghcr.io/${{ steps.ctx.outputs.ns }}/cctui@${{ steps.server.outputs.digest }}"
+            echo "ghcr.io/${{ steps.ctx.outputs.ns }}/cctui-ui@${{ steps.webui.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

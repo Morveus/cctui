@@ -81,13 +81,24 @@ pub async fn dispatch_spawn(
     req: SpawnRequest,
     uploads: Vec<cctui_proto::adapter::BootstrapFile>,
 ) -> Result<(StatusCode, Json<SpawnResponse>), (StatusCode, Json<ApiError>)> {
-    dispatch_spawn_as(state, ctx, req, uploads, None).await
+    dispatch_spawn_as(state, ctx, req, uploads, None, None).await
 }
 
-/// [`dispatch_spawn`] with the session id chosen by the caller: a queued spawn
-/// launches under the id its `queued` row was shown with, so a link to it
-/// keeps working once the session is live (claude-code only; the other
-/// adapters mint their own id and ignore it).
+/// A dispatch error from the send itself: the daemon may or may not hold the
+/// command. With [`DAEMON_OFFLINE`], the only errors raised once the send has
+/// started; every other one happens before anything is sent.
+pub const DISCONNECTED_MID_DISPATCH: &str = "daemon disconnected mid-dispatch";
+
+/// The dispatch error for a machine whose daemon cannot be reached. Behind a
+/// peer replica it can also stand for a forward that timed out after
+/// delivery, so it is no proof that nothing was sent either.
+pub const DAEMON_OFFLINE: &str = "daemon for that machine is offline — start `cctui-daemon` first";
+
+/// [`dispatch_spawn`] with ids chosen by the caller: a queued spawn launches
+/// under the id its `queued` row was shown with, so a link to it keeps working
+/// once the session is live (claude-code only; the other adapters mint their
+/// own id and ignore it), and with the `command_id` stored with it, the same
+/// on every attempt.
 #[allow(clippy::too_many_lines)]
 pub async fn dispatch_spawn_as(
     state: &AppState,
@@ -95,6 +106,7 @@ pub async fn dispatch_spawn_as(
     req: SpawnRequest,
     uploads: Vec<cctui_proto::adapter::BootstrapFile>,
     preset_session_id: Option<Uuid>,
+    preset_command_id: Option<Uuid>,
 ) -> Result<(StatusCode, Json<SpawnResponse>), (StatusCode, Json<ApiError>)> {
     // Validate env keys: shell-style `^[A-Z_][A-Z0-9_]*$`.
     for key in req.env.keys() {
@@ -143,7 +155,7 @@ pub async fn dispatch_spawn_as(
     // mints its own thread id and ignores the pre-minted id, so its tokens
     // still fall back to command_id keying (account_name stays unresolved for
     // codex until a codex-side reconcile lands).
-    let command_id = Uuid::new_v4();
+    let command_id = preset_command_id.unwrap_or_else(Uuid::new_v4);
     let is_claude = adapter_id == "claude-code";
     let pre_session_id = is_claude.then(|| preset_session_id.unwrap_or_else(Uuid::new_v4));
     // The id the gateway session token is bound to: the pre-minted real session
@@ -394,15 +406,12 @@ pub async fn dispatch_spawn_as(
     if let Err(err) = state.bus.command_daemon(machine_uuid, frame).await {
         state.pending_commands.remove(&command_id);
         return Err(match err {
-            crate::bus::BusError::NoDaemon(_) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ApiError {
-                    error: "daemon for that machine is offline — start `cctui-daemon` first".into(),
-                }),
-            ),
+            crate::bus::BusError::NoDaemon(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError { error: DAEMON_OFFLINE.into() }))
+            }
             _ => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(ApiError { error: "daemon disconnected mid-dispatch".into() }),
+                Json(ApiError { error: DISCONNECTED_MID_DISPATCH.into() }),
             ),
         });
     }
@@ -755,17 +764,34 @@ pub async fn launch_draft(
     };
     // A queued spawn: the human overrides the RAM ceiling and launches it now.
     if status == "queued" {
-        let launched = crate::admission::launch_now(&state, &session_id).await.map_err(|e| {
+        use crate::admission::LaunchOutcome;
+        let outcome = crate::admission::launch_now(&state, &session_id).await.map_err(|e| {
             tracing::error!("db error (launch queued): {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "database error".into() }))
         })?;
-        if !launched {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(ApiError {
-                    error: "queued spawn is already launching or could not launch".into(),
-                }),
-            ));
+        let refused = |code: StatusCode, error: String| (code, Json(ApiError { error }));
+        match outcome {
+            LaunchOutcome::Launched => {}
+            // Nothing sent: it stays queued and the reaper tries again.
+            LaunchOutcome::Retry(why) => {
+                return Err(refused(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("not launched yet: {why}"),
+                ));
+            }
+            // Ended as spawn_failed, never retried.
+            LaunchOutcome::Failed(why) => {
+                return Err(refused(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("launch failed: {why}"),
+                ));
+            }
+            LaunchOutcome::NotQueued => {
+                return Err(refused(
+                    StatusCode::CONFLICT,
+                    "this spawn is no longer queued (already launching or launched)".into(),
+                ));
+            }
         }
         return Ok((
             StatusCode::ACCEPTED,

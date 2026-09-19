@@ -406,7 +406,6 @@ impl Bus {
     }
 
     /// Whether THIS pod terminates `machine`'s daemon WS.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn daemon_connected(&self, machine: Uuid) -> bool {
         self.inner.daemons.contains_key(&machine)
     }

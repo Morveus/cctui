@@ -108,6 +108,12 @@ fn cpu_busy_pct(prev: CpuTimes, cur: CpuTimes) -> Option<f32> {
 /// `(used, total)` bytes from `/proc/meminfo`, used = `MemTotal` - `MemAvailable`
 /// (what `free` calls "used" minus reclaimable cache).
 fn parse_meminfo(info: &str) -> Option<(u64, u64)> {
+    let (avail, total) = parse_mem_available(info)?;
+    Some((total.saturating_sub(avail), total))
+}
+
+/// `(available, total)` bytes from `/proc/meminfo` (`MemAvailable`, `MemTotal`).
+pub(crate) fn parse_mem_available(info: &str) -> Option<(u64, u64)> {
     let kb = |key: &str| -> Option<u64> {
         info.lines()
             .find(|l| l.starts_with(key))
@@ -116,7 +122,7 @@ fn parse_meminfo(info: &str) -> Option<(u64, u64)> {
     };
     let total = kb("MemTotal:")? * 1024;
     let avail = kb("MemAvailable:")? * 1024;
-    Some((total.saturating_sub(avail), total))
+    Some((avail, total))
 }
 
 /// `(used, total)` bytes of the filesystem holding `path`. Used counts the

@@ -399,6 +399,12 @@ pub struct Driver {
     /// command path can start/stop viewers.
     pty_view: super::pty_view::PtyViewManager,
     last_reseed: Option<Instant>,
+    /// Memory-pressure sleep policy (see [`crate::mempressure`]); `None` when
+    /// disabled by the environment.
+    sleep_policy: Option<crate::mempressure::Policy>,
+    /// No memory-pressure decision before this instant: set after a worker is
+    /// put to sleep so the freed memory shows before the next one.
+    next_sleep_check: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -596,6 +602,8 @@ impl Driver {
             spawn_permission_mode: std::sync::Mutex::new(HashMap::new()),
             pty_view,
             last_reseed: None,
+            sleep_policy: crate::mempressure::Policy::from_env(),
+            next_sleep_check: None,
         }
     }
 
@@ -2374,7 +2382,22 @@ impl Driver {
         };
 
         let resp: ListResponse = socket::call(&sock, &json!({"proto": 1, "op": "list"})).await?;
+        let finished: Vec<String> = resp
+            .jobs
+            .iter()
+            .filter(|j| {
+                j.is_user_visible()
+                    && !j.is_dead()
+                    && crate::mempressure::turn_is_over(
+                        j.tempo.as_deref(),
+                        j.state.as_deref(),
+                        j.needs.as_deref(),
+                    )
+            })
+            .map(|j| j.short.clone())
+            .collect();
         self.apply_snapshot(resp.jobs).await;
+        self.sleep_under_memory_pressure(&sock, &finished).await;
         let reattached = self.churned;
         if self.churned {
             self.churned = false;
@@ -2385,6 +2408,74 @@ impl Driver {
             self.last_reseed = Some(Instant::now());
         }
         Ok(())
+    }
+
+    /// When host memory runs short, stop the worker of the session idle the
+    /// longest among `finished` (shorts whose turn is over), leaving its job
+    /// state on disk: the roster then reports it hibernated and the next reply
+    /// revives it. One worker per call, then a pause (see [`crate::mempressure`]).
+    async fn sleep_under_memory_pressure(&mut self, sock: &Path, finished: &[String]) {
+        let Some(policy) = self.sleep_policy else { return };
+        if self.next_sleep_check.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        // A dispatched worker pod runs its one session; stopping it would only
+        // end the job early.
+        if self.dispatch_done.lock().is_ok_and(|g| g.is_some()) {
+            return;
+        }
+        let Some(mem) = crate::mempressure::Memory::read() else { return };
+        if !policy.under_pressure(mem) {
+            return;
+        }
+        let candidates: Vec<crate::mempressure::Candidate> = {
+            let asks: HashSet<String> =
+                self.pending_asks.lock().map(|m| m.keys().cloned().collect()).unwrap_or_default();
+            finished
+                .iter()
+                .filter(|short| {
+                    !self.dead_shorts.contains(*short) && !self.pending_perms.contains_key(*short)
+                })
+                .filter_map(|short| {
+                    let loc = self.transcript_locations.get(short)?;
+                    let busy = asks.contains(&loc.local_id)
+                        || self.subagents.values().any(|s| s.parent_local_id == loc.local_id);
+                    if busy {
+                        return None;
+                    }
+                    // The transcript's last write is when the session last did
+                    // anything, and it survives a daemon restart.
+                    let quiet_since =
+                        std::fs::metadata(&loc.path).and_then(|m| m.modified()).ok()?;
+                    Some(crate::mempressure::Candidate { short: short.clone(), quiet_since })
+                })
+                .collect()
+        };
+        let now = SystemTime::now();
+        let Some(victim) = crate::mempressure::pick(&candidates, policy.min_idle, now) else {
+            tracing::debug!(
+                available = mem.available,
+                total = mem.total,
+                "memory pressure but no idle session to put to sleep"
+            );
+            return;
+        };
+        let quiet_mins = now.duration_since(victim.quiet_since).unwrap_or_default().as_secs() / 60;
+        let short = victim.short.clone();
+        match socket::one_shot(sock, &json!({"proto":1,"op":"kill","short":short})).await {
+            Ok(_) => tracing::info!(
+                %short,
+                quiet_mins,
+                available_mb = mem.available / (1024 * 1024),
+                total_mb = mem.total / (1024 * 1024),
+                threshold_pct = policy.threshold_pct,
+                "memory pressure: put the longest idle session to sleep (hibernated, a reply wakes it)"
+            ),
+            Err(err) => {
+                tracing::warn!(%short, %err, "memory pressure: stopping an idle worker failed");
+            }
+        }
+        self.next_sleep_check = Some(Instant::now() + crate::mempressure::COOLDOWN);
     }
 
     /// Renew each live account-bound worker's gateway token by re-pulling its
@@ -5477,5 +5568,85 @@ mod tests {
         let resent = drain_messages(&mut rx);
         assert!(!resent.is_empty(), "a mark behind the local offset must re-send the window");
         assert_eq!(d.offsets.get(&sess), local, "the persisted offset is never rewound");
+    }
+
+    /// Stand-in claude daemon: answers every request `{ok:true}` and hands
+    /// the requests it saw back through the returned receiver.
+    fn recording_socket() -> (PathBuf, mpsc::UnboundedReceiver<serde_json::Value>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = std::env::temp_dir().join(format!("cctui-sleep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("d.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (r, mut w) = stream.into_split();
+                let mut line = String::new();
+                if BufReader::new(r).read_line(&mut line).await.is_ok() {
+                    let _ = tx.send(serde_json::from_str(&line).unwrap_or_default());
+                    let _ = w.write_all(b"{\"ok\":true}\n").await;
+                }
+            }
+        });
+        (path, rx)
+    }
+
+    fn quiet_transcript(d: &mut Driver, short: &str, mins_ago: u64) {
+        let path = d.cfg.projects_root.join(format!("{short}.jsonl"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(mins_ago * 60)).unwrap();
+        d.transcript_locations.insert(
+            short.to_owned(),
+            TranscriptLocation {
+                path,
+                local_id: format!("{short}-local"),
+                cwd: "/tmp".into(),
+                offset_key: short.to_owned(),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_pressure_sleeps_the_longest_idle_free_session_only() {
+        let (mut d, _rx) = driver();
+        // Threshold 100 %: any real host is "under pressure", no grace.
+        d.sleep_policy =
+            Some(crate::mempressure::Policy { threshold_pct: 100.0, min_idle: Duration::ZERO });
+        quiet_transcript(&mut d, "aaaa0001", 5);
+        quiet_transcript(&mut d, "aaaa0002", 60);
+        quiet_transcript(&mut d, "aaaa0003", 600);
+        // The oldest one still has a live subagent: not a candidate.
+        d.subagents.insert(
+            "agent-x".into(),
+            SubagentState {
+                parent_local_id: "aaaa0003-local".into(),
+                idle_ticks: 0,
+                tool_use_id: None,
+                parent_resolved: false,
+                tail_pending: true,
+            },
+        );
+        let (sock, mut seen) = recording_socket();
+        let finished = ["aaaa0001".to_owned(), "aaaa0002".to_owned(), "aaaa0003".to_owned()];
+        d.sleep_under_memory_pressure(&sock, &finished).await;
+        let req = seen.try_recv().expect("one worker is stopped");
+        assert_eq!(req["op"], "kill");
+        assert_eq!(req["short"], "aaaa0002", "the longest idle session without live work");
+        // Cooldown: the next poll does not stop another one right away.
+        d.sleep_under_memory_pressure(&sock, &finished).await;
+        assert!(seen.try_recv().is_err(), "one worker per step");
+    }
+
+    #[tokio::test]
+    async fn no_pressure_no_sleep() {
+        let (mut d, _rx) = driver();
+        d.sleep_policy =
+            Some(crate::mempressure::Policy { threshold_pct: 0.0, min_idle: Duration::ZERO });
+        quiet_transcript(&mut d, "aaaa0001", 600);
+        let (sock, mut seen) = recording_socket();
+        d.sleep_under_memory_pressure(&sock, &["aaaa0001".to_owned()]).await;
+        assert!(seen.try_recv().is_err(), "memory is plentiful: nothing is stopped");
     }
 }

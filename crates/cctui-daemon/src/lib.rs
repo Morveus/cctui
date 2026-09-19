@@ -25,6 +25,7 @@ pub mod git;
 pub mod imagepost;
 pub mod listdirs;
 pub mod mcp;
+pub mod mempressure;
 pub mod offsets;
 pub mod readfile;
 pub mod resources;

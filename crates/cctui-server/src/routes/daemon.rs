@@ -1202,13 +1202,25 @@ async fn handle_event(
             }
             // The receipt a queued launch waits for: until it lands, its
             // request stays in the queue (a no-op for every other command).
-            crate::admission::settle_receipt(state, machine_id, command_id, ok, error.as_deref())
-                .await;
+            // When it takes charge, the failed-spawn bookkeeping below must not
+            // also run: a negative receipt leaves the request in doubt, and a
+            // second "ended" row would contradict it.
+            let queued_launch = crate::admission::settle_receipt(
+                state,
+                machine_id,
+                command_id,
+                ok,
+                error.as_deref(),
+            )
+            .await;
             let pending = state.pending_commands.remove(&command_id).map(|(_, c)| c);
             let mut session_id = pending.as_ref().and_then(|c| c.session_id.clone());
             // A spawn that never started has no row of its own: write one so
             // the failure shows up on the list with its detail.
-            if !ok && let Some(row) = pending.and_then(|c| c.spawn) {
+            if !ok
+                && !queued_launch
+                && let Some(row) = pending.and_then(|c| c.spawn)
+            {
                 let detail = error.clone().unwrap_or_else(|| "spawn failed".to_owned());
                 let reason = EndReason::SpawnFailed { detail };
                 match persist_failed_spawn(&state.pool, &row, &reason).await {

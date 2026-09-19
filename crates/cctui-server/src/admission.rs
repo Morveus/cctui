@@ -646,11 +646,20 @@ async fn apply_receipt(
     Ok(Some((session_id, false)))
 }
 
-/// [`apply_receipt`], then tell the UIs. Receipts for spawns that never
-/// queued are ignored.
-pub async fn settle_receipt(state: &AppState, command_id: Uuid, ok: bool, error: Option<&str>) {
-    match apply_receipt(&state.pool, command_id, ok, error).await {
-        Ok(None) => {}
+/// [`apply_receipt`], then tell the UIs. Returns whether this receipt belonged
+/// to a queued launch and was taken charge of here: the caller must then leave
+/// the usual failed-spawn bookkeeping alone, which would otherwise add a
+/// second, "ended" row for a request deliberately kept in doubt. A receipt for
+/// a spawn that never queued is ignored, and answers `false`.
+pub async fn settle_receipt(
+    state: &AppState,
+    machine: Uuid,
+    command_id: Uuid,
+    ok: bool,
+    error: Option<&str>,
+) -> bool {
+    match apply_receipt(&state.pool, machine, command_id, ok, error).await {
+        Ok(None) => false,
         Ok(Some((session_id, done))) => {
             tracing::info!(session = %session_id, %command_id, ok, "queued launch acknowledged");
             if done {
@@ -661,8 +670,15 @@ pub async fn settle_receipt(state: &AppState, command_id: Uuid, ok: bool, error:
                     status: SessionStatus::Queued,
                 });
             }
+            true
         }
-        Err(e) => tracing::warn!(%e, %command_id, "settling an acknowledged launch"),
+        Err(e) => {
+            tracing::warn!(%e, %command_id, "settling an acknowledged launch");
+            // This receipt may well belong to a queued launch we could not
+            // settle: leave it to the reaper rather than let the failure
+            // bookkeeping bury a request we are keeping.
+            true
+        }
     }
 }
 

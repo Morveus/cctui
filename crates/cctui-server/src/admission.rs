@@ -191,11 +191,13 @@ pub async fn spawn_or_queue(
     ctx: &AuthContext,
     req: SpawnRequest,
     uploads: Vec<BootstrapFile>,
+    raw_uploads: Vec<crate::uploads::RawUpload>,
 ) -> Result<(StatusCode, Json<SpawnResponse>), ApiErr> {
     let machine = crate::routes::spawn::resolve_owned_machine(state, ctx, &req.machine_id).await?;
     match decide(&state.pool, machine, false).await.map_err(|e| db_err(&e))? {
         Decision::Admit => {
-            let out = crate::routes::spawn::dispatch_spawn(state, ctx, req, uploads).await;
+            let out =
+                crate::routes::spawn::dispatch_spawn(state, ctx, req, uploads, raw_uploads).await;
             if out.is_err() {
                 forget_admission(&state.pool, machine).await;
             }
@@ -788,11 +790,15 @@ async fn dispatch_row(state: &AppState, row: QueuedRow) -> Result<(), DispatchEr
         return Err(DispatchError::NotSent(DAEMON_OFFLINE.into()));
     }
     let preset = Uuid::parse_str(&row.session_id).ok();
+    // The queued row only keeps the bootstrap files; the attachment records
+    // the live path writes are rebuilt from them (content type unknown).
+    let raw_uploads = raw_uploads_from(&uploads)?;
     let sent = crate::routes::spawn::dispatch_spawn_as(
         state,
         &ctx,
         req,
         uploads,
+        raw_uploads,
         preset,
         Some(row.command_id),
     )
@@ -913,6 +919,26 @@ async fn drain_inner(state: &AppState) -> Result<(), sqlx::Error> {
         }
     }
     Ok(())
+}
+
+/// Rebuild the raw uploads of a queued spawn from its stored bootstrap files.
+fn raw_uploads_from(
+    uploads: &[BootstrapFile],
+) -> Result<Vec<crate::uploads::RawUpload>, DispatchError> {
+    use base64::Engine as _;
+    uploads
+        .iter()
+        .map(|f| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&f.content_b64)
+                .map_err(|e| DispatchError::Rejected(format!("corrupt queued upload: {e}")))?;
+            Ok(crate::uploads::RawUpload {
+                name: f.name.clone(),
+                bytes: bytes.into(),
+                content_type: None,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

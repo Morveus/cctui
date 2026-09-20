@@ -26,6 +26,7 @@ import {
   normalizePollText,
   resultCategory,
 } from "$lib/components/organisms/conversation/lines";
+import { looksMeta } from "$lib/components/organisms/conversation/format";
 import {
   renderMarkdown,
   highlightBlock,
@@ -81,19 +82,6 @@ interface Block {
   label?: string; // tool name / divider text
   html: string; // inner HTML, already escaped/rendered
 }
-
-const META_TAGS = [
-  "<task-notification",
-  "<system-reminder",
-  "<command-name",
-  "<command-message",
-  "<local-command",
-  "<bash-input",
-  "<bash-stdout",
-  "<bash-stderr",
-];
-const looksMeta = (t: string) =>
-  META_TAGS.some((m) => t.trimStart().startsWith(m));
 
 // Mirror the drawer's tool-input prettification (diff / shell / JSON),
 // honoring the same prettyDiff/prettyJson toggles.

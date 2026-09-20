@@ -32,9 +32,19 @@ export const META_TAGS = [
 	'Stop hook feedback:',
 	'# Autonomous loop'
 ];
+// Markers are matched at the start of ANY line, not only the start of the turn:
+// the harness routinely prefixes its own sentence before the wrapper it injects,
+// which a prefix-only test never sees. Line-anchored rather than a bare
+// substring scan so a human quoting `<system-reminder>` inside a sentence stays
+// a human turn. Mirrors `user_text_is_meta` in the daemon's transcript parser.
 export function looksMeta(text: string): boolean {
-	const t = text.trimStart();
-	return META_TAGS.some((m) => t.startsWith(m));
+	return (
+		isSyntheticImageNotice(text) ||
+		text.split('\n').some((line) => {
+			const t = line.trimStart();
+			return META_TAGS.some((m) => t.startsWith(m));
+		})
+	);
 }
 
 // The harness wraps a peer agent's message in this tag but prefixes its own
@@ -67,7 +77,9 @@ export function parsePeerMessage(text: string): PeerMessage | null {
 // prose is what makes one turn render as one bubble.
 const ATTACHED_HEADER_RE = /^Attached files?(\s*\(\d+\))?:$/i;
 const STAGED_BULLET_RE = /^-\s*\S*\/?cctui-uploads\/\S+/;
-const SYNTH_IMAGE_LINE_RE = /^\[Image:[^\]]*\]$/;
+// The wording changes between Claude releases (`source: …`, `original WxH,
+// displayed at …`, `#2`), so match the family by bracket shape, not a literal.
+const SYNTH_IMAGE_LINE_RE = /^\[Image(?:[:#][^\]]*|\s[^\]]*)?\]$/;
 export const IMAGE_TOKEN_RUN_RE = /^(?:\s*\[(?:Image #\d+|[^[\]\n]*\.[A-Za-z0-9]{1,8})\])+\s*/;
 
 export function isSyntheticImageNotice(text: string): boolean {
@@ -218,6 +230,30 @@ export function eventSig(e: AgentEvent): string {
 		default:
 			return `${e.type}:${e.ts}`;
 	}
+}
+
+// Merge the drawer's three event sources into one ordered list. `seen` is
+// threaded through every source AND across each source's own rows: a duplicate
+// inside a single `history` array must collapse too, which a set merely *seeded*
+// from that array can never do. `history` is consumed first so it wins over
+// `earlier` and `live`.
+export function mergeEventSources(
+	history: AgentEvent[],
+	earlier: AgentEvent[],
+	live: AgentEvent[]
+): AgentEvent[] {
+	const seen = new Set<string>();
+	const dedup = (list: AgentEvent[]) =>
+		list.filter((e) => {
+			const sig = eventSig(e);
+			if (seen.has(sig)) return false;
+			seen.add(sig);
+			return true;
+		});
+	const hist = dedup(history);
+	const front = dedup(earlier);
+	const tail = dedup(live);
+	return orderEvents([...front, ...hist, ...tail]);
 }
 
 // Order the merged history+live event list causally. `seq` is the server's

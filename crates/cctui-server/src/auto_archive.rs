@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 use cctui_proto::classifier::Bucket;
 
+use crate::live_sessions::live_sessions_predicate;
 use crate::routes::sessions::ArchiveOutcome;
 use crate::state::AppState;
 
@@ -109,12 +110,14 @@ pub async fn sweep(state: &AppState) {
         tracing::warn!(error = %e, "auto-archive intent prune failed");
     }
 
-    let rows = match sqlx::query_as::<_, SignalRow>(
+    let rows = match sqlx::query_as::<_, SignalRow>(concat!(
         "SELECT id, tempo, agent_state, activity, soft_limit_reason FROM sessions \
-         WHERE metadata->>'auto_archive' = 'true' \
-           AND status NOT IN ('archived', 'draft', 'queued') \
-         LIMIT $1",
-    )
+             WHERE ",
+        live_sessions_predicate!(),
+        " AND metadata->>'auto_archive' = 'true' \
+               AND status NOT IN ('archived', 'draft', 'queued') \
+             LIMIT $1"
+    ))
     .bind(BATCH)
     .fetch_all(&state.pool)
     .await

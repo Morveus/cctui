@@ -38,6 +38,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::auth::{AuthContext, mint_secret, sha256_hex, user_token};
+use crate::live_sessions::live_sessions_predicate;
 use crate::state::AppState;
 
 /// Evict a daemon whose WS yields no frame of any kind — data, ping, or pong —
@@ -893,18 +894,7 @@ async fn process_frame(
 ) -> anyhow::Result<()> {
     match frame {
         DaemonFrameUp::SessionRegistered { adapter_id, local_id } => {
-            upsert_session(
-                state,
-                machine_id,
-                user_id,
-                &adapter_id,
-                &local_id,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
+            register_announced_session(state, machine_id, user_id, &adapter_id, &local_id).await
         }
         DaemonFrameUp::Event { adapter_id, event } => {
             // Machine-scoped codex model catalog: cache it by
@@ -1129,7 +1119,7 @@ async fn handle_event(
                 )
                 .await;
             }
-            upsert_session(
+            let first_registration = upsert_session(
                 state,
                 machine_id,
                 user_id,
@@ -1141,6 +1131,9 @@ async fn handle_event(
                 extra,
             )
             .await?;
+            if first_registration {
+                publish_session_registered(state, &local_id).await;
+            }
             crate::auto_archive::claim_intent(state, &local_id, spawn_key_hint.as_deref()).await;
         }
         AdapterEvent::Message { local_id, payload } => {
@@ -1784,7 +1777,7 @@ async fn upsert_session(
     parent_local_id: Option<String>,
     observed_at: Option<i64>,
     extra: Option<serde_json::Value>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     // `parent_id`: resolve via a subquery rather than binding the
     // raw value so a not-yet-known parent yields NULL instead of an FK
     // violation that would drop the whole insert. In the normal case the
@@ -1798,7 +1791,7 @@ async fn upsert_session(
     // (`inactive`, `archived`, `ended`) so a re-discovery refreshes the
     // heartbeat without resurrecting the session into the Working list;
     // otherwise revive it to `active`.
-    sqlx::query(
+    let inserted: Option<bool> = sqlx::query_scalar(
         r"INSERT INTO sessions
             (id, parent_id, account_id, machine_id, working_dir, status, registered_at,
              last_heartbeat, metadata, user_id, machine_uuid, adapter_id)
@@ -1812,7 +1805,8 @@ async fn upsert_session(
             status = CASE WHEN sessions.status IN ('inactive', 'archived', 'ended') THEN sessions.status ELSE 'active' END,
             adapter_id = EXCLUDED.adapter_id,
             parent_id = COALESCE(sessions.parent_id, EXCLUDED.parent_id),
-            metadata = COALESCE(sessions.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)",
+            metadata = COALESCE(sessions.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
+          RETURNING (xmax = 0)",
     )
     .bind(local_id)
     .bind(machine_id.to_string())
@@ -1823,7 +1817,7 @@ async fn upsert_session(
     .bind(parent_local_id)
     .bind(observed_at)
     .bind(extra)
-    .execute(&state.pool)
+    .fetch_optional(&state.pool)
     .await?;
     // A daemon that re-registers the session after a reconnect proves the
     // `daemon_lost` / `machine_offline` end was spurious.
@@ -1850,7 +1844,80 @@ async fn upsert_session(
     .bind(local_id)
     .execute(&state.pool)
     .await?;
+    Ok(inserted.unwrap_or(false))
+}
+
+/// Register a session the daemon announced, announcing it to browser clients
+/// only on a first insert: the codex inventory poll re-announces every known
+/// thread every ~15 s.
+async fn register_announced_session(
+    state: &AppState,
+    machine_id: Uuid,
+    user_id: Uuid,
+    adapter_id: &str,
+    local_id: &str,
+) -> anyhow::Result<()> {
+    if upsert_session(state, machine_id, user_id, adapter_id, local_id, None, None, None, None)
+        .await?
+    {
+        publish_session_registered(state, local_id).await;
+    }
     Ok(())
+}
+
+/// Tell browser clients a session exists as soon as it is registered, instead
+/// of leaving them to discover it on the next list poll. Best-effort: a row
+/// that cannot be read back is simply not announced.
+async fn publish_session_registered(state: &AppState, local_id: &str) {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: String,
+        parent_id: Option<String>,
+        account_id: Option<String>,
+        machine_id: String,
+        working_dir: String,
+        status: String,
+        registered_at: chrono::DateTime<Utc>,
+        last_heartbeat: chrono::DateTime<Utc>,
+        metadata: serde_json::Value,
+        adapter_id: Option<String>,
+    }
+
+    let row: Option<Row> = match sqlx::query_as(
+        "SELECT id, parent_id, account_id, machine_id, working_dir, status, registered_at, \
+                last_heartbeat, metadata, adapter_id \
+           FROM sessions WHERE id = $1",
+    )
+    .bind(local_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(err) => {
+            tracing::warn!(%err, %local_id, "session read-back failed; registration not announced");
+            return;
+        }
+    };
+    let Some(row) = row else { return };
+    let (status, _) = crate::routes::sessions::resolve_status_liveness(
+        &row.status,
+        row.registered_at,
+        row.last_heartbeat,
+    );
+    state.bus.publish_server(cctui_proto::ws::ServerEvent::SessionRegistered {
+        session: cctui_proto::models::Session {
+            id: row.id,
+            parent_id: row.parent_id,
+            account_id: row.account_id,
+            machine_id: row.machine_id,
+            working_dir: row.working_dir,
+            status,
+            registered_at: row.registered_at,
+            last_heartbeat: row.last_heartbeat,
+            metadata: row.metadata,
+            adapter_id: row.adapter_id.map(AdapterId::new),
+        },
+    });
 }
 
 /// Insert a stream event, returning `Some(id)` (the `stream_events.id`
@@ -2050,10 +2117,12 @@ async fn persist_session_end(
     // is honoured as terminal by the list/search read paths regardless of
     // heartbeat age. We do not delete the row — archival remains the
     // persistence story; un-archive/resume can revive it.
-    sqlx::query(
-        "UPDATE sessions SET status = 'ended', ended_at = now(), end_reason = $2, end_detail = $3 \
-         WHERE id = $1 AND status <> 'archived'",
-    )
+    sqlx::query(concat!(
+        "UPDATE sessions SET status = 'ended', ended_at = now(), end_reason = $2, \
+                 end_detail = $3 \
+             WHERE id = $1 AND ",
+        live_sessions_predicate!()
+    ))
     .bind(local_id)
     .bind(reason.kind().as_str())
     .bind(reason.detail().map(truncate_end_detail))

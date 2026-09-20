@@ -37,9 +37,9 @@
 	import BookmarkSaveModal from './bookmarks/BookmarkSaveModal.svelte';
 	import type { Line, MsgCategory, ViewOpts } from './conversation/types';
 	import { parseViewOpts } from './conversation/filters';
-	import { eventSig, orderEvents } from './conversation/format';
+	import { mergeEventSources } from './conversation/format';
 	import { buildLines, type LineBuildCtx } from './conversation/lines';
-	import { ConversationStream } from './conversation/stream.svelte';
+	import { ConversationStream, mergeLiveEvent } from './conversation/stream.svelte';
 	import { ScrollController } from './conversation/scroll.svelte';
 	import { createSeqJumper, type RenderWindow } from './conversation/jump';
 	import { SearchHitStepper } from './conversation/searchHits.svelte';
@@ -156,7 +156,9 @@
 		historyData: () => history.data,
 		pin: scroll.stickToBottom,
 		invalidateConversation: () => qc.invalidateQueries({ queryKey: qk.conversation(id) }),
-		invalidateSessions: () => qc.invalidateQueries({ queryKey: ['sessions'] })
+		invalidateSessions: () => qc.invalidateQueries({ queryKey: ['sessions'] }),
+		mergeIntoCache: (sid, ev) =>
+			qc.setQueryData<AgentEvent[]>(qk.conversation(sid), (prev) => mergeLiveEvent(prev, ev))
 	});
 	// (Re)subscribe when the open session changes or a forced resubscribe is
 	// requested; tear down listeners on switch/unmount.
@@ -210,14 +212,7 @@
 			((history.data?.length ?? 0) >= CONVERSATION_FETCH_LIMIT || earlier.length > 0)
 	);
 
-	const events = $derived.by(() => {
-		const hist = history.data ?? [];
-		const seen = new Set(hist.map(eventSig));
-		const front = earlier.filter((e) => !seen.has(eventSig(e)));
-		for (const e of front) seen.add(eventSig(e));
-		const tail = stream.live.filter((e) => !seen.has(eventSig(e)));
-		return orderEvents([...front, ...hist, ...tail]);
-	});
+	const events = $derived(mergeEventSources(history.data ?? [], earlier, stream.live));
 
 	async function fetchEarlier() {
 		if (fetchingEarlier || earlierExhausted) return;

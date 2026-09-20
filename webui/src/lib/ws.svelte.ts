@@ -221,6 +221,17 @@ interface TrackedSend {
 // always retry manually (which resets the counter).
 const ACK_TIMEOUT_MS = 8000;
 const MAX_ATTEMPTS = 5;
+
+/**
+ * Silence after which the socket is presumed half-open. A browser cannot
+ * observe the server's `Ping`/`Pong`, so liveness is inferred from real frames;
+ * `machine_resources` arrives roughly every 20 s while any daemon is online.
+ * A half-open connection never fires `onclose`, so nothing else detects it.
+ */
+export const WATCHDOG_MS = 60_000;
+/** Silence after which a tab-visible / network-online socket is presumed dead
+ *  rather than merely idle. */
+export const RESUME_STALE_MS = 30_000;
 /** Decode a standard-base64 string to raw bytes (PTY chunks). */
 export function decodeBase64(b64: string): Uint8Array {
 	const bin = atob(b64);
@@ -228,6 +239,10 @@ export function decodeBase64(b64: string): Uint8Array {
 	for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
 	return out;
 }
+
+/** Re-dispatch delay for a send parked on a missing socket. Off the backoff
+ *  ladder: it is waiting for a transport, not backing off a server. */
+const RECONNECT_PARK_MS = 1000;
 
 const BACKOFF_BASE_MS = 1000;
 const BACKOFF_CAP_MS = 30000;
@@ -394,11 +409,62 @@ export class WsClient {
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	private listDirtyTimer: ReturnType<typeof setTimeout> | null = null;
 	private want = false;
+	private watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+	private lastFrameAt = 0;
+	private lifecycleBound = false;
 
 	connect() {
 		if (!browser || !auth.isAuthed) return;
 		this.want = true;
+		this.bindLifecycle();
 		this.open();
+	}
+
+	private bindLifecycle() {
+		if (this.lifecycleBound || typeof document === 'undefined') return;
+		this.lifecycleBound = true;
+		document.addEventListener('visibilitychange', () => {
+			if (document.visibilityState === 'visible') this.resumeCheck();
+		});
+		window.addEventListener('online', () => this.resumeCheck());
+	}
+
+	/** Re-establish liveness after a sleep / network change: dial if the socket
+	 * is gone, force a fresh one if it reads `OPEN` but has gone quiet. */
+	resumeCheck() {
+		if (!this.want) return;
+		if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+			this.open();
+			return;
+		}
+		if (Date.now() - this.lastFrameAt > RESUME_STALE_MS) this.forceReconnect();
+	}
+
+	private armWatchdog() {
+		this.clearWatchdog();
+		this.watchdogTimer = setTimeout(() => {
+			this.watchdogTimer = null;
+			this.forceReconnect();
+		}, WATCHDOG_MS);
+	}
+
+	private clearWatchdog() {
+		if (this.watchdogTimer) {
+			clearTimeout(this.watchdogTimer);
+			this.watchdogTimer = null;
+		}
+	}
+
+	/** Abandon the current socket and dial a new one immediately. The old
+	 * socket's handlers are inert afterwards: they all bail unless they are
+	 * still the live socket. */
+	forceReconnect() {
+		this.clearWatchdog();
+		const sock = this.socket;
+		this.socket = null;
+		this.status = 'closed';
+		sock?.close();
+		if (this.want) this.open();
 	}
 
 	private open() {
@@ -411,7 +477,10 @@ export class WsClient {
 		this.socket = sock;
 
 		sock.onopen = () => {
+			if (this.socket !== sock) return;
 			this.status = 'open';
+			this.lastFrameAt = Date.now();
+			this.armWatchdog();
 			// re-subscribe everything after a reconnect
 			for (const id of this.subscribed) this.send({ type: 'subscribe', session_id: id });
 			// re-arm live-terminal watches so the daemon PTY stream resumes
@@ -430,10 +499,15 @@ export class WsClient {
 			}
 		};
 		sock.onmessage = (ev) => {
+			if (this.socket !== sock) return;
+			this.lastFrameAt = Date.now();
+			this.armWatchdog();
 			if (typeof ev.data === 'string') net.recordWs(ev.data.length);
 			this.onFrame(ev.data);
 		};
 		sock.onclose = () => {
+			if (this.socket !== sock) return;
+			this.clearWatchdog();
 			this.status = 'closed';
 			this.socket = null;
 			if (this.want) this.scheduleReconnect();
@@ -451,6 +525,7 @@ export class WsClient {
 
 	disconnect() {
 		this.want = false;
+		this.clearWatchdog();
 		this.socket?.close();
 		this.socket = null;
 		this.status = 'closed';
@@ -933,7 +1008,10 @@ export class WsClient {
 					failed.set(s.ts, s.reason ?? 'not delivered');
 				} else {
 					pending.add(s.ts);
-					if (s.phase === 'backoff') retrying.set(s.ts, { attempt: s.attempt, max: MAX_ATTEMPTS });
+					if (s.phase === 'backoff')
+						// A send parked before its first successful write sits at
+						// attempt 0; the hint counts from 1.
+						retrying.set(s.ts, { attempt: Math.max(1, s.attempt), max: MAX_ATTEMPTS });
 				}
 			}
 		}
@@ -970,17 +1048,40 @@ export class WsClient {
 		this.ackIndex.set(cid, { sid: send.sid, ts: send.ts });
 		const ok = this.sendMessage(send.sid, send.text, cid, send.askPicks);
 		if (!ok) {
-			// Socket wasn't OPEN — nudge a reconnect and park in backoff (onopen
-			// re-dispatches) rather than burning straight to a hard failure.
+			// A frame that never left the client is not a delivery attempt: the
+			// budget measures sends the server ignored. Counting failed writes
+			// would spend MAX_ATTEMPTS on a slow reconnect and turn "offline"
+			// into a permanently red message.
+			send.attempt -= 1;
 			this.connect();
-			this.onAttemptFailed(send, 'not connected — reconnecting');
+			this.parkForReconnect(send);
 			return false;
 		}
 		send.phase = 'pending';
 		send.reason = undefined;
-		send.timer = setTimeout(() => this.onAttemptFailed(send, 'no response from server'), ACK_TIMEOUT_MS);
+		send.timer = setTimeout(() => this.onAckTimeout(send), ACK_TIMEOUT_MS);
 		this.notifyDelivery(send.sid);
 		return true;
+	}
+
+	/** A frame that left an `OPEN` socket and drew no ack is the signature of a
+	 * half-open connection, so the retry needs a new socket — every further
+	 * attempt on this one would time out identically. Park the send first, so
+	 * the new socket's `onopen` finds it and re-dispatches. */
+	private onAckTimeout(send: TrackedSend) {
+		this.onAttemptFailed(send, 'no response from server');
+		this.forceReconnect();
+	}
+
+	/** Hold a send until the socket is back without spending retry budget.
+	 *  `onopen` re-dispatches it; the timer is only a backstop for a reconnect
+	 *  that never completes. */
+	private parkForReconnect(send: TrackedSend) {
+		this.clearTimer(send);
+		send.phase = 'backoff';
+		send.reason = 'not connected — reconnecting';
+		send.timer = setTimeout(() => this.dispatch(send), RECONNECT_PARK_MS);
+		this.notifyDelivery(send.sid);
 	}
 
 	/** An attempt failed (bad ack, ack timeout, or dropped frame): schedule a

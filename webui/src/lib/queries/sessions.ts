@@ -72,6 +72,11 @@ export const useConversation = (
       return endpoints.conversation(id(), { limit: CONVERSATION_FETCH_LIMIT });
     },
     enabled: enabled() && !!id(),
+    // Reopening the drawer must always issue the `after=lastSeq` delta, even
+    // inside the global 5s staleTime: the ws is unsubscribed while the drawer
+    // is closed, so live merging cannot have covered that window. The delta is
+    // bounded and returns `prev` by identity when empty.
+    refetchOnMount: "always",
     gcTime: CONVERSATION_GC_MS,
   }));
 };

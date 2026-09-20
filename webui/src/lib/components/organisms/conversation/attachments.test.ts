@@ -48,7 +48,8 @@ const att = (name: string, created_at: number, hash = name): SessionAttachment =
 	hash,
 	size: 10,
 	content_type: 'text/plain',
-	created_at
+	created_at,
+	machine_id: 'mach-1'
 });
 
 describe('pickAttachment', () => {

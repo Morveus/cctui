@@ -2,6 +2,7 @@ use super::{Account, session_id_for_token};
 
 use uuid::Uuid;
 
+use crate::live_sessions::live_sessions_predicate;
 use crate::state::AppState;
 
 /// Merge a `CctuiAgent` child's per-session dollar budget into `cap` as a
@@ -85,11 +86,13 @@ async fn mark_block_row(
     reason: &str,
     key: &str,
 ) -> Result<bool, sqlx::Error> {
-    let res = sqlx::query(
+    let res = sqlx::query(concat!(
         "UPDATE sessions SET soft_limit_reason = $2, soft_limit_key = $3 \
-         WHERE id = $1 AND status != 'archived' \
-           AND (soft_limit_reason IS DISTINCT FROM $2 OR soft_limit_key IS DISTINCT FROM $3)",
-    )
+             WHERE id = $1 AND ",
+        live_sessions_predicate!(),
+        " AND (soft_limit_reason IS DISTINCT FROM $2 \
+                   OR soft_limit_key IS DISTINCT FROM $3)"
+    ))
     .bind(session_id)
     .bind(reason)
     .bind(key)

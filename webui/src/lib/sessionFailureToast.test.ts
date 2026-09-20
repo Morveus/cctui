@@ -4,7 +4,7 @@ import { diagnoseHref, sessionFailureToast } from './sessionFailureToast';
 
 describe('sessionFailureToast', () => {
 	beforeEach(() => {
-		toasts.items = [];
+		toasts.reset();
 	});
 
 	it('toasts a failed start with its detail and a Diagnose action', () => {

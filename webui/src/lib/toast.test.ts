@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { toasts } from './toast.svelte';
 
-describe('toasts (kit store re-exported for the webui)', () => {
+describe('toasts (the kit store, wrapped to dedupe errors)', () => {
 	beforeEach(() => {
 		vi.useFakeTimers();
-		for (const t of [...toasts.items]) toasts.dismiss(t.id);
+		toasts.reset();
 	});
 	afterEach(() => vi.useRealTimers());
 
@@ -26,6 +26,25 @@ describe('toasts (kit store re-exported for the webui)', () => {
 		await vi.runAllTimersAsync();
 		expect(run).toHaveBeenCalledTimes(1);
 		expect(toasts.items).toHaveLength(0);
+	});
+
+	it('collapses an error repeated within the dedupe window', () => {
+		toasts.error('file not found');
+		toasts.error('file not found');
+		expect(toasts.items).toHaveLength(1);
+
+		toasts.error('something else');
+		expect(toasts.items).toHaveLength(2);
+	});
+
+	it('lets the same error through again once the window has passed', () => {
+		toasts.error('file not found');
+		expect(toasts.items).toHaveLength(1);
+
+		vi.advanceTimersByTime(2500);
+		for (const t of [...toasts.items]) toasts.dismiss(t.id);
+		toasts.error('file not found');
+		expect(toasts.items).toHaveLength(1);
 	});
 
 	it('surfaces a failing action as an error toast', async () => {

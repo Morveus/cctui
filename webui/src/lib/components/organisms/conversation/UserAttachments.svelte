@@ -6,7 +6,8 @@
 	import FileChip from '$lib/components/molecules/FileChip.svelte';
 	import { attachmentStore } from '$lib/attachmentStore';
 	import { copyText } from '$lib/clipboard';
-	import { openLocalFile } from '$lib/fileviewer';
+	import { refusalMessage, tryOpenLocalFile } from '$lib/fileviewer';
+	import { localFileHref } from '$lib/markdown';
 	import { m } from '$lib/paraglide/messages';
 	import { useSessionAttachments } from '$lib/queries';
 	import { attachmentBlobUrl, pickAttachment, type SessionAttachment } from '$lib/queries/types';
@@ -42,6 +43,50 @@
 	let expanded = $state<Record<string, boolean>>({});
 	let texts = $state<Record<string, string>>({});
 
+	// The whole chain failed to produce this attachment: the chip goes inert and
+	// says why, rather than re-toasting on every click.
+	let gone = $state<Record<string, boolean>>({});
+
+	// The daemon stages under `/tmp/cctui-uploads/<session>/<name>`, which is
+	// also what the message's own `Attached file(s):` block printed.
+	const stagedHref = (a: SessionAttachment): string | null =>
+		a.machine_id && refs.sessionId
+			? localFileHref(`/tmp/cctui-uploads/${refs.sessionId}/${a.name}`, {
+					machineId: a.machine_id,
+					sessionId: a.session_id
+				})
+			: null;
+
+	/** Blob store → the staged copy on the machine. Resolves to the HTTP status
+	 *  of the *blob* attempt, or `null` once something has served the file. */
+	async function openWithFallback(a: SessionAttachment): Promise<number | null> {
+		const blobStatus = await tryOpenLocalFile(url(a), a.name);
+		if (blobStatus === null) return null;
+		const href = stagedHref(a);
+		if (href && (await tryOpenLocalFile(href, a.name)) === null) return null;
+		return blobStatus;
+	}
+
+	async function openAttachment(a: SessionAttachment) {
+		const status = await openWithFallback(a);
+		if (status === null) return;
+		if (status === 404) {
+			gone[a.id] = true;
+			toasts.error(m.conversation_attachment_gone({ name: a.name }));
+			return;
+		}
+		toasts.error(refusalMessage(status, a.name, 'blob'));
+	}
+
+	async function fetchBody(a: SessionAttachment): Promise<Response | null> {
+		const blob = await fetch(url(a), { credentials: 'same-origin' }).catch(() => null);
+		if (blob?.ok) return blob;
+		const href = stagedHref(a);
+		if (!href) return null;
+		const staged = await fetch(href, { credentials: 'same-origin' }).catch(() => null);
+		return staged?.ok ? staged : null;
+	}
+
 	async function loadText(a: SessionAttachment): Promise<string | null> {
 		if (texts[a.id] !== undefined) return texts[a.id];
 		const cached = await attachmentStore.cachedText(a.session_id, a.hash);
@@ -49,17 +94,16 @@
 			texts[a.id] = cached;
 			return cached;
 		}
-		try {
-			const res = await fetch(url(a), { credentials: 'same-origin' });
-			if (!res.ok) throw new Error(String(res.status));
-			const text = await res.text();
-			texts[a.id] = text;
-			void attachmentStore.cacheText(a.session_id, a.hash, text);
-			return text;
-		} catch {
+		const res = await fetchBody(a);
+		if (!res) {
+			gone[a.id] = true;
 			toasts.error(m.conversation_attachment_load_failed({ name: a.name }));
 			return null;
 		}
+		const text = await res.text();
+		texts[a.id] = text;
+		void attachmentStore.cacheText(a.session_id, a.hash, text);
+		return text;
 	}
 
 	async function toggle(a: SessionAttachment) {
@@ -88,10 +132,12 @@
 								? m.conversation_attachment_lines({ lines: lineCount(texts[a.id]) })
 								: null}
 							expanded={!!expanded[a.id]}
-							unavailable={archived}
-							title={expanded[a.id]
-								? m.conversation_attachment_collapse({ name: a.name })
-								: m.conversation_attachment_expand({ name: a.name })}
+							unavailable={archived || gone[a.id]}
+							title={gone[a.id]
+								? m.conversation_attachment_unavailable({ name: a.name })
+								: expanded[a.id]
+									? m.conversation_attachment_collapse({ name: a.name })
+									: m.conversation_attachment_expand({ name: a.name })}
 							onclick={() => toggle(a)}
 						/>
 						{#if !archived}
@@ -113,7 +159,7 @@
 					type="button"
 					class="thumb"
 					title={m.conversation_attachment_open({ name: a.name })}
-					onclick={() => openLocalFile(url(a), a.name)}
+					onclick={() => openAttachment(a)}
 				>
 					<img
 						src={url(a)}
@@ -126,9 +172,11 @@
 				<FileChip
 					name={a.name}
 					size={a.size}
-					unavailable={archived}
-					title={m.conversation_attachment_open({ name: a.name })}
-					onclick={() => openLocalFile(url(a), a.name)}
+					unavailable={archived || gone[a.id]}
+					title={gone[a.id]
+						? m.conversation_attachment_unavailable({ name: a.name })
+						: m.conversation_attachment_open({ name: a.name })}
+					onclick={() => openAttachment(a)}
 				/>
 			{/if}
 		{/each}

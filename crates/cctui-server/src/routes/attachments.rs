@@ -1,8 +1,10 @@
-//! Files the user sent mid-chat (`paste-N.txt` masks, screenshots, docs).
+//! Files the user sent (`paste-N.txt` masks, screenshots, docs), whether in the
+//! spawn modal or mid-chat.
 //!
-//! `POST /sessions/{id}/files` stages them on the daemon and, through
-//! [`record_uploads`], keeps a copy in the content-addressed blob store with a
-//! `session_attachments` row per file. `GET /api/v1/sessions/{id}/attachments`
+//! `POST /sessions/spawn` and `POST /sessions/{id}/files` both, through
+//! [`record_uploads`], keep a copy in the content-addressed blob store with a
+//! `session_attachments` row per file, before the bytes are staged on the
+//! daemon. `GET /api/v1/sessions/{id}/attachments`
 //! lists those rows (session-read authz via the `api_router` layer); the bytes
 //! come from the existing `GET /sessions/{id}/blobs/{hash}`.
 
@@ -27,6 +29,9 @@ pub struct SessionAttachment {
     pub content_type: Option<String>,
     #[sqlx(rename = "created_at_ms")]
     pub created_at: i64,
+    /// The session's machine, once it has registered: what the webui needs to
+    /// fall back to the staged copy through `/machines/{id}/fs/file`.
+    pub machine_id: Option<String>,
 }
 
 fn media_type_for(upload: &RawUpload) -> String {
@@ -56,7 +61,8 @@ pub async fn record_uploads(
             "INSERT INTO session_attachments (session_id, name, hash, size, content_type) \
              VALUES ($1, $2, $3, $4, $5) \
              RETURNING id, session_id, message_id, name, hash, size, content_type, \
-                       (extract(epoch FROM created_at) * 1000)::bigint AS created_at_ms",
+                       (extract(epoch FROM created_at) * 1000)::bigint AS created_at_ms, \
+                       (SELECT s.machine_id FROM sessions s WHERE s.id = $1) AS machine_id",
         )
         .bind(session_id)
         .bind(name)
@@ -70,14 +76,53 @@ pub async fn record_uploads(
     Ok(out)
 }
 
+/// Undo a [`record_uploads`] batch whose operation then failed. Blobs stay:
+/// they are content-addressed and may be shared with another attachment.
+pub async fn delete_attachments(
+    pool: &sqlx::PgPool,
+    ids: &[uuid::Uuid],
+) -> Result<(), sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("DELETE FROM session_attachments WHERE id = ANY($1)")
+        .bind(ids)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Adopt the daemon's final (collision-suffixed) staged names. The conversation
+/// matches chips to the paths printed under the message, so the row has to carry
+/// the staged name — which is only known once staging has succeeded.
+pub async fn set_attachment_names(
+    pool: &sqlx::PgPool,
+    rows: &[SessionAttachment],
+    staged_names: &[String],
+) -> Result<(), sqlx::Error> {
+    for (row, staged) in rows.iter().zip(staged_names) {
+        if row.name == *staged {
+            continue;
+        }
+        sqlx::query("UPDATE session_attachments SET name = $2 WHERE id = $1")
+            .bind(row.id)
+            .bind(staged)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
 pub async fn list_session_attachments(
     pool: &sqlx::PgPool,
     session_id: &str,
 ) -> Result<Vec<SessionAttachment>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, session_id, message_id, name, hash, size, content_type, \
-                (extract(epoch FROM created_at) * 1000)::bigint AS created_at_ms \
-         FROM session_attachments WHERE session_id = $1 ORDER BY created_at, id",
+        "SELECT a.id, a.session_id, a.message_id, a.name, a.hash, a.size, a.content_type, \
+                (extract(epoch FROM a.created_at) * 1000)::bigint AS created_at_ms, \
+                s.machine_id \
+         FROM session_attachments a LEFT JOIN sessions s ON s.id = a.session_id \
+         WHERE a.session_id = $1 ORDER BY a.created_at, a.id",
     )
     .bind(session_id)
     .fetch_all(pool)
@@ -226,5 +271,111 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("DELETE FROM users WHERE id = $1").bind(uid).execute(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn records_before_the_session_row_exists_and_still_cascades() {
+        let Some(url) = crate::routes::gateway::test_db_url("record_before_session") else {
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect test db");
+        let uid = Uuid::new_v4();
+        let machine = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, name, key_hash) VALUES ($1, 'att-spawn', $2)")
+            .bind(uid)
+            .bind(format!("kh-{uid}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO machines (id, user_id, name, key_hash) VALUES ($1, $2, $3, $4)")
+            .bind(machine)
+            .bind(uid)
+            .bind(machine.to_string())
+            .bind(format!("kh-{machine}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The spawn path records under the pre-minted session id, before the
+        // worker has registered and created the `sessions` row.
+        let sid = Uuid::new_v4().to_string();
+        let body = format!("cct916 bootstrap {sid}");
+        let uploads = [upload("paste-1.txt", body.as_bytes(), Some("text/plain"))];
+        let recorded = record_uploads(&pool, &sid, &uploads, &[]).await.unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].name, "paste-1.txt", "no staged name yet: the upload name stands");
+
+        let listed = list_session_attachments(&pool, &sid).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let hash = listed[0].hash.clone();
+        let (blob_len,): (i64,) =
+            sqlx::query_as("SELECT byte_len FROM daemon_blobs WHERE hash = $1")
+                .bind(&hash)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(blob_len, i64::try_from(body.len()).unwrap());
+
+        sqlx::query(
+            "INSERT INTO sessions (id, machine_id, working_dir, user_id, machine_uuid, adapter_id) \
+             VALUES ($1, $2, '/w', $3, $4, 'claude-code')",
+        )
+        .bind(&sid)
+        .bind(machine.to_string())
+        .bind(uid)
+        .bind(machine)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM sessions WHERE id = $1").bind(&sid).execute(&pool).await.unwrap();
+        assert!(
+            list_session_attachments(&pool, &sid).await.unwrap().is_empty(),
+            "the delete trigger replaces the dropped FK cascade"
+        );
+
+        sqlx::query("DELETE FROM daemon_blobs WHERE hash = $1")
+            .bind(&hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM machines WHERE id = $1")
+            .bind(machine)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE id = $1").bind(uid).execute(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_attachments_undoes_a_recorded_batch() {
+        let Some(url) = crate::routes::gateway::test_db_url("delete_attachments") else {
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect test db");
+        let sid = Uuid::new_v4().to_string();
+        let body = format!("cct1056 rollback {sid}");
+        let uploads = [upload("note.txt", body.as_bytes(), Some("text/plain"))];
+        let recorded = record_uploads(&pool, &sid, &uploads, &[]).await.unwrap();
+        let ids: Vec<Uuid> = recorded.iter().map(|a| a.id).collect();
+
+        set_attachment_names(&pool, &recorded, &["note-1.txt".to_owned()]).await.unwrap();
+        assert_eq!(list_session_attachments(&pool, &sid).await.unwrap()[0].name, "note-1.txt");
+
+        delete_attachments(&pool, &ids).await.unwrap();
+        assert!(list_session_attachments(&pool, &sid).await.unwrap().is_empty());
+
+        sqlx::query("DELETE FROM daemon_blobs WHERE hash = $1")
+            .bind(&recorded[0].hash)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

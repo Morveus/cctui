@@ -102,6 +102,42 @@ jobs:
             CLIENT_VERSION=${{ steps.ctx.outputs.version }}
           tags: ghcr.io/${{ steps.ctx.outputs.ns }}/cctui-ui:${{ steps.ctx.outputs.version }}
 
+      # The same two images as OCI archives, attached to the run. A run
+      # artifact downloads with the plain `repo` scope (`gh run download`),
+      # unlike a ghcr package that is born private: this is what lets an agent
+      # mirror the CI build into the internal registry without a packages
+      # token. Both exports are cache hits on the builds above.
+      - name: Export server image (OCI archive)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          build-args: |
+            CCTUI_GIT_HASH=${{ steps.ctx.outputs.sha }}
+          tags: ghcr.io/${{ steps.ctx.outputs.ns }}/cctui:${{ steps.ctx.outputs.version }}
+          outputs: type=oci,dest=/tmp/cctui-server.tar
+
+      - name: Export webui image (OCI archive)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: webui/Dockerfile
+          platforms: linux/amd64
+          build-args: |
+            CLIENT_VERSION=${{ steps.ctx.outputs.version }}
+          tags: ghcr.io/${{ steps.ctx.outputs.ns }}/cctui-ui:${{ steps.ctx.outputs.version }}
+          outputs: type=oci,dest=/tmp/cctui-ui.tar
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: images-${{ steps.ctx.outputs.version }}
+          path: |
+            /tmp/cctui-server.tar
+            /tmp/cctui-ui.tar
+          retention-days: 3
+          if-no-files-found: error
+
       # The digests a deployment should pin, rather than the tags above.
       - name: Digests to pin
         run: |

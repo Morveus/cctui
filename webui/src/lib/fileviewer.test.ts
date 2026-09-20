@@ -25,4 +25,18 @@ describe('fileviewer refusalMessage', () => {
 		expect(new Set([tooLarge, denied, missing, offline, other]).size).toBe(5);
 		expect(other).toContain('500');
 	});
+
+	it('gives blob 404, fs 404 and fs 503 three distinct messages', () => {
+		const blobMissing = refusalMessage(404, 'shot.png', 'blob');
+		const fsMissing = refusalMessage(404, 'shot.png', 'machine');
+		const fsOffline = refusalMessage(503, 'shot.png', 'machine');
+		expect(new Set([blobMissing, fsMissing, fsOffline]).size).toBe(3);
+		for (const t of [blobMissing, fsMissing, fsOffline]) expect(t).toContain('shot.png');
+	});
+
+	it('never blames the machine for a blob-store refusal', () => {
+		for (const status of [400, 404, 500, 503]) {
+			expect(refusalMessage(status, 'shot.png', 'blob')).not.toMatch(/machine/i);
+		}
+	});
 });

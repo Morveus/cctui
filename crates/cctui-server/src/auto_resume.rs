@@ -26,6 +26,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 
+use crate::live_sessions::live_sessions_predicate;
 use crate::state::AppState;
 
 /// Delay before the first nudge, then between successive nudges. The last
@@ -134,7 +135,8 @@ pub fn backoff_after(attempt: i32) -> i64 {
 /// The `event_type`/`role`/`text` triple in `last_err` is also the predicate of
 /// the partial index `idx_stream_events_api_error`: reword one side and the
 /// planner stops using the index.
-const STUCK_SELECT: &str = "WITH last_err AS ( \
+const STUCK_SELECT: &str = concat!(
+    "WITH last_err AS ( \
         SELECT DISTINCT ON (e.session_id) \
                e.session_id, e.id, e.created_at, e.payload->>'text' AS text \
         FROM stream_events e \
@@ -151,7 +153,9 @@ const STUCK_SELECT: &str = "WITH last_err AS ( \
      FROM last_err le \
      JOIN sessions s ON s.id = le.session_id \
      LEFT JOIN session_auto_resume r ON r.session_id = le.session_id \
-     WHERE s.status NOT IN ('archived', 'ended', 'failed', 'draft', 'queued') \
+     WHERE ",
+    live_sessions_predicate!("s"),
+    " AND s.status NOT IN ('archived', 'ended', 'failed', 'draft', 'queued') \
        AND COALESCE((SELECT us.data->'autoResumeOnConnectionLoss' = 'true'::jsonb \
                      FROM user_settings us WHERE us.user_id = s.user_id), false) \
        AND NOT EXISTS ( \
@@ -160,7 +164,8 @@ const STUCK_SELECT: &str = "WITH last_err AS ( \
              AND (n.event_type = 'tool_use' \
                   OR (n.event_type = 'message' \
                       AND n.payload->>'role' IN ('assistant', 'user')))) \
-     LIMIT $2";
+     LIMIT $2"
+);
 
 #[derive(sqlx::FromRow)]
 struct StuckRow {

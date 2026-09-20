@@ -15,6 +15,7 @@ use cctui_proto::classifier::{Bucket, ClassifyInput, PrStatus, PrStatusCache, cl
 use cctui_proto::models::{Attention, Liveness, Session, SessionEndReason, SessionStatus};
 
 use crate::auth::AuthContext;
+use crate::live_sessions::live_sessions_predicate;
 use crate::routes::spawn::{bad_request, resolve_owned_machine};
 use crate::state::AppState;
 
@@ -396,9 +397,10 @@ pub async fn list_sessions(
         "SELECT {cols} \
          FROM sessions s \
          LEFT JOIN machines m ON m.id = s.machine_uuid \
-         WHERE s.status != 'archived' \
+         WHERE {} \
          AND ($1::uuid IS NULL OR m.user_id = $1) \
          ORDER BY s.registered_at DESC",
+        live_sessions_predicate!("s"),
     );
     let mut rows: Vec<DbSession> = sqlx::query_as(sqlx::AssertSqlSafe(non_archived_query))
         .bind(uid)
@@ -615,6 +617,9 @@ async fn enrich_and_sort(
     }
 
     // Last message text + timestamp per session, from stream_events.
+    // `event_type = 'message'` is also the predicate of the partial index
+    // `idx_stream_events_latest_message`; narrowing it here (a role filter,
+    // say) without narrowing the index costs the per-session single probe.
     if !session_ids.is_empty() {
         let rows: Vec<(String, serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
             "SELECT DISTINCT ON (session_id) session_id, payload, created_at \
@@ -1240,7 +1245,7 @@ pub async fn search_sessions(
         let scope = if params.include_archived {
             "TRUE".to_string()
         } else {
-            format!("(s.status <> 'archived' OR s.id = ANY(${}))", n + 1)
+            format!("({} OR s.id = ANY(${}))", live_sessions_predicate!("s"), n + 1)
         };
         // Whether we bound the live_ids array (1) or not (0) — shifts limit/offset.
         let extra = usize::from(!params.include_archived);

@@ -202,6 +202,15 @@ describe('tool activity — asleep vs. grinding', () => {
 		expect(a.todoTotal).toBe(1);
 	});
 
+	it('drops the in_progress step once the session stops working', () => {
+		const todos = [{ content: 'ship it', status: 'in_progress', active_form: 'Shipping it' }];
+		expect(toolActivity(working({ todos }), NOW).todoActive).toBe('Shipping it');
+		const idle = toolActivity(session({ bucket: 'done', status: 'active', todos }), NOW);
+		expect(idle.todoActive).toBeNull();
+		expect(idle.todoTotal).toBe(1);
+		expect(idle.show).toBe(true);
+	});
+
 	it('reports no in_progress step when every task is pending or done', () => {
 		const a = toolActivity(
 			working({

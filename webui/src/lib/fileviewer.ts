@@ -39,8 +39,25 @@ export function classify(contentType: string | null): FileKind {
 	return 'download';
 }
 
-/** Toast text for a refused read, by HTTP status. */
-export function refusalMessage(status: number, name: string): string {
+/**
+ * Which route the href points at. `blob` is the server's own store
+ * (`/sessions/{id}/blobs/{hash}`), which knows nothing about any machine, so
+ * its refusals must never be worded as a machine-side absence; `machine` is
+ * `/machines/{id}/fs/file`, where the daemon and the filesystem are in play.
+ */
+export type FileSource = 'machine' | 'blob';
+
+/** Toast text for a refused read, by HTTP status and route. */
+export function refusalMessage(
+	status: number,
+	name: string,
+	source: FileSource = 'machine'
+): string {
+	if (source === 'blob') {
+		return status === 404
+			? m.conversation_attachment_gone({ name })
+			: m.conversation_file_open_failed({ name, status: String(status) });
+	}
 	switch (status) {
 		case 413:
 			return m.conversation_file_too_large({ name });
@@ -56,18 +73,40 @@ export function refusalMessage(status: number, name: string): string {
 	}
 }
 
-export async function openLocalFile(href: string, name: string): Promise<void> {
+/**
+ * Open `href`, returning `null` on success and the HTTP status (`0` for a
+ * network failure) on refusal — without toasting, so a caller with a fallback
+ * chain can try the next source before saying anything.
+ */
+export async function tryOpenLocalFile(
+	href: string,
+	name: string
+): Promise<number | null> {
 	let res: Response;
 	try {
 		res = await fetch(href, { credentials: 'same-origin' });
 	} catch {
+		return 0;
+	}
+	if (!res.ok) return res.status;
+	await present(res, name);
+	return null;
+}
+
+export async function openLocalFile(
+	href: string,
+	name: string,
+	source: FileSource = 'machine'
+): Promise<void> {
+	const status = await tryOpenLocalFile(href, name);
+	if (status === 0) {
 		toasts.error(m.conversation_file_open_failed({ name, status: 'network' }));
-		return;
+	} else if (status !== null) {
+		toasts.error(refusalMessage(status, name, source));
 	}
-	if (!res.ok) {
-		toasts.error(refusalMessage(res.status, name));
-		return;
-	}
+}
+
+async function present(res: Response, name: string): Promise<void> {
 	const kind = classify(res.headers.get('content-type'));
 	if (kind === 'download') {
 		download(await res.blob(), name);

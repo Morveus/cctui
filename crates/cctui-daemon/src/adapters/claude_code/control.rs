@@ -37,7 +37,7 @@ use super::kickstart::Kickstarter;
 use super::state::{StateJson, default_jobs_root};
 use super::transcript::{self, OffsetStore, default_projects_root};
 use super::{SessionMap, socket};
-use crate::git::read_git_branch;
+use crate::git::{read_git_branch, read_git_remote};
 
 /// Config knobs read from `adapters_enabled.config`.
 #[derive(Debug, Clone)]
@@ -2540,20 +2540,26 @@ impl Driver {
                 };
                 let on_disk = StateJson::read(&self.cfg.jobs_root, &job.short);
                 let created_at = on_disk.as_ref().and_then(|s| s.created_at.clone());
-                let git_branch = job.cwd.as_deref().and_then(read_git_branch);
+                let mut extra = json!({
+                    "short": job.short,
+                    "relation": relation,
+                });
+                // The server merges metadata with jsonb `||`, where an explicit
+                // null overwrites. Omit what this poll could not read so a
+                // rediscovery never erases what an earlier one published.
+                for (key, value) in [
+                    ("cli_version", job.cli_version.clone()),
+                    ("created_at", created_at),
+                    ("git_branch", job.cwd.as_deref().and_then(read_git_branch)),
+                    ("git_remote", job.cwd.as_deref().and_then(read_git_remote)),
+                ] {
+                    if let Some(value) = value {
+                        extra[key] = json!(value);
+                    }
+                }
                 self.emit(AdapterEvent::SessionStarted {
                     local_id: session_id,
-                    meta: SessionMeta {
-                        working_dir: job.cwd.clone(),
-                        parent_local_id,
-                        extra: json!({
-                            "short": job.short,
-                            "cli_version": job.cli_version,
-                            "relation": relation,
-                            "created_at": created_at,
-                            "git_branch": git_branch,
-                        }),
-                    },
+                    meta: SessionMeta { working_dir: job.cwd.clone(), parent_local_id, extra },
                 })
                 .await;
             }

@@ -87,16 +87,18 @@
 			<IconButton icon="edit" label={m.pools_edit()} inline size={13} onclick={onedit} />
 		{/if}
 	{/snippet}
-	{#if usage}
-		<div class="gauges">
-			<PoolUsageGauges {usage} />
-		</div>
-	{/if}
-	<div class="members">
-		{@render children?.()}
-		{#if pool.members.length === 0}
-			<Text as="p" tone="faint" size="sm">{m.pools_members_empty()}</Text>
+	<div class="content" class:with-usage={usage !== null}>
+		{#if usage}
+			<div class="gauges">
+				<PoolUsageGauges {usage} />
+			</div>
 		{/if}
+		<div class="members">
+			{@render children?.()}
+			{#if pool.members.length === 0}
+				<Text as="p" tone="faint" size="sm">{m.pools_members_empty()}</Text>
+			{/if}
+		</div>
 	</div>
 	{#if refused}
 		<p class="refusal" aria-live="polite">{refusal}</p>
@@ -106,6 +108,7 @@
 
 <style>
 	.zone {
+		container-type: inline-size;
 		border-radius: var(--r-lg);
 	}
 	/* Touch drag hover: the kit Fieldset only reacts to HTML5 dragover. */
@@ -135,15 +138,31 @@
 		pointer-events: none;
 	}
 	.members {
+		min-width: 0;
 		display: flex;
 		flex-direction: column;
 		gap: var(--sp-3);
 	}
-	/* The pool's own gauges sit above its cards, set off by a hairline so the
-	   aggregate never reads as one more account. */
+	/* Stack on narrow panels; use a separate summary column when both fit. */
 	.gauges {
+		min-width: 0;
 		margin-bottom: var(--sp-3);
 		padding-bottom: var(--sp-2);
 		border-bottom: 1px dashed var(--border);
+	}
+	@container (min-width: 56rem) {
+		.content.with-usage {
+			display: grid;
+			grid-template-columns: minmax(18rem, 1fr) minmax(0, 2fr);
+			gap: var(--sp-4);
+			align-items: start;
+		}
+		.with-usage .gauges {
+			margin-bottom: 0;
+			padding-bottom: 0;
+			padding-inline-end: var(--sp-4);
+			border-bottom: 0;
+			border-inline-end: 1px dashed var(--border);
+		}
 	}
 </style>

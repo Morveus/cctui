@@ -16,10 +16,31 @@ import {
 	type LivePlan,
 	type SoftLimit
 } from '$lib/ws.svelte';
-import { parseAsk, parseTodos, todoProgress as deriveTodoProgress } from './format';
+import { eventSig, parseAsk, parseTodos, todoProgress as deriveTodoProgress } from './format';
 import { lastProseLine, toolInvocationSummary, type ActivityTool } from './activity';
 import type { AskQuestion, TodoItem, TodoProgress } from './types';
 import { endpoints } from '$lib/queries';
+
+// Fold a live ws event into the cached conversation tail. Returns `prev` by
+// identity when nothing changes, so a known event doesn't re-render the drawer.
+//
+// Both guards protect the `after=` delta cursor. A seq-less event is dropped
+// because an optimistic echo's synthetic `maxSeq + 1` is not a `stream_events`
+// id and would make the next delta skip real events; an absent or empty entry
+// is never seeded because a tail with no base makes the next delta start
+// mid-conversation.
+export function mergeLiveEvent(
+	prev: AgentEvent[] | undefined,
+	ev: AgentEvent
+): AgentEvent[] | undefined {
+	if (!prev?.length) return prev;
+	const seq = ev.seq;
+	if (seq === null || seq === undefined) return prev;
+	const sig = eventSig(ev);
+	if (prev.some((e) => e.seq === seq || eventSig(e) === sig)) return prev;
+	const at = prev.findIndex((e) => e.seq != null && Number(e.seq) > Number(seq));
+	return at < 0 ? [...prev, ev] : [...prev.slice(0, at), ev, ...prev.slice(at)];
+}
 
 export interface StreamOpts {
 	// The open session id (reactive getter).
@@ -35,6 +56,8 @@ export interface StreamOpts {
 	invalidateConversation: () => void;
 	// Invalidate the sessions list (reflect a new turn without waiting for poll).
 	invalidateSessions: () => void;
+	// Fold a server-sent live event into the `["conversation", sid]` cache.
+	mergeIntoCache: (sid: string, ev: AgentEvent) => void;
 }
 
 export class ConversationStream {
@@ -99,6 +122,10 @@ export class ConversationStream {
 		this.#resetActivity();
 		ws.subscribe(sid);
 		const offStream = ws.onStream(sid, (ev) => {
+			// Ahead of the echo skip below: the cache must take the server's copy of
+			// a user message (it carries the real `seq`) even when `live` keeps the
+			// optimistic one instead. The drawer collapses the pair by `eventSig`.
+			this.#opts.mergeIntoCache(sid, ev);
 			// Skip a server-echoed user message that duplicates our optimistic one.
 			const key = userMsgKey(ev);
 			if (key !== null && this.live.some((e) => userMsgKey(e) === key)) return;

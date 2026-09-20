@@ -404,6 +404,9 @@ export interface SessionAttachment {
   content_type: string | null;
   /** Epoch ms. */
   created_at: number;
+  /** The session's machine, null until the worker has registered. Lets a chip
+   *  fall back to the staged copy when the blob store no longer has the bytes. */
+  machine_id: string | null;
 }
 
 export const ATTACHMENT_CLOCK_SLACK_MS = 60_000;

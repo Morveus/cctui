@@ -12,8 +12,10 @@
 //! `/clear` truncates), so seek-and-read-new is sufficient and avoids
 //! the rename / debounce complications a watcher would carry.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use cctui_proto::adapter::AdapterEvent;
 use serde_json::{Value, json};
@@ -365,6 +367,69 @@ pub fn reconcile_tail(
     Ok(events)
 }
 
+/// Process-local tally of transcript shapes that produce no event, keyed by a
+/// namespaced label (`unknown:<type>`, `unknown-assistant-block:<t>`,
+/// `unknown-user-block:<t>`, `ignored:<kind>`). The daemon has no metrics
+/// exporter, so counts live here rather than in a registry.
+static DROP_TALLY: LazyLock<Mutex<BTreeMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Increment `label` and return its new count (0 if the lock is poisoned —
+/// observability must never take the parser down).
+fn tally(label: &str) -> u64 {
+    let Ok(mut counts) = DROP_TALLY.lock() else { return 0 };
+    let count = counts.entry(label.to_owned()).or_insert(0);
+    *count += 1;
+    *count
+}
+
+/// A shape we do not handle and did not expect: count it, and warn once.
+fn record_unknown(namespace: &str, kind: &str) {
+    let label = format!("{namespace}:{kind}");
+    if tally(&label) == 1 {
+        tracing::warn!(
+            line_type = %label,
+            "unhandled claude transcript shape — content is being dropped"
+        );
+    }
+}
+
+/// A shape we handle by deliberately producing nothing. Counted, never warned.
+fn record_ignored(kind: &str) {
+    tally(&format!("ignored:{kind}"));
+}
+
+/// Snapshot of [`DROP_TALLY`] for the session-diagnose report.
+// The diagnose aggregation that reads this lives in `control.rs` and is owned by
+// another change; without it nothing in the binary calls this yet.
+#[allow(dead_code)]
+#[must_use]
+pub fn transcript_drop_tally() -> Vec<(String, u64)> {
+    let Ok(counts) = DROP_TALLY.lock() else { return Vec::new() };
+    counts.iter().map(|(k, v)| (k.clone(), *v)).collect()
+}
+
+/// First non-empty string among `keys`. Claude has renamed fields between
+/// releases on several of these records, and this parser cannot see the schema.
+fn first_str<'a>(line: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .filter_map(|k| line.get(*k))
+        .filter_map(Value::as_str)
+        .find(|s| !s.trim().is_empty())
+}
+
+const EXCERPT_CHARS: usize = 120;
+
+/// One-line, length-capped excerpt for a marker label.
+fn excerpt(text: &str) -> String {
+    let line = text.trim().lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= EXCERPT_CHARS {
+        return line.to_owned();
+    }
+    let head: String = line.chars().take(EXCERPT_CHARS).collect();
+    format!("{head}…")
+}
+
 /// Map one transcript / stream-json JSON line (`type:"assistant"|"user"|…`)
 /// to zero or more [`AdapterEvent`]s. Shared with the stream-json drivers:
 /// the CLI's `--output-format stream-json` `assistant`/`user`
@@ -406,17 +471,56 @@ pub(super) fn parse_line(local_id: &str, line: &Value, out: &mut Vec<AdapterEven
                 });
             }
         }
-        "attachment" | "permission-mode" | "worktree-state" | "ai-title" | "agent-name"
-        | "agent-setting" | "last-prompt" => {
+        "attachment" | "permission-mode" | "worktree-state" | "ai-title" | "custom-title"
+        | "agent-name" | "agent-setting" | "queue-operation" => {
             out.push(AdapterEvent::Message {
                 local_id: local_id.to_owned(),
                 payload: system_marker_payload(kind, line),
             });
         }
-        _ => {
-            tracing::debug!(kind, "ignoring unknown transcript line type");
-        }
+        "system" => parse_system(local_id, line, out),
+        // `last-prompt` is a composer-restore pointer and `atis-latch` internal
+        // latch state: no user meaning, and `last-prompt` embeds `leafUuid` so
+        // every one survives payload dedup as its own bubble.
+        "last-prompt" | "atis-latch" => record_ignored(kind),
+        _ => record_unknown("unknown", kind),
     }
+}
+
+/// `type:"system"` covers both genuine timeline events and per-turn bookkeeping
+/// (`turn_duration`, `stop_hook_summary`) that belongs on the owning turn rather
+/// than in the timeline; the latter is counted, not emitted.
+fn parse_system(local_id: &str, line: &Value, out: &mut Vec<AdapterEvent>) {
+    let subtype = line.get("subtype").and_then(Value::as_str).unwrap_or_default();
+    let body = || {
+        first_str(line, &["summary", "content", "message", "text", "command"])
+            .map(excerpt)
+            .unwrap_or_default()
+    };
+    let text = match subtype {
+        "away_summary" => format!("away summary: {}", body()),
+        "scheduled_task_fire" => format!("scheduled task fired: {}", body()),
+        "model_refusal_fallback" => format!("model refusal fallback: {}", body()),
+        "informational" => body(),
+        "local_command" => format!("local command: {}", body()),
+        "turn_duration" | "stop_hook_summary" => {
+            record_ignored(&format!("system/{subtype}"));
+            return;
+        }
+        other => {
+            record_unknown("unknown", &format!("system/{other}"));
+            return;
+        }
+    };
+    let text = if text.trim().is_empty() { subtype.to_owned() } else { text };
+    out.push(AdapterEvent::Message {
+        local_id: local_id.to_owned(),
+        payload: json!({
+            "role": "system_marker",
+            "marker": format!("system/{subtype}"),
+            "text": text,
+        }),
+    });
 }
 
 /// Never embeds the raw line — attachment bodies can be huge; only the marker,
@@ -486,12 +590,31 @@ fn system_marker_payload(marker: &str, line: &Value) -> Value {
                 "text": format!("agent setting: {setting}"),
             })
         }
-        "last-prompt" => {
+        "custom-title" => {
+            let title = first_str(line, &["customTitle", "title"]).unwrap_or_default();
             json!({
                 "role": "system_marker",
                 "marker": marker,
-                "leaf_uuid": str_field("leafUuid"),
-                "text": "last prompt updated",
+                "title": title,
+                "text": format!("title: {title}"),
+            })
+        }
+        "queue-operation" => {
+            let op = first_str(line, &["operation", "op", "action"]).unwrap_or("queue");
+            let verb = match op {
+                "enqueue" | "add" | "queued" => "queued",
+                "dequeue" | "remove" | "dequeued" => "dequeued",
+                other => other,
+            };
+            let body = first_str(line, &["prompt", "text", "content", "value"])
+                .map(excerpt)
+                .unwrap_or_default();
+            let text = if body.is_empty() { verb.to_owned() } else { format!("{verb}: {body}") };
+            json!({
+                "role": "system_marker",
+                "marker": marker,
+                "operation": verb,
+                "text": text,
             })
         }
         _ => json!({ "role": "system_marker", "marker": marker, "text": marker }),
@@ -647,7 +770,7 @@ fn parse_assistant_block(
             });
         }
         other => {
-            tracing::debug!(block_type = ?other, "ignoring unknown assistant content block");
+            record_unknown("unknown-assistant-block", other.unwrap_or("<none>"));
         }
     }
 }
@@ -693,12 +816,39 @@ const META_MARKERS: [&str; 12] = [
     "# Autonomous loop",
 ];
 
+/// Claude echoes an ingested image back as a *user* turn of pure bookkeeping.
+/// The wording changes between releases (`[Image: source: …]`,
+/// `[Image: original 1440x3120, displayed at 923x2000. …]`, `[Image #2]`), so
+/// match the family by its bracket shape rather than any one literal.
+fn is_image_notice_line(line: &str) -> bool {
+    let t = line.trim();
+    let Some(rest) = t.strip_prefix("[Image") else { return false };
+    rest.ends_with(']') && rest.starts_with([']', ':', ' ', '#'])
+}
+
+/// A turn made of nothing but image-notice lines carries no human content.
+fn is_image_notice_turn(text: &str) -> bool {
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty()).peekable();
+    lines.peek().is_some() && lines.all(is_image_notice_line)
+}
+
 /// Whether a user-role transcript message is really a system/agent-directed
 /// message rather than human input, decided solely from the message body
 /// (`text`). See [`META_MARKERS`] for why Claude's `isMeta` flag is ignored.
+///
+/// Markers are matched at the start of ANY line, not only the start of the
+/// turn: the harness routinely prefixes its own sentence before the wrapper it
+/// injects, which a prefix-only test never sees. Line-anchored rather than a
+/// bare substring scan so a human quoting `<system-reminder>` inside a sentence
+/// stays a human turn.
 fn user_text_is_meta(text: &str) -> bool {
-    let t = text.trim_start();
-    META_MARKERS.iter().any(|m| t.starts_with(m))
+    if is_image_notice_turn(text) {
+        return true;
+    }
+    text.lines().any(|line| {
+        let t = line.trim_start();
+        META_MARKERS.iter().any(|m| t.starts_with(m))
+    })
 }
 
 /// Extract the summary text from a `/compact` line. The content lives under
@@ -796,7 +946,7 @@ fn parse_user(local_id: &str, line: &Value, out: &mut Vec<AdapterEvent>) {
                     }),
                 });
             }
-            _ => {}
+            other => record_unknown("unknown-user-block", other.unwrap_or("<none>")),
         }
     }
     if !texts.is_empty() || has_attachment {
@@ -1664,7 +1814,8 @@ mod tests {
             json!({"type":"ai-title","aiTitle":"deploy v1","sessionId":"x"}),
             json!({"type":"agent-name","agentName":"kusaritoi","sessionId":"x"}),
             json!({"type":"agent-setting","agentSetting":"claude","sessionId":"x"}),
-            json!({"type":"last-prompt","leafUuid":"07cc9471","sessionId":"x"}),
+            json!({"type":"custom-title","customTitle":"my session","sessionId":"x"}),
+            json!({"type":"queue-operation","operation":"enqueue","prompt":"<task-notification>go"}),
         ];
         let mut out = Vec::new();
         for l in &lines {
@@ -1702,9 +1853,127 @@ mod tests {
             Some("claude")
         );
         assert_eq!(
-            by_marker("last-prompt").get("leaf_uuid").and_then(Value::as_str),
-            Some("07cc9471")
+            by_marker("custom-title").get("title").and_then(Value::as_str),
+            Some("my session")
         );
+        assert_eq!(
+            by_marker("queue-operation").get("text").and_then(Value::as_str),
+            Some("queued: <task-notification>go")
+        );
+    }
+
+    #[test]
+    fn meta_markers_match_mid_text_not_only_at_the_start() {
+        // The case that fails a prefix-only test: the harness prefixes its own
+        // sentence before the wrapper it injects.
+        assert!(user_text_is_meta(
+            "Another session sent a message:\n<task-notification>done</task-notification>"
+        ));
+        assert!(user_text_is_meta("preamble\n  <system-reminder>hi</system-reminder>"));
+        assert!(user_text_is_meta("<system-reminder>hi</system-reminder>"));
+    }
+
+    #[test]
+    fn human_prose_quoting_a_marker_inline_stays_human() {
+        assert!(!user_text_is_meta("the <system-reminder> tag keeps firing, can we mute it?"));
+        assert!(!user_text_is_meta("ship it"));
+    }
+
+    #[test]
+    fn image_bookkeeping_turns_are_meta_whatever_the_wording() {
+        for text in [
+            "[Image: source: /tmp/a.png]",
+            "[Image: original 1440x3120, displayed at 923x2000. Multiply coordinates by 1.56 to map to original image.]",
+            "[Image #2]",
+            "[Image]",
+            "[Image #1]\n[Image #2]",
+        ] {
+            assert!(user_text_is_meta(text), "must be meta: {text}");
+        }
+        // A human turn that merely mentions an image is not bookkeeping.
+        assert!(!user_text_is_meta("[Image #1]\nwhat is in this screenshot?"));
+        assert!(!user_text_is_meta("look at [Image #1] please"));
+    }
+
+    fn tally_for(label: &str) -> u64 {
+        transcript_drop_tally().into_iter().find(|(k, _)| k == label).map_or(0, |(_, v)| v)
+    }
+
+    #[test]
+    fn system_subtypes_map_to_timeline_markers() {
+        let lines = [
+            (
+                json!({"type":"system","subtype":"away_summary","summary":"stepped out"}),
+                "away summary: stepped out",
+            ),
+            (
+                json!({"type":"system","subtype":"scheduled_task_fire","content":"nightly"}),
+                "scheduled task fired: nightly",
+            ),
+            (
+                json!({"type":"system","subtype":"model_refusal_fallback","message":"downgraded"}),
+                "model refusal fallback: downgraded",
+            ),
+            (json!({"type":"system","subtype":"informational","content":"heads up"}), "heads up"),
+            (
+                json!({"type":"system","subtype":"local_command","command":"/clear"}),
+                "local command: /clear",
+            ),
+        ];
+        for (line, want) in &lines {
+            let mut out = Vec::new();
+            parse_line("s", line, &mut out);
+            let msgs = message_payloads(&out);
+            assert_eq!(msgs.len(), 1, "one marker per system line: {line}");
+            assert_eq!(msgs[0].get("role").and_then(Value::as_str), Some("system_marker"));
+            assert_eq!(msgs[0].get("text").and_then(Value::as_str), Some(*want));
+        }
+    }
+
+    #[test]
+    fn turn_bookkeeping_and_pointer_records_are_dropped_but_counted() {
+        let lines = [
+            json!({"type":"last-prompt","leafUuid":"07cc9471"}),
+            json!({"type":"atis-latch","value":1}),
+            json!({"type":"system","subtype":"turn_duration","durationMs":1200}),
+            json!({"type":"system","subtype":"stop_hook_summary","summary":"ok"}),
+        ];
+        let mut out = Vec::new();
+        for l in &lines {
+            parse_line("s", l, &mut out);
+        }
+        assert!(out.is_empty(), "deliberate drops must emit nothing");
+        for label in [
+            "ignored:last-prompt",
+            "ignored:atis-latch",
+            "ignored:system/turn_duration",
+            "ignored:system/stop_hook_summary",
+        ] {
+            assert!(tally_for(label) >= 1, "{label} must be counted");
+        }
+    }
+
+    #[test]
+    fn unknown_shapes_are_counted_by_namespaced_label() {
+        let lines = [
+            json!({"type":"quantum-entanglement-log","x":1}),
+            json!({"type":"system","subtype":"tachyon_burst"}),
+            json!({"type":"assistant","message":{"content":[{"type":"holodeck_block"}]}}),
+            json!({"type":"user","message":{"content":[{"type":"warp_core_block"}]}}),
+        ];
+        let mut out = Vec::new();
+        for l in &lines {
+            parse_line("s", l, &mut out);
+        }
+        assert!(out.is_empty(), "unknown shapes must not fabricate events");
+        for label in [
+            "unknown:quantum-entanglement-log",
+            "unknown:system/tachyon_burst",
+            "unknown-assistant-block:holodeck_block",
+            "unknown-user-block:warp_core_block",
+        ] {
+            assert!(tally_for(label) >= 1, "{label} must be counted");
+        }
     }
 
     #[test]

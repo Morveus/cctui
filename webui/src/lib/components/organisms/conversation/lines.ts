@@ -31,8 +31,7 @@ export interface DeliveryState {
 	retrying: Map<number, { attempt: number; max: number }>;
 }
 
-// `# Autonomous loop` is also in `META_TAGS` and the daemon's `META_MARKERS`;
-// keep the three in sync.
+// `# Autonomous loop` is also in `META_TAGS` and the daemon's `META_MARKERS`.
 const POLL_PREFIXES = ['# Autonomous loop'];
 const POLL_SENTINELS = ['<<autonomous-loop>>', '<<autonomous-loop-dynamic>>'];
 

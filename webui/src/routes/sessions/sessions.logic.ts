@@ -289,6 +289,8 @@ export type ToolActivity = {
 	todoTotal: number;
 	// The single in_progress entry's activeForm, falling back to its content.
 	// Arbitrary-length agent prose: every renderer must bound and truncate it.
+	// Working sessions only — a task list outlives the turn that wrote it, and a
+	// stale "Running tests" on an idle row reads as live.
 	todoActive: string | null;
 };
 
@@ -302,7 +304,7 @@ export function toolActivity(s: SessionListItem, now: number): ToolActivity {
 	const todoTotal = todos.length;
 	const todoDone = todos.filter((t) => t.status === 'completed').length;
 	const running = todos.find((t) => t.status === 'in_progress');
-	const todoActive = running ? (running.active_form ?? running.content) || null : null;
+	const todoActive = working && running ? (running.active_form ?? running.content) || null : null;
 	const show = (working && (ageMs !== null || !!detail)) || todoTotal > 0;
 	return { show, count, ageMs, detail, asleep, todoDone, todoTotal, todoActive };
 }

@@ -16,6 +16,7 @@ mod error;
 mod fireworks_billing;
 mod http_cache;
 mod langfuse;
+mod live_sessions;
 mod machine_liveness;
 mod machine_resources;
 mod normalize;
@@ -48,6 +49,7 @@ use axum::http::Method;
 use axum::routing::{any, delete, get, patch, post, put};
 use axum::{Extension, Router, middleware};
 use config::Config;
+use live_sessions::live_sessions_predicate;
 use registry::Registry;
 use state::AppState;
 
@@ -1542,9 +1544,11 @@ async fn sweep_usage_notice_buckets(state: &AppState) {
         return;
     }
     let ids: Vec<String> = sessions.into_iter().collect();
-    let live = match sqlx::query_scalar::<_, String>(
-        "SELECT id FROM sessions WHERE id = ANY($1) AND status NOT IN ('archived', 'ended')",
-    )
+    let live = match sqlx::query_scalar::<_, String>(concat!(
+        "SELECT id FROM sessions WHERE id = ANY($1) AND ",
+        live_sessions_predicate!(),
+        " AND status NOT IN ('archived', 'ended')"
+    ))
     .bind(&ids)
     .fetch_all(&state.pool)
     .await
@@ -1573,11 +1577,16 @@ async fn auto_archive_stale(state: &AppState) {
         );
     match sqlx::query_scalar::<_, String>(
         // Drafts and queued spawns are not running: never auto-archive them.
-        "UPDATE sessions SET status = 'archived', \
-             ended_at = COALESCE(ended_at, now()), \
-             end_reason = COALESCE(end_reason, 'reaped_inactive') \
-         WHERE status NOT IN ('archived', 'draft', 'queued') AND pinned = false AND last_heartbeat < $1 \
-         RETURNING id",
+        concat!(
+            "UPDATE sessions SET status = 'archived', \
+                 ended_at = COALESCE(ended_at, now()), \
+                 end_reason = COALESCE(end_reason, 'reaped_inactive') \
+             WHERE ",
+            live_sessions_predicate!(),
+            " AND status NOT IN ('archived', 'draft', 'queued') \
+               AND pinned = false AND last_heartbeat < $1 \
+             RETURNING id"
+        ),
     )
     .bind(cutoff)
     .fetch_all(&state.pool)

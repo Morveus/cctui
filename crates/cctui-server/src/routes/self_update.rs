@@ -207,7 +207,7 @@ pub async fn launch(
         attachment_names: Vec::new(),
         spawn_capability: None,
     };
-    match spawn::dispatch_spawn(&state, &ctx, req, Vec::new()).await {
+    match spawn::dispatch_spawn(&state, &ctx, req, Vec::new(), Vec::new()).await {
         Ok((status, Json(res))) => {
             tracing::info!(
                 version = %latest.version,

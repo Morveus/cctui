@@ -38,6 +38,14 @@ let realWs: unknown;
 const last = () => sockets.at(-1)!;
 const frames = (s: FakeSocket) => s.sent.map((f) => JSON.parse(f) as Record<string, unknown>);
 const messages = (s: FakeSocket) => frames(s).filter((f) => f.type === 'message');
+/** Every message frame the client emitted, across sockets: an ack timeout
+ *  retries on a NEW socket, so a send's attempts are spread over several. */
+const allMessages = () => sockets.flatMap(messages);
+/** Bring up the socket the client dialled, the way a working network would.
+ *  No-op if the newest socket is already open. */
+const acceptDialled = () => {
+	if (last().readyState === 0) last().accept();
+};
 
 beforeEach(() => {
 	sockets = [];
@@ -100,46 +108,79 @@ describe('TrackedSend ack / retry / reconnect state machine', () => {
 		expect(snap.pending.size).toBe(0);
 		expect(snap.failed.size).toBe(0);
 
+		// The watchdog swaps the socket after 60 s of silence; a settled send
+		// must not be re-dispatched onto the replacement.
 		vi.advanceTimersByTime(60_000);
-		expect(messages(last()).length).toBe(1);
+		expect(messages(s).length).toBe(1);
+		expect(allMessages().length).toBe(1);
+		expect(c.deliverySnapshot('s1').pending.size).toBe(0);
 	});
 
-	it('retries the send after the ack timeout elapses (new correlation id)', () => {
+	it('retries on a fresh socket after the ack timeout (new correlation id)', () => {
 		const c = openClient();
 		c.trackedSend('s1', 'hello', 100);
-		const s = last();
-		const cid1 = messages(s)[0].client_msg_id as string;
+		const first = last();
+		const cid1 = messages(first)[0].client_msg_id as string;
 
 		vi.advanceTimersByTime(ACK_TIMEOUT_MS);
+		// An unacked frame means the socket is half-open: retrying on it would
+		// time out identically, so it is abandoned for a fresh one.
+		expect(first.readyState).toBe(3);
+		expect(last()).not.toBe(first);
 		expect(c.deliverySnapshot('s1').retrying.has(100)).toBe(true);
 
-		vi.advanceTimersByTime(backoffDelay(1));
-		const msgs = messages(s);
-		expect(msgs.length).toBe(2);
-		const cid2 = msgs[1].client_msg_id as string;
-		expect(cid2).not.toBe(cid1);
+		const second = last();
+		second.accept();
+		const msgs = messages(second);
+		expect(msgs.length).toBe(1);
+		expect(msgs[0].content).toBe('hello');
+		expect(msgs[0].client_msg_id).not.toBe(cid1);
+		expect(messages(first).length).toBe(1);
 		expect(c.deliverySnapshot('s1').pending.has(100)).toBe(true);
 	});
 
 	it('exhausts MAX_ATTEMPTS into a hard failure, then retryNow resets the loop', () => {
 		const c = openClient();
 		c.trackedSend('s1', 'hello', 100);
-		const s = last();
 
-		for (let i = 0; i < 6; i++) {
+		for (let i = 0; i < MAX_ATTEMPTS + 2; i++) {
 			vi.advanceTimersByTime(ACK_TIMEOUT_MS);
+			acceptDialled();
 			vi.advanceTimersByTime(30000);
+			acceptDialled();
 		}
 		const failed = c.deliverySnapshot('s1');
 		expect(failed.failed.has(100)).toBe(true);
 		expect(failed.pending.has(100)).toBe(false);
-		expect(messages(s).length).toBe(MAX_ATTEMPTS);
+		expect(allMessages().length).toBe(MAX_ATTEMPTS);
 
 		c.retryNow('s1', 100);
 		const retried = c.deliverySnapshot('s1');
 		expect(retried.failed.size).toBe(0);
 		expect(retried.pending.has(100)).toBe(true);
-		expect(messages(s).length).toBe(MAX_ATTEMPTS + 1);
+		expect(allMessages().length).toBe(MAX_ATTEMPTS + 1);
+	});
+
+	// The budget counts frames the server ignored, not writes the client could
+	// not make — otherwise a reconnect slower than the backoff fails a message
+	// that never reached anyone.
+	it('does not spend retry budget while the replacement socket is still dialling', () => {
+		const c = openClient();
+		c.trackedSend('s1', 'hello', 100);
+
+		// Ack timeout, then leave every reconnect hanging (dead network).
+		vi.advanceTimersByTime(ACK_TIMEOUT_MS);
+		vi.advanceTimersByTime(120_000);
+
+		const snap = c.deliverySnapshot('s1');
+		expect(snap.failed.size).toBe(0);
+		expect(snap.pending.has(100)).toBe(true);
+		expect(allMessages().length).toBe(1);
+
+		// The moment a socket comes up, the parked send goes out on it.
+		acceptDialled();
+		expect(messages(last()).length).toBe(1);
+		expect(allMessages().length).toBe(2);
 	});
 
 	it('parks a send when the socket is down and delivers it on reconnect', () => {
@@ -163,18 +204,22 @@ describe('TrackedSend ack / retry / reconnect state machine', () => {
 	it('ignores a stale ack for a superseded attempt', () => {
 		const c = openClient();
 		c.trackedSend('s1', 'hello', 100);
-		const s = last();
-		const cid1 = messages(s)[0].client_msg_id as string;
+		const first = last();
+		const cid1 = messages(first)[0].client_msg_id as string;
 
 		vi.advanceTimersByTime(ACK_TIMEOUT_MS);
-		vi.advanceTimersByTime(backoffDelay(1));
-		expect(messages(s).length).toBe(2);
+		acceptDialled();
+		const second = last();
+		expect(allMessages().length).toBe(2);
 
-		s.deliver({ type: 'message_ack', client_msg_id: cid1, ok: true });
+		// A late ack for attempt 1, arriving on the socket that outlived it,
+		// must not settle the send now riding attempt 2.
+		second.deliver({ type: 'message_ack', client_msg_id: cid1, ok: true });
 		expect(c.deliverySnapshot('s1').pending.has(100)).toBe(true);
 
-		const cid2 = messages(s)[1].client_msg_id as string;
-		s.deliver({ type: 'message_ack', client_msg_id: cid2, ok: true });
+		const cid2 = messages(second)[0].client_msg_id as string;
+		expect(cid2).not.toBe(cid1);
+		second.deliver({ type: 'message_ack', client_msg_id: cid2, ok: true });
 		expect(c.deliverySnapshot('s1').pending.size).toBe(0);
 	});
 

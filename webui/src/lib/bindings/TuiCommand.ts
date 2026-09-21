@@ -10,4 +10,10 @@ export type TuiCommand = { "type": "subscribe", session_id: string, } | { "type"
  * questions" (the ESC-dismiss fallback). `content` still carries the
  * flattened text so older daemons (and the fallback path) work.
  */
-ask_picks?: Array<Array<number>> | null, } | { "type": "permission_response", session_id: string, request_id: string, behavior: string, };
+ask_picks?: Array<Array<number>> | null, 
+/**
+ * UUIDv7 minted by the client when the human hit send, carried through
+ * the daemon onto every event this turn produces so clients dedup by
+ * identity. Absent from older clients, which fall back to content.
+ */
+turn_id?: string | null, } | { "type": "permission_response", session_id: string, request_id: string, behavior: string, };

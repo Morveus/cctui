@@ -1118,6 +1118,7 @@ mod tests {
             message_id: None,
             usage: None,
             seq: None,
+            turn_id: None,
         }
     }
 
@@ -1149,6 +1150,7 @@ mod tests {
                 ask_picks: None,
                 env: std::collections::BTreeMap::new(),
                 command_id: None,
+                turn_id: None,
             }),
         }
     }

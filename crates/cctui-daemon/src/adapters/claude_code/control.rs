@@ -220,6 +220,17 @@ impl LiveSnapshot {
 /// Spawn-time `(model, effort)` pair remembered per worker `short`.
 type SpawnModelEffort = (Option<String>, Option<String>);
 
+/// How long after a reply op its turn id keeps landing on the session's user
+/// events. Claude emits the re-encodings within seconds; anything later is a
+/// different turn, most likely typed into the native TUI.
+const TURN_ID_WINDOW: Duration = Duration::from_mins(1);
+
+#[derive(Clone, Copy)]
+struct PendingTurn {
+    id: uuid::Uuid,
+    at: Instant,
+}
+
 /// A prepared spawn/fork `dispatch` request whose control-socket round-trip
 /// is awaited outside the run loop, so a slow or silent claude daemon can't
 /// wedge polling and every later command for the adapter.
@@ -355,6 +366,14 @@ pub struct Driver {
     /// session list still shows the model/effort we launched the worker with.
     /// `Mutex` because `spawn` takes `&self` while the poll loop holds `&mut self`.
     spawn_model_effort: std::sync::Mutex<HashMap<String, SpawnModelEffort>>,
+    /// The turn id of the reply most recently injected into each session, with
+    /// the instant it was injected. Claude re-encodes one injected turn as
+    /// several transcript lines, so every user event inside
+    /// [`TURN_ID_WINDOW`] takes the same id; past the window a turn typed
+    /// straight into the native TUI would otherwise inherit it.
+    /// `Mutex` because the reply path takes `&self` while the poll loop holds
+    /// `&mut self`.
+    pending_turns: std::sync::Mutex<HashMap<String, PendingTurn>>,
     /// Parent session id remembered per freshly-forked child `short`.
     /// `fork` dispatches a new worker but the `SessionStarted` for it is emitted
     /// later by the poll loop when the short first appears in the roster — that
@@ -592,6 +611,7 @@ impl Driver {
             churned: false,
             server_marks: HashMap::new(),
             spawn_model_effort: std::sync::Mutex::new(HashMap::new()),
+            pending_turns: std::sync::Mutex::new(HashMap::new()),
             fork_parent_by_short: std::sync::Mutex::new(HashMap::new()),
             server: None,
             machine_key: None,
@@ -777,7 +797,12 @@ impl Driver {
         text: &str,
         ask_picks: Option<Vec<Vec<usize>>>,
         env: &std::collections::BTreeMap<String, String>,
+        turn_id: Option<uuid::Uuid>,
     ) -> anyhow::Result<()> {
+        // Recorded before the op so the transcript tail cannot observe the
+        // injected turn ahead of its id. A reply with no id clears any previous
+        // one rather than letting it leak onto an unrelated turn.
+        self.note_turn(local_id, turn_id);
         // Hibernated sessions (worker exited, job state still on disk)
         // have left `short_by_session`, so fall back to deriving the
         // short from the session id — same as the removal path. The derived
@@ -967,11 +992,12 @@ impl Driver {
                     &text,
                     None,
                     &std::collections::BTreeMap::default(),
+                    None,
                 )
                 .await?;
             }
-            AdapterCommand::Reply { local_id, text, ask_picks, env, .. } => {
-                self.deliver_reply(&sock, &local_id, &text, ask_picks, &env).await?;
+            AdapterCommand::Reply { local_id, text, ask_picks, env, turn_id, .. } => {
+                self.deliver_reply(&sock, &local_id, &text, ask_picks, &env, turn_id).await?;
             }
             AdapterCommand::Kill { local_id, signal } => {
                 let short = self.resolve_short(&local_id)?;
@@ -1663,8 +1689,9 @@ impl Driver {
             .output()
             .await
             .with_context(|| format!("spawning `{} rm {short}`", self.cfg.claude_bin))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        match classify_claude_rm(out.status.code(), out.status.success(), &stderr) {
+        match classify_claude_rm(out.status.code(), out.status.success(), &stdout, &stderr) {
             ClaudeRmOutcome::Removed => {
                 tracing::info!(%short, "removed claude job via `claude rm`");
                 Ok(())
@@ -2613,6 +2640,7 @@ impl Driver {
                             intent: None,
                             model: None,
                             effort: None,
+                            permission_mode: None,
                             children: Vec::new(),
                         })
                         .await;
@@ -2757,6 +2785,7 @@ impl Driver {
                             // same).
                             "session_id": sess,
                         }),
+                        turn_id: None,
                     })
                     .await;
                 }
@@ -2815,6 +2844,7 @@ impl Driver {
                     intent,
                     model,
                     effort,
+                    permission_mode: None,
                     children,
                 })
                 .await;
@@ -2911,6 +2941,7 @@ impl Driver {
                         intent: None,
                         model: None,
                         effort: None,
+                        permission_mode: None,
                         children: Vec::new(),
                     })
                     .await;
@@ -2995,6 +3026,7 @@ impl Driver {
             intent: None,
             model: None,
             effort: None,
+            permission_mode: None,
             children: Vec::new(),
         }
     }
@@ -3459,7 +3491,45 @@ impl Driver {
     }
 
     async fn emit(&self, evt: AdapterEvent) {
-        let _ = self.events.send(evt).await;
+        let _ = self.events.send(self.stamp_turn(evt)).await;
+    }
+
+    /// Give a user event the id of the turn cctui injected, when one is still
+    /// in flight. Only `role:"user"` events are stamped: the several encodings
+    /// Claude stores one turn in must share a key, while two assistant messages
+    /// in the same turn must not.
+    fn stamp_turn(&self, mut evt: AdapterEvent) -> AdapterEvent {
+        if let AdapterEvent::Message { local_id, payload, turn_id } = &mut evt
+            && turn_id.is_none()
+            && payload.get("role").and_then(serde_json::Value::as_str) == Some("user")
+            && let Some(id) = self.turn_for(local_id)
+        {
+            *turn_id = Some(id);
+        }
+        evt
+    }
+
+    fn note_turn(&self, local_id: &str, turn_id: Option<uuid::Uuid>) {
+        let Ok(mut map) = self.pending_turns.lock() else { return };
+        match turn_id {
+            Some(id) => {
+                map.insert(local_id.to_owned(), PendingTurn { id, at: Instant::now() });
+            }
+            None => {
+                map.remove(local_id);
+            }
+        }
+    }
+
+    fn turn_for(&self, local_id: &str) -> Option<uuid::Uuid> {
+        let mut map = self.pending_turns.lock().ok()?;
+        let pending = *map.get(local_id)?;
+        let live = pending.at.elapsed() <= TURN_ID_WINDOW;
+        if !live {
+            map.remove(local_id);
+        }
+        drop(map);
+        live.then_some(pending.id)
     }
 }
 
@@ -3569,6 +3639,13 @@ fn agent_tool_context(cap: &cctui_proto::api::SpawnCapability) -> String {
         b,
         "  example: mcp__cctui__CctuiAgent({{\"adapter\": \"{adapter}\", \"prompt\": \
          \"Review the diff on branch X and list real defects\", \"cwd\": \"/path/to/repo\"}})"
+    );
+    b.push_str(
+        "CctuiUsage: `mcp__cctui__CctuiUsage` reports the rate limits and budget that apply to \
+         THIS session — the account it is pinned to (possibly shared or pool-elected, not \
+         necessarily your own), its usage windows, this session's spend, and whether each model \
+         is currently allowed or soft-limit blocked. Check it before a fan-out and when picking \
+         a child's model: a blocked model burns the whole batch on 429s. Takes no arguments.\n",
     );
     b
 }
@@ -3965,17 +4042,29 @@ enum ClaudeRmOutcome {
     Refused(String),
 }
 
-fn classify_claude_rm(code: Option<i32>, success: bool, stderr: &str) -> ClaudeRmOutcome {
+/// The CLI explains a refusal on **stdout** (`kept <short> — worktree is the
+/// working directory of a live session (pid …)`, then what to do about it)
+/// and reserves stderr for errors (`No job matching`, `couldn't remove …
+/// EACCES`). Both go into the detail, whitespace collapsed, so the operator
+/// reads the same message in the daemon log as at the prompt: a bare
+/// `exit 1` cost hours of guesswork on a worktree held by a live session.
+fn classify_claude_rm(
+    code: Option<i32>,
+    success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> ClaudeRmOutcome {
     if success {
         return ClaudeRmOutcome::Removed;
     }
-    let stderr = stderr.trim();
     if stderr.contains("No job matching") {
         return ClaudeRmOutcome::AlreadyGone;
     }
     let code = code.map_or_else(|| "signal".to_owned(), |c| c.to_string());
+    let output =
+        [stderr, stdout].iter().flat_map(|s| s.split_whitespace()).collect::<Vec<_>>().join(" ");
     let detail =
-        if stderr.is_empty() { format!("exit {code}") } else { format!("exit {code}: {stderr}") };
+        if output.is_empty() { format!("exit {code}") } else { format!("exit {code}: {output}") };
     ClaudeRmOutcome::Refused(detail)
 }
 
@@ -4453,11 +4542,14 @@ mod tests {
         assert!(block.contains("adapters you may spawn: claude-code, codex, opencode"));
         assert!(block.contains("per-child budget ceiling: $20"));
         assert!(block.contains("example: mcp__cctui__CctuiAgent({\"adapter\": \"claude-code\""));
+        assert!(block.contains("mcp__cctui__CctuiUsage"), "the limits tool is announced too");
+        assert!(block.contains("blocked model burns the whole batch"), "{block}");
         assert!(block.ends_with("</session-context>"));
 
         let empty = cctui_proto::api::SpawnCapability::default();
         let block = build_session_context(&spec, "/work/cctui", &[], Some(&empty));
         assert!(!block.contains("CctuiAgent"), "an empty capability advertises nothing");
+        assert!(!block.contains("CctuiUsage"), "the relay is absent, so neither tool exists");
     }
 
     #[test]
@@ -4503,18 +4595,36 @@ mod tests {
     #[test]
     fn claude_rm_outcome_distinguishes_gone_from_refused() {
         use super::{ClaudeRmOutcome, classify_claude_rm};
-        assert_eq!(classify_claude_rm(Some(0), true, ""), ClaudeRmOutcome::Removed);
+        assert_eq!(classify_claude_rm(Some(0), true, "", ""), ClaudeRmOutcome::Removed);
         assert_eq!(
-            classify_claude_rm(Some(1), false, "No job matching 'ad162ca8'\n"),
+            classify_claude_rm(Some(1), false, "", "No job matching 'ad162ca8'\n"),
             ClaudeRmOutcome::AlreadyGone
         );
         assert_eq!(
-            classify_claude_rm(Some(1), false, "worktree has uncommitted changes: /w\n"),
+            classify_claude_rm(Some(1), false, "", "worktree has uncommitted changes: /w\n"),
             ClaudeRmOutcome::Refused("exit 1: worktree has uncommitted changes: /w".into())
         );
         assert_eq!(
-            classify_claude_rm(None, false, ""),
+            classify_claude_rm(None, false, "", ""),
             ClaudeRmOutcome::Refused("exit signal".into())
+        );
+        // The CLI's own explanation of a refusal is on stdout: it must reach
+        // the log, not be dropped for a bare exit code.
+        assert_eq!(
+            classify_claude_rm(
+                Some(1),
+                false,
+                "kept 229a5a4f — worktree is the working directory of a live session (pid 42)\n  worktree kept at /w\n  exit that session, then run 'claude rm 229a5a4f' again\n",
+                ""
+            ),
+            ClaudeRmOutcome::Refused(
+                "exit 1: kept 229a5a4f — worktree is the working directory of a live session (pid 42) worktree kept at /w exit that session, then run 'claude rm 229a5a4f' again".into()
+            )
+        );
+        // stderr first when both speak: the error before the narration.
+        assert_eq!(
+            classify_claude_rm(Some(1), false, "kept x\n", "EACCES: permission denied\n"),
+            ClaudeRmOutcome::Refused("exit 1: EACCES: permission denied kept x".into())
         );
     }
 
@@ -4534,6 +4644,83 @@ mod tests {
             hook_socket_path: tmp.join("hook.sock"),
         };
         (Driver::new(cfg, tx, cmd_rx, CancellationToken::new()), rx)
+    }
+
+    #[tokio::test]
+    async fn injected_turn_stamps_every_encoding_with_one_id() {
+        let (d, mut rx) = driver();
+        let id = uuid::Uuid::new_v4();
+        d.note_turn("sess-1", Some(id));
+        // The three shapes Claude stores one attachment-carrying turn in.
+        for text in [
+            "look at this\nAttached file:\n- /tmp/cctui-uploads/sess-1/shot.png",
+            "[Image #1][shot.png]look at this",
+            "[Image: source: /tmp/cctui-uploads/sess-1/shot.png]",
+        ] {
+            d.emit(AdapterEvent::Message {
+                local_id: "sess-1".into(),
+                payload: json!({"role": "user", "text": text, "meta": false}),
+                turn_id: None,
+            })
+            .await;
+        }
+        for _ in 0..3 {
+            let AdapterEvent::Message { turn_id, .. } = rx.recv().await.unwrap() else {
+                panic!("want Message")
+            };
+            assert_eq!(turn_id, Some(id));
+        }
+
+        d.emit(AdapterEvent::Message {
+            local_id: "sess-1".into(),
+            payload: json!({"role": "assistant", "text": "on it"}),
+            turn_id: None,
+        })
+        .await;
+        let AdapterEvent::Message { turn_id, .. } = rx.recv().await.unwrap() else {
+            panic!("want Message")
+        };
+        assert_eq!(turn_id, None, "assistant text must not inherit the turn id");
+
+        d.emit(AdapterEvent::Message {
+            local_id: "sess-2".into(),
+            payload: json!({"role": "user", "text": "hi"}),
+            turn_id: None,
+        })
+        .await;
+        let AdapterEvent::Message { turn_id, .. } = rx.recv().await.unwrap() else {
+            panic!("want Message")
+        };
+        assert_eq!(turn_id, None, "another session's turn must not inherit it");
+    }
+
+    #[tokio::test]
+    async fn a_reply_without_a_turn_id_clears_the_previous_one() {
+        let (d, mut rx) = driver();
+        d.note_turn("sess-1", Some(uuid::Uuid::new_v4()));
+        d.note_turn("sess-1", None);
+        d.emit(AdapterEvent::Message {
+            local_id: "sess-1".into(),
+            payload: json!({"role": "user", "text": "typed in the TUI"}),
+            turn_id: None,
+        })
+        .await;
+        let AdapterEvent::Message { turn_id, .. } = rx.recv().await.unwrap() else {
+            panic!("want Message")
+        };
+        assert_eq!(turn_id, None);
+    }
+
+    #[test]
+    fn a_turn_id_older_than_the_window_is_not_reused() {
+        let (d, _rx) = driver();
+        let id = uuid::Uuid::new_v4();
+        let stale = Instant::now()
+            .checked_sub(TURN_ID_WINDOW + Duration::from_secs(1))
+            .expect("monotonic clock must already be older than the window");
+        d.pending_turns.lock().unwrap().insert("sess-1".into(), PendingTurn { id, at: stale });
+        assert_eq!(d.turn_for("sess-1"), None);
+        assert!(!d.pending_turns.lock().unwrap().contains_key("sess-1"));
     }
 
     #[tokio::test]
@@ -4769,7 +4956,7 @@ mod tests {
                 AdapterEvent::SessionStarted { .. } | AdapterEvent::SessionEnded { .. } => {
                     panic!("a reset must not start or end a session");
                 }
-                AdapterEvent::Message { local_id, payload }
+                AdapterEvent::Message { local_id, payload, .. }
                     if payload.get("role").and_then(|r| r.as_str()) == Some("context_reset") =>
                 {
                     assert_eq!(local_id, "sess-1", "marker rides the original session");

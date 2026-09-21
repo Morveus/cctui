@@ -16,9 +16,10 @@
 		Kbd,
 		Link,
 		Textarea,
+		WorkingDir,
 		type Query
 	} from '@dorsk/tsumikit';
-	import { makeCwdSchema, cwdToQuery, dirFromQuery } from './cwdSchema';
+	import { makeCwdSchema, dirFromQuery } from './cwdSchema';
 	import { gitBadge, makeGitInfoWatcher } from './cwdGitInfo';
 	import { makeClipboardFiles } from '$lib/attachments';
 	import type { Form } from './types';
@@ -65,15 +66,15 @@
 	}
 
 	// The machine picker and the path share one control; `form.working_dir` is
-	// the source of truth and the raw query mirrors it both ways, `lastDir`
-	// tracking what the query represents so the two syncs never loop.
+	// the source of truth and the field's bare value mirrors it both ways,
+	// `lastDir` tracking what the field holds so the two syncs never loop.
 	const cwdSchema = makeCwdSchema(
 		() => form.machine_id,
 		() => recentDirs,
 		m.spawn_cwd_label()
 	);
 	// svelte-ignore state_referenced_locally
-	let cwdRaw = $state(cwdToQuery(form.working_dir));
+	let cwdRaw = $state(form.working_dir);
 	// svelte-ignore state_referenced_locally
 	let lastDir = form.working_dir;
 	function onCwdChange(q: Query) {
@@ -88,7 +89,7 @@
 		const dir = form.working_dir;
 		if (dir !== lastDir) {
 			lastDir = dir;
-			cwdRaw = cwdToQuery(dir);
+			cwdRaw = dir;
 		}
 	});
 
@@ -119,15 +120,20 @@
 	<Field label={m.spawn_cwd_label()} for="sp-cwd">
 		<FilterInput
 			id="sp-cwd"
+			key="cwd"
 			schema={cwdSchema}
 			bind:value={cwdRaw}
 			icon={null}
 			showClear={false}
 			placeholder="/home/user/project"
+			title={form.working_dir || undefined}
 			onchange={onCwdChange}
 		>
 			{#snippet inline()}
 				<MachinePicker bind:value={form.machine_id} {machines} label={m.spawn_machine_label()} />
+			{/snippet}
+			{#snippet display()}
+				<WorkingDir path={form.working_dir} shrink minLeaf={12} />
 			{/snippet}
 		</FilterInput>
 	</Field>

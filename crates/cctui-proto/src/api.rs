@@ -621,6 +621,11 @@ pub struct UsageAnalytics {
 #[ts(export)]
 pub struct MessageRequest {
     pub content: String,
+    /// Client-minted `UUIDv7` identity for this human turn, echoed by the daemon
+    /// onto every event the turn produces. Optional: a client that mints none
+    /// falls back to content matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<uuid::Uuid>,
 }
 
 /// Body for `PATCH /api/v1/sessions/{id}` — rename a session after creation.

@@ -1,5 +1,5 @@
 //! `cctui-daemon mcp-agent` — the stdio MCP server a claude session is launched
-//! with, exposing the single `CctuiAgent` tool.
+//! with, exposing the `CctuiAgent` and `CctuiUsage` tools.
 //!
 //! The subcommand is a thin relay, mirroring `ask-hook`: it speaks MCP on
 //! stdio and forwards each `tools/call` to the long-lived daemon over its local
@@ -23,6 +23,11 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 pub const TOOL_NAME: &str = "CctuiAgent";
+pub const USAGE_TOOL_NAME: &str = "CctuiUsage";
+
+/// A limits lookup is one cached server read; it must never hold a turn open
+/// the way a followed child does.
+const USAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// MCP protocol revision this server implements.
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -126,6 +131,34 @@ pub fn tool_schema() -> Value {
     })
 }
 
+/// The `CctuiUsage` input schema. No required arguments: the session id is
+/// already baked into this relay's argv, so the tool always answers for the
+/// caller and can never be pointed at another session.
+#[must_use]
+pub fn usage_tool_schema() -> Value {
+    json!({
+        "name": USAGE_TOOL_NAME,
+        "description": "Report the rate limits and budget that apply to THIS session: the \
+    account it is pinned to (which may be a shared or pool-elected one, not your own), that \
+    account's usage windows, the caps in force, this session's dollar spend, and whether each \
+    model it could run on is currently allowed or soft-limit blocked. Use it before dispatching \
+    a batch of work, and when deciding which model to give a child: a blocked model wastes the \
+    whole fan-out on 429s. Returns a one-line summary followed by the full JSON.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "model": {
+                    "type": "string",
+                    "description": "Ask about one model instead of this session's current one. \
+    The per-model map is returned either way.",
+                },
+            },
+            "required": [],
+            "additionalProperties": false,
+        },
+    })
+}
+
 /// Clamp a caller-supplied timeout into the supported range.
 #[must_use]
 pub fn resolve_timeout(requested: Option<u64>) -> Duration {
@@ -209,13 +242,15 @@ fn handle_request(session_id: &str, sock: &Path, req: &Value, outbox: &Outbox) -
                 "serverInfo": { "name": "cctui", "version": env!("CARGO_PKG_VERSION") },
             }),
         )),
-        "tools/list" => Some(reply(id, &json!({ "tools": [tool_schema()] }))),
+        "tools/list" => Some(reply(id, &json!({ "tools": [tool_schema(), usage_tool_schema()] }))),
         "tools/call" => {
             let params = req.get("params");
             let name = params.and_then(|p| p.get("name")).and_then(Value::as_str).unwrap_or("");
-            if name != TOOL_NAME {
-                return Some(tool_result(id, &format!("unknown tool {name:?}"), true));
-            }
+            let kind = match name {
+                TOOL_NAME => "spawn_agent",
+                USAGE_TOOL_NAME => "usage",
+                other => return Some(tool_result(id, &format!("unknown tool {other:?}"), true)),
+            };
             let args =
                 params.and_then(|p| p.get("arguments")).cloned().unwrap_or_else(|| json!({}));
             let id = id.cloned();
@@ -225,7 +260,7 @@ fn handle_request(session_id: &str, sock: &Path, req: &Value, outbox: &Outbox) -
             let outbox = outbox.clone();
             std::thread::spawn(move || {
                 let (text, is_error) =
-                    call_daemon(&session_id, &sock, &args, token.as_ref(), &outbox);
+                    call_daemon(&session_id, &sock, kind, &args, token.as_ref(), &outbox);
                 outbox.send(&tool_result(id.as_ref(), &text, is_error));
             });
             None
@@ -247,7 +282,7 @@ enum Leg {
 
 /// Drive one connection to the daemon: send `request`, forward interim
 /// progress frames, record the child id the daemon announces, and stop at the
-/// first final frame.
+/// first final frame. `tool` names the caller in every error the model sees.
 fn run_leg(
     stream: &UnixStream,
     request: &Value,
@@ -255,6 +290,7 @@ fn run_leg(
     outbox: &Outbox,
     seq: &mut u64,
     child: &mut Option<String>,
+    tool: &str,
 ) -> Leg {
     let mut writer = stream;
     if writeln!(writer, "{request}").and_then(|()| writer.flush()).is_err() {
@@ -283,7 +319,7 @@ fn run_leg(
             // did not send one. Reattaching here would loop forever.
             Err(err) => {
                 return Leg::Done(
-                    format!("CctuiAgent failed: lost the daemon connection ({err})"),
+                    format!("{tool} failed: lost the daemon connection ({err})"),
                     true,
                 );
             }
@@ -292,7 +328,7 @@ fn run_leg(
             return Leg::Dropped;
         }
         let Ok(frame) = serde_json::from_str::<Value>(&line) else {
-            return Leg::Done("CctuiAgent failed: malformed daemon reply".to_owned(), true);
+            return Leg::Done(format!("{tool} failed: malformed daemon reply"), true);
         };
         if let Some(id) = frame.get("attached").and_then(Value::as_str) {
             *child = Some(id.to_owned());
@@ -332,7 +368,13 @@ fn reconnect(sock: &Path, window: Duration, retry: Duration) -> Option<UnixStrea
 
 /// The message a call returns when the daemon vanished before it had even
 /// named the child. Nothing can be reattached: there is no id to reattach to.
-fn restarted_before_attach() -> String {
+fn restarted_before_attach(tool: &str) -> String {
+    if tool != TOOL_NAME {
+        return format!(
+            "{tool} failed: the cctui daemon restarted (auto-update re-exec) while this call was \
+             running. Nothing was left behind; call it again."
+        );
+    }
     "CctuiAgent failed: the cctui daemon restarted (auto-update re-exec) while this call was      starting, before it named the child session, so there is nothing to reattach to. THIS IS      NOT THE CHILD CRASHING. Check cctui for a child session under this one; if none appeared,      call CctuiAgent again."
         .to_owned()
 }
@@ -346,13 +388,19 @@ fn restarted_before_attach() -> String {
 fn call_daemon(
     session_id: &str,
     sock: &Path,
+    kind: &str,
     args: &Value,
     token: Option<&Value>,
     outbox: &Outbox,
 ) -> (String, bool) {
-    let timeout = resolve_timeout(args.get("timeout_secs").and_then(Value::as_u64));
+    let tool = if kind == "usage" { USAGE_TOOL_NAME } else { TOOL_NAME };
+    let timeout = if kind == "usage" {
+        USAGE_TIMEOUT
+    } else {
+        resolve_timeout(args.get("timeout_secs").and_then(Value::as_u64))
+    };
     let mut request = json!({
-        "kind": "spawn_agent",
+        "kind": kind,
         "session_id": session_id,
         "args": args,
         "timeout_secs": timeout.as_secs(),
@@ -361,10 +409,7 @@ fn call_daemon(
     let mut stream = match UnixStream::connect(sock) {
         Ok(s) => s,
         Err(err) => {
-            return (
-                format!("CctuiAgent unavailable: cannot reach the cctui daemon ({err})"),
-                true,
-            );
+            return (format!("{tool} unavailable: cannot reach the cctui daemon ({err})"), true);
         }
     };
     let mut seq: u64 = 0;
@@ -372,11 +417,11 @@ fn call_daemon(
     for attempt in 0..=REATTACH_MAX {
         // Outlive the daemon's own wait so the daemon's timeout message wins.
         let _ = stream.set_read_timeout(Some(timeout + Duration::from_secs(30)));
-        match run_leg(&stream, &request, token, outbox, &mut seq, &mut child) {
+        match run_leg(&stream, &request, token, outbox, &mut seq, &mut child, tool) {
             Leg::Done(text, is_error) => return (text, is_error),
             Leg::Dropped => {}
         }
-        let Some(id) = child.clone() else { return (restarted_before_attach(), true) };
+        let Some(id) = child.clone() else { return (restarted_before_attach(tool), true) };
         if attempt == REATTACH_MAX {
             return (
                 format!(
@@ -487,12 +532,68 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_exactly_the_agent_tool() {
+    fn tools_list_returns_the_agent_and_usage_tools() {
         let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
         let resp = handle("s1", Path::new("/tmp/x.sock"), &req).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], TOOL_NAME);
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec![TOOL_NAME, USAGE_TOOL_NAME]);
+    }
+
+    #[test]
+    fn the_usage_tool_needs_no_arguments_and_takes_only_an_optional_model() {
+        let schema = usage_tool_schema();
+        assert_eq!(schema["name"], USAGE_TOOL_NAME);
+        assert_eq!(schema["inputSchema"]["required"], json!([]));
+        assert_eq!(schema["inputSchema"]["additionalProperties"], json!(false));
+        let props = schema["inputSchema"]["properties"].as_object().unwrap();
+        assert_eq!(props.keys().collect::<Vec<_>>(), vec!["model"]);
+        let desc = schema["description"].as_str().unwrap();
+        assert!(desc.contains("THIS session"), "{desc}");
+        assert!(desc.contains("blocked"), "{desc}");
+    }
+
+    #[test]
+    fn a_usage_call_reaches_the_daemon_as_a_usage_kind_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+            let req: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(req["kind"], json!("usage"));
+            assert_eq!(req["session_id"], json!("s1"));
+            assert_eq!(req["args"]["model"], json!("claude-opus-5"));
+            writeln!(stream, "{}", json!({ "ok": true, "result": "5h 46% · weekly 71%" })).unwrap();
+        });
+        let (text, is_error) = call_daemon(
+            "s1",
+            &sock_path,
+            "usage",
+            &json!({ "model": "claude-opus-5" }),
+            None,
+            &Outbox::new(),
+        );
+        server.join().unwrap();
+        assert!(!is_error);
+        assert_eq!(text, "5h 46% · weekly 71%");
+    }
+
+    #[test]
+    fn a_dead_socket_fails_the_usage_call_by_name_instead_of_hanging() {
+        let (text, is_error) = call_daemon(
+            "s1",
+            Path::new("/nonexistent/cctui-agent.sock"),
+            "usage",
+            &json!({}),
+            None,
+            &Outbox::new(),
+        );
+        assert!(is_error);
+        assert!(text.starts_with(USAGE_TOOL_NAME), "{text}");
+        assert!(text.contains("cannot reach the cctui daemon"), "{text}");
     }
 
     #[test]
@@ -516,6 +617,7 @@ mod tests {
         let (text, is_error) = call_daemon(
             "s1",
             Path::new("/nonexistent/cctui-agent.sock"),
+            "spawn_agent",
             &json!({ "adapter": "opencode", "prompt": "hi", "timeout_secs": 1 }),
             None,
             &Outbox::new(),
@@ -541,6 +643,7 @@ mod tests {
         let (text, is_error) = call_daemon(
             "s1",
             &sock_path,
+            "spawn_agent",
             &json!({ "adapter": "codex", "prompt": "go", "timeout_secs": 5 }),
             Some(&json!("tok-1")),
             &Outbox::new(),
@@ -577,6 +680,7 @@ mod tests {
             call_daemon(
                 "s1",
                 &sock_a,
+                "spawn_agent",
                 &json!({ "adapter": "codex", "prompt": "first", "timeout_secs": 5 }),
                 None,
                 &Outbox::new(),
@@ -587,6 +691,7 @@ mod tests {
             call_daemon(
                 "s1",
                 &sock_path,
+                "spawn_agent",
                 &json!({ "adapter": "codex", "prompt": "second", "timeout_secs": 5 }),
                 None,
                 &Outbox::new(),
@@ -692,6 +797,7 @@ mod tests {
         let (text, is_error) = call_daemon(
             "parent-1",
             &sock,
+            "spawn_agent",
             &json!({ "prompt": "review", "model": "claude-opus-5" }),
             None,
             &Outbox::new(),
@@ -720,6 +826,7 @@ mod tests {
         let (text, is_error) = call_daemon(
             "parent-1",
             &sock,
+            "spawn_agent",
             &json!({ "prompt": "review", "model": "claude-opus-5" }),
             None,
             &Outbox::new(),
@@ -740,7 +847,7 @@ mod tests {
             true
         });
         let (text, is_error) =
-            call_daemon("parent-1", &sock, &json!({ "prompt": "x" }), None, &Outbox::new());
+            call_daemon("parent-1", &sock, "spawn_agent", &json!({ "prompt": "x" }), None, &Outbox::new());
         assert!(is_error);
         assert_eq!(text, "child agent failed");
     }

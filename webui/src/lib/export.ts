@@ -170,6 +170,8 @@ function toBlock(
         if (!visible(opts, cat)) return null;
         return { role: "thinking", ts: Number(e.ts), html: md(e.content, opts) };
       }
+      // Turn annotations belong to a turn, not the transcript body.
+      if (e.kind === "turn_annotation") return null;
       if (e.kind === "system_marker") {
         if (!visible(opts, "marker")) return null;
         return { role: "marker", ts: Number(e.ts), html: md(e.content, opts) };
@@ -474,6 +476,7 @@ function toMarkdownBlock(
         if (!visible(opts, cat)) return null;
         return `**Thinking:**\n\n${e.content}`;
       }
+      if (e.kind === "turn_annotation") return null;
       if (e.kind === "system_marker") {
         if (!visible(opts, "marker")) return null;
         return `_${e.content}_`;

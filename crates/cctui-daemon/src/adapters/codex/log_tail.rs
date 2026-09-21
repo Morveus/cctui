@@ -108,7 +108,7 @@ pub type ResumeMarks = Arc<Mutex<HashMap<String, u64>>>;
 
 /// How far behind the persisted offset the reconcile pass backs up before
 /// re-reading, mirroring the claude-code transcript tailer. The server's
-/// `(session_id, event_type, content_hash)` dedup drops every replayed
+/// `(session_id, event_type, content_hash, turn_id)` dedup drops every replayed
 /// duplicate, so the window can be generous.
 pub const RECONCILE_BACKUP_BYTES: u64 = 64 * 1024;
 
@@ -387,6 +387,7 @@ fn hibernated_status(local_id: String) -> AdapterEvent {
         intent: None,
         model: None,
         effort: None,
+        permission_mode: None,
         children: Vec::new(),
     }
 }
@@ -596,11 +597,16 @@ fn parse_line(local_id: &str, line: &str) -> AdapterEvent {
         {
             return AdapterEvent::ToolUse { local_id: local_id.to_owned(), payload: value };
         }
-        return AdapterEvent::Message { local_id: local_id.to_owned(), payload: value };
+        return AdapterEvent::Message {
+            local_id: local_id.to_owned(),
+            payload: value,
+            turn_id: None,
+        };
     }
     AdapterEvent::Message {
         local_id: local_id.to_owned(),
         payload: json!({"role": "assistant", "text": line}),
+        turn_id: None,
     }
 }
 
@@ -630,6 +636,7 @@ fn turn_context_status(local_id: &str, value: &Value) -> Option<AdapterEvent> {
         intent: None,
         model,
         effort,
+        permission_mode: None,
         children: vec![],
     })
 }

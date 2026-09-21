@@ -182,6 +182,12 @@ pub enum AdapterEvent {
     Message {
         local_id: String,
         payload: serde_json::Value,
+        /// Identity of the human turn this event derives from, minted by the
+        /// client and carried through [`AdapterCommand::Reply`]. `None` for
+        /// turns cctui did not originate (typed into the agent's own TUI) and
+        /// for daemons predating the field — those still need content matching.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<Uuid>,
     },
     ToolUse {
         local_id: String,
@@ -216,6 +222,10 @@ pub enum AdapterEvent {
         /// Reasoning/effort level (e.g. `"low"`, `"high"`), when set.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
+        /// Permission posture the session is actually running under, as
+        /// observed (claude reports it in the transcript, not in `state.json`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_mode: Option<PermissionMode>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         children: Vec<SessionChild>,
     },
@@ -498,6 +508,12 @@ pub enum AdapterCommand {
         /// `None` for non-client callers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         command_id: Option<Uuid>,
+        /// Client-minted identity of this human turn (`UUIDv7`). The adapter
+        /// stamps it onto every [`AdapterEvent::Message`] the injected turn
+        /// produces, so the several encodings Claude stores one turn in share
+        /// one key. `None` for callers that mint none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<Uuid>,
     },
     /// Interrupt the in-flight turn WITHOUT tearing the session down — the
     /// keep-alive equivalent of pressing Esc in the TUI. Distinct
@@ -951,6 +967,7 @@ mod tests {
             AdapterEvent::Message {
                 local_id: "s1".into(),
                 payload: serde_json::json!({"role": "assistant", "text": "hi"}),
+                turn_id: None,
             },
             AdapterEvent::ToolUse {
                 local_id: "s1".into(),
@@ -962,6 +979,58 @@ mod tests {
             let json = serde_json::to_string(&evt).unwrap();
             let _back: AdapterEvent = serde_json::from_str(&json).expect(&json);
         }
+    }
+
+    #[test]
+    fn message_turn_id_roundtrips_and_is_omitted_when_absent() {
+        let bare = AdapterEvent::Message {
+            local_id: "s1".into(),
+            payload: serde_json::json!({"role": "user", "text": "hi"}),
+            turn_id: None,
+        };
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(!json.contains("turn_id"), "{json}");
+        let back: AdapterEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, AdapterEvent::Message { turn_id: None, .. }));
+
+        let id = Uuid::new_v4();
+        let stamped = AdapterEvent::Message {
+            local_id: "s1".into(),
+            payload: serde_json::json!({"role": "user", "text": "hi"}),
+            turn_id: Some(id),
+        };
+        let json = serde_json::to_string(&stamped).unwrap();
+        let back: AdapterEvent = serde_json::from_str(&json).unwrap();
+        let AdapterEvent::Message { turn_id, .. } = back else { panic!("wrong variant") };
+        assert_eq!(turn_id, Some(id));
+    }
+
+    #[test]
+    fn message_from_daemon_predating_the_field_decodes() {
+        let legacy = r#"{"kind":"message","local_id":"s1","payload":{"role":"user"}}"#;
+        let back: AdapterEvent = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(back, AdapterEvent::Message { turn_id: None, .. }));
+    }
+
+    #[test]
+    fn reply_command_carries_turn_id() {
+        let id = Uuid::new_v4();
+        let cmd = AdapterCommand::Reply {
+            local_id: "s1".into(),
+            text: "go on".into(),
+            ask_picks: None,
+            env: std::collections::BTreeMap::default(),
+            command_id: None,
+            turn_id: Some(id),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: AdapterCommand = serde_json::from_str(&json).unwrap();
+        let AdapterCommand::Reply { turn_id, .. } = back else { panic!("wrong variant") };
+        assert_eq!(turn_id, Some(id));
+
+        let legacy = r#"{"kind":"reply","local_id":"s1","text":"go on"}"#;
+        let back: AdapterCommand = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(back, AdapterCommand::Reply { turn_id: None, .. }));
     }
 
     #[test]
@@ -1006,6 +1075,7 @@ mod tests {
             intent: None,
             model: Some("opus[1m]".into()),
             effort: Some("low".into()),
+            permission_mode: None,
             children: vec![SessionChild {
                 id: "1972".into(),
                 href: "https://github.com/o/r/pull/1972".into(),
@@ -1030,6 +1100,7 @@ mod tests {
             intent: None,
             model: None,
             effort: None,
+            permission_mode: None,
             children: vec![],
         };
         let json = serde_json::to_string(&evt).unwrap();
@@ -1061,6 +1132,7 @@ mod tests {
                 ask_picks: None,
                 env: std::collections::BTreeMap::default(),
                 command_id: None,
+                turn_id: None,
             },
             AdapterCommand::Kill { local_id: "s1".into(), signal: Some(15) },
             AdapterCommand::Kill { local_id: "s1".into(), signal: None },

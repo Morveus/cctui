@@ -17,7 +17,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
-use cctui_proto::adapter::AdapterEvent;
+use cctui_proto::adapter::{AdapterEvent, PermissionMode};
 use serde_json::{Value, json};
 
 /// Encode a working directory into the path-segment Claude uses under
@@ -369,7 +369,8 @@ pub fn reconcile_tail(
 
 /// Process-local tally of transcript shapes that produce no event, keyed by a
 /// namespaced label (`unknown:<type>`, `unknown-assistant-block:<t>`,
-/// `unknown-user-block:<t>`, `ignored:<kind>`). The daemon has no metrics
+/// `unknown-user-block:<t>`, `unknown-streamjson-system:<subtype>`,
+/// `ignored:<kind>`). The daemon has no metrics
 /// exporter, so counts live here rather than in a registry.
 static DROP_TALLY: LazyLock<Mutex<BTreeMap<String, u64>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
@@ -384,7 +385,7 @@ fn tally(label: &str) -> u64 {
 }
 
 /// A shape we do not handle and did not expect: count it, and warn once.
-fn record_unknown(namespace: &str, kind: &str) {
+pub(super) fn record_unknown(namespace: &str, kind: &str) {
     let label = format!("{namespace}:{kind}");
     if tally(&label) == 1 {
         tracing::warn!(
@@ -418,6 +419,14 @@ fn first_str<'a>(line: &'a Value, keys: &[&str]) -> Option<&'a str> {
         .find(|s| !s.trim().is_empty())
 }
 
+/// First numeric value among `keys`, tolerating the string encodings Claude
+/// has used for the same field across releases.
+fn first_num(line: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .filter_map(|k| line.get(*k))
+        .find_map(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok())))
+}
+
 const EXCERPT_CHARS: usize = 120;
 
 /// One-line, length-capped excerpt for a marker label.
@@ -446,6 +455,7 @@ pub(super) fn parse_line(local_id: &str, line: &Value, out: &mut Vec<AdapterEven
         out.push(AdapterEvent::Message {
             local_id: local_id.to_owned(),
             payload: json!({ "role": "compact_summary", "text": compact_summary_text(line) }),
+            turn_id: None,
         });
         return;
     }
@@ -461,6 +471,7 @@ pub(super) fn parse_line(local_id: &str, line: &Value, out: &mut Vec<AdapterEven
                     "status_detail": line.get("status_detail"),
                     "needs_action": line.get("needs_action"),
                 }),
+                turn_id: None,
             });
         }
         "pr-link" => {
@@ -471,11 +482,19 @@ pub(super) fn parse_line(local_id: &str, line: &Value, out: &mut Vec<AdapterEven
                 });
             }
         }
-        "attachment" | "permission-mode" | "worktree-state" | "ai-title" | "custom-title"
-        | "agent-name" | "agent-setting" | "queue-operation" => {
+        "permission-mode" | "ai-title" | "custom-title" | "agent-name" => {
+            session_fact(local_id, kind, line, out);
+        }
+        "attachment" => attachment_annotation(local_id, line, out),
+        "file-history-snapshot" | "file-history-delta" => {
+            out.push(turn_annotation(local_id, "file_history", &file_history_detail(kind, line)));
+        }
+        "worktree-state" | "agent-setting" | "mode" | "bridge-session" | "cost-state"
+        | "queue-operation" => {
             out.push(AdapterEvent::Message {
                 local_id: local_id.to_owned(),
                 payload: system_marker_payload(kind, line),
+                turn_id: None,
             });
         }
         "system" => parse_system(local_id, line, out),
@@ -485,6 +504,109 @@ pub(super) fn parse_line(local_id: &str, line: &Value, out: &mut Vec<AdapterEven
         "last-prompt" | "atis-latch" => record_ignored(kind),
         _ => record_unknown("unknown", kind),
     }
+}
+
+/// A [`AdapterEvent::Status`] carrying only session-identity fields; every
+/// other field stays `None` so the server's `COALESCE` update leaves the
+/// signals the live-status path owns untouched.
+fn session_status(
+    local_id: &str,
+    name: Option<String>,
+    permission_mode: Option<PermissionMode>,
+) -> AdapterEvent {
+    AdapterEvent::Status {
+        local_id: local_id.to_owned(),
+        tempo: None,
+        state: None,
+        detail: None,
+        activity: None,
+        name,
+        intent: None,
+        model: None,
+        effort: None,
+        permission_mode,
+        children: Vec::new(),
+    }
+}
+
+/// Claude's `--permission-mode` vocabulary. `plan` has no [`PermissionMode`]
+/// counterpart, so it falls through to the marker path rather than being
+/// misreported as one of the postures cctui can actually spawn.
+fn permission_mode_from_claude(raw: &str) -> Option<PermissionMode> {
+    match raw {
+        "bypassPermissions" => Some(PermissionMode::Yolo),
+        "acceptEdits" => Some(PermissionMode::Auto),
+        "default" => Some(PermissionMode::Ask),
+        _ => None,
+    }
+}
+
+/// Last-value-wins session state, not a timeline event. A value that does not
+/// map stays a marker so the information is not simply lost.
+fn session_fact(local_id: &str, kind: &str, line: &Value, out: &mut Vec<AdapterEvent>) {
+    let fact = match kind {
+        "permission-mode" => {
+            let raw = line.get("permissionMode").and_then(Value::as_str).unwrap_or_default();
+            permission_mode_from_claude(raw).map(|m| session_status(local_id, None, Some(m)))
+        }
+        "ai-title" | "custom-title" | "agent-name" => {
+            let keys: &[&str] = match kind {
+                "ai-title" => &["aiTitle", "title"],
+                "custom-title" => &["customTitle", "title"],
+                _ => &["agentName", "name"],
+            };
+            first_str(line, keys).map(|n| session_status(local_id, Some(n.to_owned()), None))
+        }
+        _ => None,
+    };
+    match fact {
+        Some(status) => {
+            record_ignored(&format!("session-fact/{kind}"));
+            out.push(status);
+        }
+        None => out.push(AdapterEvent::Message {
+            local_id: local_id.to_owned(),
+            payload: system_marker_payload(kind, line),
+            turn_id: None,
+        }),
+    }
+}
+
+/// Bookkeeping that belongs on the turn it annotates rather than in the
+/// timeline. The detail rides in `text` as `<kind>:<detail>`; the webui
+/// re-anchors it onto the owning line and never renders a bubble for it.
+fn turn_annotation(local_id: &str, annotation: &str, detail: &str) -> AdapterEvent {
+    let text =
+        if detail.is_empty() { annotation.to_owned() } else { format!("{annotation}:{detail}") };
+    AdapterEvent::Message {
+        local_id: local_id.to_owned(),
+        payload: json!({ "role": "turn_annotation", "annotation": annotation, "text": text }),
+        turn_id: None,
+    }
+}
+
+/// Reminder attachments the harness injects on its own; they annotate nothing a
+/// reader wants to count.
+const REMINDER_ATTACHMENTS: &[&str] =
+    &["total_tokens_reminder", "task_reminder", "batching_reminder_sent"];
+
+fn attachment_annotation(local_id: &str, line: &Value, out: &mut Vec<AdapterEvent>) {
+    let att = line
+        .get("attachment")
+        .and_then(|a| a.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if REMINDER_ATTACHMENTS.contains(&att) {
+        record_ignored(&format!("attachment/{att}"));
+        return;
+    }
+    out.push(turn_annotation(local_id, "attachment", att));
+}
+
+fn file_history_detail(kind: &str, line: &Value) -> String {
+    let verb = if kind.ends_with("delta") { "delta" } else { "snapshot" };
+    first_str(line, &["filePath", "path", "file"])
+        .map_or_else(|| verb.to_owned(), |path| format!("{verb}:{path}"))
 }
 
 /// `type:"system"` covers both genuine timeline events and per-turn bookkeeping
@@ -503,8 +625,13 @@ fn parse_system(local_id: &str, line: &Value, out: &mut Vec<AdapterEvent>) {
         "model_refusal_fallback" => format!("model refusal fallback: {}", body()),
         "informational" => body(),
         "local_command" => format!("local command: {}", body()),
-        "turn_duration" | "stop_hook_summary" => {
-            record_ignored(&format!("system/{subtype}"));
+        "turn_duration" => {
+            let ms = first_num(line, &["durationMs", "duration_ms", "duration"]).unwrap_or(0);
+            out.push(turn_annotation(local_id, "turn_duration", &ms.to_string()));
+            return;
+        }
+        "stop_hook_summary" => {
+            out.push(turn_annotation(local_id, "stop_hook_summary", &body()));
             return;
         }
         other => {
@@ -520,29 +647,59 @@ fn parse_system(local_id: &str, line: &Value, out: &mut Vec<AdapterEvent>) {
             "marker": format!("system/{subtype}"),
             "text": text,
         }),
+        turn_id: None,
     });
 }
 
 /// Never embeds the raw line — attachment bodies can be huge; only the marker,
 /// a few useful fields, and a short `text` survive.
 fn system_marker_payload(marker: &str, line: &Value) -> Value {
-    let str_field = |k: &str| line.get(k).and_then(Value::as_str).unwrap_or_default();
-    match marker {
-        "attachment" => {
-            let att = line
-                .get("attachment")
-                .and_then(|a| a.get("type"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
+    session_state_marker(marker, line)
+        .or_else(|| identity_marker(marker, line))
+        .unwrap_or_else(|| json!({ "role": "system_marker", "marker": marker, "text": marker }))
+}
+
+/// Session posture and accounting: the records that describe how the session is
+/// running rather than who it is.
+fn session_state_marker(marker: &str, line: &Value) -> Option<Value> {
+    let payload = match marker {
+        "mode" => {
+            let mode = first_str(line, &["mode", "value"]).unwrap_or("unknown");
             json!({
                 "role": "system_marker",
                 "marker": marker,
-                "attachment_type": att,
-                "text": format!("[attachment: {att}]"),
+                "mode": mode,
+                "text": format!("mode: {mode}"),
+            })
+        }
+        "bridge-session" => {
+            let id = first_str(line, &["bridgeSessionId", "sessionId", "id"]).unwrap_or_default();
+            let text = if id.is_empty() {
+                "bridge session".to_owned()
+            } else {
+                format!("bridge session: {id}")
+            };
+            json!({ "role": "system_marker", "marker": marker, "text": text })
+        }
+        "cost-state" => {
+            let cost = line
+                .get("totalCostUSD")
+                .or_else(|| line.get("costUSD"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let added = first_num(line, &["totalLinesAdded", "linesAdded"]).unwrap_or(0);
+            let removed = first_num(line, &["totalLinesRemoved", "linesRemoved"]).unwrap_or(0);
+            json!({
+                "role": "system_marker",
+                "marker": marker,
+                "cost_usd": cost,
+                "lines_added": added,
+                "lines_removed": removed,
+                "text": format!("cost: ${cost:.2} (+{added}/-{removed})"),
             })
         }
         "permission-mode" => {
-            let mode = str_field("permissionMode");
+            let mode = line.get("permissionMode").and_then(Value::as_str).unwrap_or_default();
             json!({
                 "role": "system_marker",
                 "marker": marker,
@@ -563,6 +720,35 @@ fn system_marker_payload(marker: &str, line: &Value) -> Value {
                 "text": text,
             })
         }
+        "queue-operation" => {
+            let op = first_str(line, &["operation", "op", "action"]).unwrap_or("queue");
+            let verb = match op {
+                "enqueue" | "add" | "queued" => "queued",
+                "dequeue" | "remove" | "dequeued" => "dequeued",
+                other => other,
+            };
+            let body = first_str(line, &["prompt", "text", "content", "value"])
+                .map(excerpt)
+                .unwrap_or_default();
+            let text = if body.is_empty() { verb.to_owned() } else { format!("{verb}: {body}") };
+            json!({
+                "role": "system_marker",
+                "marker": marker,
+                "operation": verb,
+                "text": text,
+            })
+        }
+        _ => return None,
+    };
+    Some(payload)
+}
+
+/// Titles and agent identity — the fallback shape for the records that normally
+/// reach [`AdapterEvent::Status`] and only become markers when their value is
+/// missing or unmappable.
+fn identity_marker(marker: &str, line: &Value) -> Option<Value> {
+    let str_field = |k: &str| line.get(k).and_then(Value::as_str).unwrap_or_default();
+    let payload = match marker {
         "ai-title" => {
             let title = str_field("aiTitle");
             json!({
@@ -599,26 +785,9 @@ fn system_marker_payload(marker: &str, line: &Value) -> Value {
                 "text": format!("title: {title}"),
             })
         }
-        "queue-operation" => {
-            let op = first_str(line, &["operation", "op", "action"]).unwrap_or("queue");
-            let verb = match op {
-                "enqueue" | "add" | "queued" => "queued",
-                "dequeue" | "remove" | "dequeued" => "dequeued",
-                other => other,
-            };
-            let body = first_str(line, &["prompt", "text", "content", "value"])
-                .map(excerpt)
-                .unwrap_or_default();
-            let text = if body.is_empty() { verb.to_owned() } else { format!("{verb}: {body}") };
-            json!({
-                "role": "system_marker",
-                "marker": marker,
-                "operation": verb,
-                "text": text,
-            })
-        }
-        _ => json!({ "role": "system_marker", "marker": marker, "text": marker }),
-    }
+        _ => return None,
+    };
+    Some(payload)
 }
 
 /// Extract a linked-PR [`SessionChild`] from a transcript `pr-link` line. The
@@ -706,6 +875,7 @@ fn parse_assistant_block(
                     "text": block.get("text"),
                     "message_id": message_id,
                 }),
+                turn_id: None,
             });
         }
         Some("thinking") => {
@@ -716,6 +886,7 @@ fn parse_assistant_block(
                     "text": block.get("thinking").or_else(|| block.get("text")),
                     "message_id": message_id,
                 }),
+                turn_id: None,
             });
         }
         Some("tool_use") => {
@@ -736,6 +907,7 @@ fn parse_assistant_block(
                     "text": "[redacted thinking]",
                     "message_id": message_id,
                 }),
+                turn_id: None,
             });
         }
         Some("image") => {
@@ -746,6 +918,7 @@ fn parse_assistant_block(
                     "text": "[image attachment]",
                     "message_id": message_id,
                 }),
+                turn_id: None,
             });
         }
         Some("server_tool_use") => {
@@ -911,6 +1084,7 @@ fn parse_user(local_id: &str, line: &Value, out: &mut Vec<AdapterEvent>) {
         out.push(AdapterEvent::Message {
             local_id: local_id.to_owned(),
             payload: with_line_id(payload, line),
+            turn_id: None,
         });
         return;
     }
@@ -960,6 +1134,7 @@ fn parse_user(local_id: &str, line: &Value, out: &mut Vec<AdapterEvent>) {
         out.push(AdapterEvent::Message {
             local_id: local_id.to_owned(),
             payload: with_line_id(payload, line),
+            turn_id: None,
         });
     }
     out.extend(tool_results);
@@ -1808,13 +1983,8 @@ mod tests {
     #[test]
     fn skipped_line_types_emit_system_markers() {
         let lines = [
-            json!({"type":"attachment","attachment":{"type":"skill_listing","content":"huge blob"}}),
-            json!({"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"x"}),
             json!({"type":"worktree-state","worktreeState":"active","sessionId":"x"}),
-            json!({"type":"ai-title","aiTitle":"deploy v1","sessionId":"x"}),
-            json!({"type":"agent-name","agentName":"kusaritoi","sessionId":"x"}),
             json!({"type":"agent-setting","agentSetting":"claude","sessionId":"x"}),
-            json!({"type":"custom-title","customTitle":"my session","sessionId":"x"}),
             json!({"type":"queue-operation","operation":"enqueue","prompt":"<task-notification>go"}),
         ];
         let mut out = Vec::new();
@@ -1831,35 +2001,32 @@ mod tests {
         let by_marker = |marker: &str| {
             *msgs.iter().find(|m| m.get("marker").and_then(Value::as_str) == Some(marker)).unwrap()
         };
-        let att = by_marker("attachment");
-        assert_eq!(att.get("attachment_type").and_then(Value::as_str), Some("skill_listing"));
-        assert_eq!(att.get("text").and_then(Value::as_str), Some("[attachment: skill_listing]"));
-        assert!(att.get("content").is_none(), "attachment body must not flow through");
-        assert_eq!(
-            by_marker("permission-mode").get("permission_mode").and_then(Value::as_str),
-            Some("bypassPermissions")
-        );
         assert_eq!(
             by_marker("worktree-state").get("text").and_then(Value::as_str),
             Some("worktree state: active")
-        );
-        assert_eq!(by_marker("ai-title").get("title").and_then(Value::as_str), Some("deploy v1"));
-        assert_eq!(
-            by_marker("agent-name").get("agent_name").and_then(Value::as_str),
-            Some("kusaritoi")
         );
         assert_eq!(
             by_marker("agent-setting").get("agent_setting").and_then(Value::as_str),
             Some("claude")
         );
         assert_eq!(
-            by_marker("custom-title").get("title").and_then(Value::as_str),
-            Some("my session")
-        );
-        assert_eq!(
             by_marker("queue-operation").get("text").and_then(Value::as_str),
             Some("queued: <task-notification>go")
         );
+    }
+
+    #[test]
+    fn attachment_bodies_never_flow_through() {
+        let mut out = Vec::new();
+        parse_line(
+            "s",
+            &json!({"type":"attachment","attachment":{"type":"skill_listing","content":"huge blob"}}),
+            &mut out,
+        );
+        let msgs = message_payloads(&out);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].get("text").and_then(Value::as_str), Some("attachment:skill_listing"));
+        assert!(msgs[0].get("content").is_none(), "attachment body must not flow through");
     }
 
     #[test]
@@ -1935,21 +2102,141 @@ mod tests {
         let lines = [
             json!({"type":"last-prompt","leafUuid":"07cc9471"}),
             json!({"type":"atis-latch","value":1}),
-            json!({"type":"system","subtype":"turn_duration","durationMs":1200}),
-            json!({"type":"system","subtype":"stop_hook_summary","summary":"ok"}),
         ];
         let mut out = Vec::new();
         for l in &lines {
             parse_line("s", l, &mut out);
         }
         assert!(out.is_empty(), "deliberate drops must emit nothing");
-        for label in [
-            "ignored:last-prompt",
-            "ignored:atis-latch",
-            "ignored:system/turn_duration",
-            "ignored:system/stop_hook_summary",
-        ] {
+        for label in ["ignored:last-prompt", "ignored:atis-latch"] {
             assert!(tally_for(label) >= 1, "{label} must be counted");
+        }
+    }
+
+    #[test]
+    fn session_facts_become_status_not_timeline_lines() {
+        let cases = [
+            (
+                json!({"type":"permission-mode","permissionMode":"bypassPermissions"}),
+                None,
+                Some(PermissionMode::Yolo),
+            ),
+            (
+                json!({"type":"permission-mode","permissionMode":"acceptEdits"}),
+                None,
+                Some(PermissionMode::Auto),
+            ),
+            (
+                json!({"type":"permission-mode","permissionMode":"default"}),
+                None,
+                Some(PermissionMode::Ask),
+            ),
+            (json!({"type":"agent-name","agentName":"lane-a"}), Some("lane-a"), None),
+            (json!({"type":"ai-title","aiTitle":"fix the parser"}), Some("fix the parser"), None),
+            (json!({"type":"custom-title","customTitle":"my session"}), Some("my session"), None),
+        ];
+        for (line, want_name, want_mode) in &cases {
+            let mut out = Vec::new();
+            parse_line("s", line, &mut out);
+            assert!(message_payloads(&out).is_empty(), "no timeline bubble for {line}");
+            assert_eq!(out.len(), 1, "exactly one Status for {line}");
+            match &out[0] {
+                AdapterEvent::Status { name, permission_mode, tempo, model, .. } => {
+                    assert_eq!(name.as_deref(), *want_name, "{line}");
+                    assert_eq!(permission_mode, want_mode, "{line}");
+                    assert!(tempo.is_none() && model.is_none(), "session facts set nothing else");
+                }
+                other => panic!("expected Status for {line}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unmappable_permission_mode_falls_back_to_a_marker() {
+        let mut out = Vec::new();
+        parse_line("s", &json!({"type":"permission-mode","permissionMode":"plan"}), &mut out);
+        let msgs = message_payloads(&out);
+        assert_eq!(msgs.len(), 1, "an unmapped posture must not be silently lost");
+        assert_eq!(msgs[0].get("role").and_then(Value::as_str), Some("system_marker"));
+        assert_eq!(msgs[0].get("text").and_then(Value::as_str), Some("permission mode: plan"));
+    }
+
+    #[test]
+    fn turn_bookkeeping_becomes_annotations_on_the_owning_turn() {
+        let cases = [
+            (
+                json!({"type":"attachment","attachment":{"type":"prompt_snapshot"}}),
+                "attachment:prompt_snapshot",
+            ),
+            (
+                json!({"type":"system","subtype":"turn_duration","durationMs":1200}),
+                "turn_duration:1200",
+            ),
+            (
+                json!({"type":"system","subtype":"stop_hook_summary","summary":"ok"}),
+                "stop_hook_summary:ok",
+            ),
+            (
+                json!({"type":"file-history-snapshot","filePath":"src/a.rs"}),
+                "file_history:snapshot:src/a.rs",
+            ),
+            (
+                json!({"type":"file-history-delta","filePath":"src/b.rs"}),
+                "file_history:delta:src/b.rs",
+            ),
+        ];
+        for (line, want) in &cases {
+            let mut out = Vec::new();
+            parse_line("s", line, &mut out);
+            let msgs = message_payloads(&out);
+            assert_eq!(msgs.len(), 1, "one annotation per line: {line}");
+            assert_eq!(
+                msgs[0].get("role").and_then(Value::as_str),
+                Some("turn_annotation"),
+                "{line} must not be a timeline bubble"
+            );
+            assert_eq!(msgs[0].get("text").and_then(Value::as_str), Some(*want), "{line}");
+        }
+    }
+
+    #[test]
+    fn reminder_attachments_are_dropped_outright() {
+        for subtype in REMINDER_ATTACHMENTS {
+            let mut out = Vec::new();
+            parse_line("s", &json!({"type":"attachment","attachment":{"type":subtype}}), &mut out);
+            assert!(out.is_empty(), "{subtype} must emit nothing");
+            assert!(tally_for(&format!("ignored:attachment/{subtype}")) >= 1, "{subtype} counted");
+        }
+    }
+
+    #[test]
+    fn remaining_session_records_stay_markers() {
+        let cases = [
+            (json!({"type":"mode","mode":"normal"}), "mode: normal"),
+            (json!({"type":"worktree-state","worktreeState":"clean"}), "worktree state: clean"),
+            (json!({"type":"agent-setting","agentSetting":"verbose"}), "agent setting: verbose"),
+            (json!({"type":"bridge-session","bridgeSessionId":"abc"}), "bridge session: abc"),
+            (
+                json!({"type":"cost-state","totalCostUSD":1.5,"totalLinesAdded":40,
+                       "totalLinesRemoved":12}),
+                "cost: $1.50 (+40/-12)",
+            ),
+            (
+                json!({"type":"queue-operation","operation":"enqueue","prompt":"do the thing"}),
+                "queued: do the thing",
+            ),
+        ];
+        for (line, want) in &cases {
+            let mut out = Vec::new();
+            parse_line("s", line, &mut out);
+            let msgs = message_payloads(&out);
+            assert_eq!(msgs.len(), 1, "one marker per line: {line}");
+            assert_eq!(
+                msgs[0].get("role").and_then(Value::as_str),
+                Some("system_marker"),
+                "{line}"
+            );
+            assert_eq!(msgs[0].get("text").and_then(Value::as_str), Some(*want), "{line}");
         }
     }
 

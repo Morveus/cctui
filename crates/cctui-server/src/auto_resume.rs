@@ -238,6 +238,7 @@ async fn fire(state: &AppState, row: &StuckRow, attempt: i32, now: DateTime<Utc>
             ask_picks: None,
             env,
             command_id: None,
+            turn_id: None,
         },
     )
     .await;

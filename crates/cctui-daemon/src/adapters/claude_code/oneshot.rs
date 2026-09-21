@@ -519,6 +519,7 @@ fn idle_status(local_id: &str) -> AdapterEvent {
         intent: None,
         model: None,
         effort: None,
+        permission_mode: None,
         children: Vec::new(),
     }
 }

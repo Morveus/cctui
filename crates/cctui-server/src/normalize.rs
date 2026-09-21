@@ -33,6 +33,7 @@ pub fn to_agent_event(adapter_id: &str, event_type: &str, payload: &Value) -> Op
             message_id: None,
             usage: None,
             seq: None,
+            turn_id: None,
         });
     }
     if adapter_id == "codex" {
@@ -42,62 +43,7 @@ pub fn to_agent_event(adapter_id: &str, event_type: &str, payload: &Value) -> Op
         return codex(event_type, payload).and_then(|v| agent_event_from_canonical(&v, ts));
     }
     match event_type {
-        "message" => {
-            let role = payload.get("role").and_then(Value::as_str)?;
-            let text = payload.get("text").and_then(Value::as_str).unwrap_or_default();
-            match role {
-                "user" => {
-                    let meta = payload.get("meta").and_then(Value::as_bool).unwrap_or(false);
-                    Some(AgentEvent::Text {
-                        content: format!("▷ User: {text}"),
-                        meta,
-                        kind: None,
-                        ts,
-                        message_id: None,
-                        usage: None,
-                        seq: None,
-                    })
-                }
-                "assistant"
-                | "assistant_thinking"
-                | "assistant_redacted_thinking"
-                | "assistant_attachment" => Some(AgentEvent::Text {
-                    content: text.to_owned(),
-                    meta: false,
-                    kind: text_kind(role),
-                    ts,
-                    message_id: payload
-                        .get("message_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    usage: None,
-                    seq: None,
-                }),
-                "system_marker" => Some(AgentEvent::Text {
-                    content: format!("· {text}"),
-                    meta: true,
-                    kind: text_kind(role),
-                    ts,
-                    message_id: None,
-                    usage: None,
-                    seq: None,
-                }),
-                "summary" => turn_summary_parts(payload).map(|(detail, category, needs_action)| {
-                    AgentEvent::TurnSummary {
-                        detail,
-                        status_category: category,
-                        needs_action,
-                        ts,
-                        seq: None,
-                    }
-                }),
-                "context_reset" => Some(AgentEvent::ContextReset { ts, seq: None }),
-                "compact_summary" => {
-                    Some(AgentEvent::CompactSummary { content: text.to_owned(), ts, seq: None })
-                }
-                _ => None,
-            }
-        }
+        "message" => message_event(payload, ts),
         "tool_use" => {
             let kind = payload.get("kind").and_then(Value::as_str);
             if matches!(kind, Some("tool_result" | "server_tool_result")) {
@@ -128,12 +74,82 @@ pub fn to_agent_event(adapter_id: &str, event_type: &str, payload: &Value) -> Op
     }
 }
 
+/// The `message` payload dialect: one role per canonical client shape. Split
+/// out of [`to_agent_event`] so that dispatcher stays a dispatcher.
+fn message_event(payload: &Value, ts: i64) -> Option<AgentEvent> {
+    let role = payload.get("role").and_then(Value::as_str)?;
+    let text = payload.get("text").and_then(Value::as_str).unwrap_or_default();
+    match role {
+        "user" => {
+            let meta = payload.get("meta").and_then(Value::as_bool).unwrap_or(false);
+            Some(AgentEvent::Text {
+                content: format!("▷ User: {text}"),
+                meta,
+                kind: None,
+                ts,
+                message_id: None,
+                usage: None,
+                seq: None,
+                turn_id: None,
+            })
+        }
+        "assistant"
+        | "assistant_thinking"
+        | "assistant_redacted_thinking"
+        | "assistant_attachment" => Some(AgentEvent::Text {
+            content: text.to_owned(),
+            meta: false,
+            kind: text_kind(role),
+            ts,
+            message_id: payload.get("message_id").and_then(Value::as_str).map(str::to_owned),
+            usage: None,
+            seq: None,
+            turn_id: None,
+        }),
+        "turn_annotation" => Some(AgentEvent::Text {
+            content: text.to_owned(),
+            meta: true,
+            kind: text_kind(role),
+            ts,
+            message_id: None,
+            usage: None,
+            seq: None,
+            turn_id: None,
+        }),
+        "system_marker" => Some(AgentEvent::Text {
+            content: format!("· {text}"),
+            meta: true,
+            kind: text_kind(role),
+            ts,
+            message_id: None,
+            usage: None,
+            seq: None,
+            turn_id: None,
+        }),
+        "summary" => turn_summary_parts(payload).map(|(detail, category, needs_action)| {
+            AgentEvent::TurnSummary {
+                detail,
+                status_category: category,
+                needs_action,
+                ts,
+                seq: None,
+            }
+        }),
+        "context_reset" => Some(AgentEvent::ContextReset { ts, seq: None }),
+        "compact_summary" => {
+            Some(AgentEvent::CompactSummary { content: text.to_owned(), ts, seq: None })
+        }
+        _ => None,
+    }
+}
+
 fn text_kind(role: &str) -> Option<String> {
     let kind = match role {
         "assistant_thinking" => "thinking",
         "assistant_redacted_thinking" => "redacted_thinking",
         "assistant_attachment" => "attachment",
         "system_marker" => "system_marker",
+        "turn_annotation" => "turn_annotation",
         _ => return None,
     };
     Some(kind.to_owned())
@@ -202,6 +218,7 @@ fn agent_event_from_canonical(v: &Value, ts: i64) -> Option<AgentEvent> {
             message_id: v.get("message_id").and_then(Value::as_str).map(str::to_owned),
             usage: serde_json::from_value(v.get("usage").cloned().unwrap_or(Value::Null)).ok(),
             seq: None,
+            turn_id: None,
         }),
         "turn_summary" => Some(AgentEvent::TurnSummary {
             detail: v.get("detail").and_then(Value::as_str).unwrap_or_default().to_owned(),

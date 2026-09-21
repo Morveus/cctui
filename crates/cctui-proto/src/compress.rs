@@ -95,7 +95,11 @@ mod tests {
         });
         DaemonFrameUp::Event {
             adapter_id: "claude-code".into(),
-            event: AdapterEvent::Message { local_id: format!("sess-{}", i % 4), payload },
+            event: AdapterEvent::Message {
+                local_id: format!("sess-{}", i % 4),
+                payload,
+                turn_id: None,
+            },
         }
     }
 
@@ -155,6 +159,7 @@ mod tests {
                 event: AdapterEvent::Message {
                     local_id: format!("s{i}"),
                     payload: serde_json::json!({ "n": i, "blob": next_hex(120) }),
+                    turn_id: None,
                 },
             })
             .collect();

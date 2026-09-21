@@ -26,6 +26,14 @@ use crate::sendguard::{MAX_ATTEMPTS, MAX_PAYLOAD_BYTES, SendGuard};
 
 /// Backoff schedule. Capped at the last entry on subsequent failures.
 const BACKOFF_SECS: &[u64] = &[5, 10, 20, 60];
+/// Gap before the first retry of a refused job removal. It doubles on
+/// every further refusal (see [`purge_gap`]).
+const PURGE_RETRY: Duration = Duration::from_mins(10);
+/// Ceiling of the doubling gap. A removal that can never succeed (an
+/// `EACCES` on a root-owned file, a worktree that is the cwd of a live
+/// session) is still retried, once a day, instead of every ten minutes
+/// forever: a 14-job backlog at ten minutes is ~2000 log lines a day.
+const PURGE_RETRY_MAX: Duration = Duration::from_hours(24);
 
 /// WS keepalive ping interval. Must be shorter than any idle timeout on
 /// the path (ingress, NAT, load balancer). 20s is comfortably below the
@@ -94,8 +102,63 @@ pub struct Supervisor {
     /// WS keepalive cadence; [`PING_INTERVAL`] outside tests.
     ping_interval: Duration,
     /// The in-flight purge of leaked claude jobs (see `purge_leaked_jobs`),
-    /// aborted and restarted whenever a fresh `ResumeMarks` arrives.
+    /// aborted and restarted whenever a fresh archived list arrives.
     purge: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+    /// When each session's job removal was last queued and how many times
+    /// it was found still on disk afterwards, so a refused `claude rm` is
+    /// retried on a doubling gap (see [`purge_gap`]), not every heartbeat.
+    purge_attempts: std::sync::Mutex<HashMap<String, PurgeAttempt>>,
+}
+
+/// One archived session's removal history, kept while its job dir is
+/// still on disk and dropped as soon as it is gone.
+#[derive(Debug, Clone, Copy)]
+struct PurgeAttempt {
+    /// When the last `Remove` was queued.
+    at: tokio::time::Instant,
+    /// How many earlier attempts left the job dir in place.
+    failures: u32,
+}
+
+/// Gap to wait after `failures` unsuccessful attempts: [`PURGE_RETRY`]
+/// doubled per failure, capped at [`PURGE_RETRY_MAX`].
+fn purge_gap(failures: u32) -> Duration {
+    let doubled = PURGE_RETRY.saturating_mul(1u32 << failures.min(16));
+    doubled.min(PURGE_RETRY_MAX)
+}
+
+/// Split `ids` (the archived sessions whose job dir is still on disk) into
+/// the ones due for a removal attempt now, recording that attempt. Ids no
+/// longer listed have been removed: their history is forgotten, so a job
+/// that leaks again starts from the first gap.
+fn purge_due(
+    attempts: &mut HashMap<String, PurgeAttempt>,
+    ids: Vec<String>,
+    now: tokio::time::Instant,
+) -> Vec<String> {
+    attempts.retain(|id, _| ids.contains(id));
+    let mut due = Vec::new();
+    for id in ids {
+        match attempts.get_mut(&id) {
+            None => {
+                attempts.insert(id.clone(), PurgeAttempt { at: now, failures: 0 });
+                due.push(id);
+            }
+            Some(attempt) if now.duration_since(attempt.at) >= purge_gap(attempt.failures) => {
+                attempt.failures += 1;
+                attempt.at = now;
+                tracing::info!(
+                    id = %id,
+                    failures = attempt.failures,
+                    next_gap_secs = purge_gap(attempt.failures).as_secs(),
+                    "claude job still on disk after removal; retrying"
+                );
+                due.push(id);
+            }
+            Some(_) => {}
+        }
+    }
+    due
 }
 
 impl Supervisor {
@@ -117,6 +180,7 @@ impl Supervisor {
             connected: tokio::sync::broadcast::Sender::new(CONNECT_SIGNAL_BUFFER),
             ping_interval: PING_INTERVAL,
             purge: std::sync::Mutex::new(None),
+            purge_attempts: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -377,6 +441,7 @@ impl Supervisor {
                                 .resources
                                 .lock()
                                 .map_or(None, |mut s| s.sample()),
+                            claude_jobs: claude_jobs_root(running).map(|root| jobs_on_disk(&root)),
                         };
                         let payload = serde_json::to_string(&hb)?;
                         self.counters.add(Subsystem::Heartbeat, payload.len() as u64);
@@ -478,36 +543,10 @@ impl Supervisor {
                         tracing::warn!(%adapter_id, "adapter busy; resume marks dropped until next connect");
                     }
                 }
-                if let Some(claude) = running.get(CLAUDE_ADAPTER_ID) {
-                    let jobs_root = claude
-                        .config
-                        .get("jobs_root")
-                        .and_then(serde_json::Value::as_str)
-                        .map_or_else(
-                            crate::adapters::claude_code::state::default_jobs_root,
-                            std::path::PathBuf::from,
-                        );
-                    let leaked = leaked_jobs(&jobs_root, &archived);
-                    let mut purge = self.purge.lock().unwrap();
-                    // One purge at a time: the fresh list supersedes whatever
-                    // the previous connection was still working through.
-                    if let Some(previous) = purge.take() {
-                        previous.abort();
-                    }
-                    if !leaked.is_empty() {
-                        tracing::info!(
-                            count = leaked.len(),
-                            "removing claude jobs of archived sessions"
-                        );
-                        let task = tokio::spawn(purge_leaked_jobs(
-                            claude.commands_tx.clone(),
-                            claude.shutdown.clone(),
-                            jobs_root,
-                            leaked,
-                        ));
-                        *purge = Some(task.abort_handle());
-                    }
-                }
+                self.purge_archived_jobs(running, &archived);
+            }
+            DaemonFrameDown::ArchivedJobs { session_ids } => {
+                self.purge_archived_jobs(running, &session_ids);
             }
             DaemonFrameDown::StageFiles { request_id, adapter_id, local_id, uploads } => {
                 let up = stage_files_result(request_id, &adapter_id, &local_id, &uploads);
@@ -862,6 +901,64 @@ impl AdapterRunning {
     }
 }
 
+impl Supervisor {
+    /// Queue a `Remove` for every archived session whose claude job is still
+    /// on disk and was not already attempted within [`PURGE_RETRY`].
+    fn purge_archived_jobs(&self, running: &HashMap<String, AdapterRunning>, archived: &[String]) {
+        let Some(claude) = running.get(CLAUDE_ADAPTER_ID) else { return };
+        let Some(jobs_root) = claude_jobs_root(running) else { return };
+        let leaked = self.not_yet_attempted(leaked_jobs(&jobs_root, archived));
+        if leaked.is_empty() {
+            return;
+        }
+        let mut purge = self.purge.lock().unwrap();
+        // One purge at a time: the fresh list supersedes whatever the
+        // previous one was still working through.
+        if let Some(previous) = purge.take() {
+            previous.abort();
+        }
+        tracing::info!(count = leaked.len(), "removing claude jobs of archived sessions");
+        let task = tokio::spawn(purge_leaked_jobs(
+            claude.commands_tx.clone(),
+            claude.shutdown.clone(),
+            jobs_root,
+            leaked,
+        ));
+        *purge = Some(task.abort_handle());
+    }
+}
+
+impl Supervisor {
+    /// Drop the ids whose retry gap has not elapsed and record the rest as
+    /// attempted now (see [`purge_due`]).
+    fn not_yet_attempted(&self, ids: Vec<String>) -> Vec<String> {
+        let now = tokio::time::Instant::now();
+        let mut attempts = self.purge_attempts.lock().unwrap();
+        purge_due(&mut attempts, ids, now)
+    }
+}
+
+/// The claude adapter's jobs root, when the adapter is running.
+fn claude_jobs_root(running: &HashMap<String, AdapterRunning>) -> Option<std::path::PathBuf> {
+    let claude = running.get(CLAUDE_ADAPTER_ID)?;
+    Some(claude.config.get("jobs_root").and_then(serde_json::Value::as_str).map_or_else(
+        crate::adapters::claude_code::state::default_jobs_root,
+        std::path::PathBuf::from,
+    ))
+}
+
+/// Shorts of the job directories under `jobs_root`, sorted.
+fn jobs_on_disk(jobs_root: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(jobs_root) else { return Vec::new() };
+    let mut shorts: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| crate::configsweep::short_of(&e.file_name().to_string_lossy()))
+        .collect();
+    shorts.sort();
+    shorts
+}
+
 async fn stop_adapters(running: &mut HashMap<String, AdapterRunning>) {
     let ids: Vec<String> = running.keys().cloned().collect();
     for id in ids {
@@ -1133,6 +1230,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
+    use cctui_proto::adapter::AdapterCommand;
     use cctui_proto::chunk::{Accept, Reassembler};
     use cctui_proto::ws::DaemonFrameUp;
 
@@ -1148,6 +1246,7 @@ mod tests {
         let msg = |payload| cctui_proto::adapter::AdapterEvent::Message {
             local_id: "s".to_owned(),
             payload,
+            turn_id: None,
         };
         let thinking = |text| serde_json::json!({ "role": "assistant_thinking", "text": text });
 
@@ -1196,6 +1295,7 @@ mod tests {
         let event = cctui_proto::adapter::AdapterEvent::Message {
             local_id: "s".to_owned(),
             payload: serde_json::json!({ "text": "ghp_ABCDEFGHIJKLMNOPQRSTUVWX0123" }),
+            turn_id: None,
         };
         let out = scrub_event(event, &scrub);
         assert!(serde_json::to_string(&out).unwrap().contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWX0123"));
@@ -1463,6 +1563,149 @@ mod tests {
         assert!(commands_rx.try_recv().is_err(), "a session without a job dir must not be removed");
     }
 
+    fn claude_running(
+        jobs: &std::path::Path,
+        commands_tx: mpsc::Sender<AdapterCommand>,
+    ) -> std::collections::HashMap<String, AdapterRunning> {
+        let mut running = std::collections::HashMap::new();
+        running.insert(
+            "claude-code".to_owned(),
+            AdapterRunning {
+                shutdown: CancellationToken::new(),
+                config: serde_json::json!({ "jobs_root": jobs.to_str().unwrap() }),
+                commands_tx,
+                tasks: Vec::new(),
+            },
+        );
+        running
+    }
+
+    async fn expect_removals(
+        commands_rx: &mut mpsc::Receiver<AdapterCommand>,
+        count: usize,
+    ) -> Vec<String> {
+        let mut removed = Vec::new();
+        while removed.len() < count {
+            let cmd = tokio::time::timeout(Duration::from_secs(5), commands_rx.recv())
+                .await
+                .expect("purge must queue the leaked removals")
+                .expect("command channel open");
+            match cmd {
+                AdapterCommand::Remove { local_id, command_id } => {
+                    assert!(command_id.is_none());
+                    removed.push(local_id);
+                }
+                other => panic!("expected Remove, got {other:?}"),
+            }
+        }
+        removed
+    }
+
+    #[tokio::test]
+    async fn archived_jobs_frame_removes_leaked_jobs_once_per_retry_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let jobs = tmp.path().join("jobs");
+        std::fs::create_dir_all(jobs.join("deadbeef")).unwrap();
+        std::fs::create_dir_all(jobs.join("cafebabe")).unwrap();
+        let (commands_tx, mut commands_rx) = mpsc::channel(8);
+        let mut running = claude_running(&jobs, commands_tx);
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (frame_up_tx, _frame_up_rx) = mpsc::channel(8);
+        let mut scrub = cctui_crypto::redact::CompiledPatterns::disabled();
+        let supervisor = Supervisor::new(
+            ServerClient::new("http://localhost"),
+            "machine-key".to_string(),
+            vec![],
+        );
+        let frame = || cctui_proto::ws::DaemonFrameDown::ArchivedJobs {
+            session_ids: vec![
+                "deadbeef-0000-0000-0000-000000000000".to_owned(),
+                "12345678-0000-0000-0000-000000000000".to_owned(),
+                "cafebabe-0000-0000-0000-000000000000".to_owned(),
+            ],
+        };
+        supervisor
+            .handle_frame(
+                frame(),
+                &mut running,
+                &event_tx,
+                &frame_up_tx,
+                &mut scrub,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            expect_removals(&mut commands_rx, 2).await,
+            vec![
+                "deadbeef-0000-0000-0000-000000000000".to_owned(),
+                "cafebabe-0000-0000-0000-000000000000".to_owned(),
+            ]
+        );
+        tokio::task::yield_now().await;
+        assert!(commands_rx.try_recv().is_err(), "a session without a job dir must not be removed");
+
+        // The next heartbeat's answer names the same jobs (`claude rm` may
+        // have refused); they are not re-queued inside the retry window.
+        supervisor
+            .handle_frame(
+                frame(),
+                &mut running,
+                &event_tx,
+                &frame_up_tx,
+                &mut scrub,
+                &CancellationToken::new(),
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(commands_rx.try_recv().is_err(), "removal must not repeat every heartbeat");
+    }
+
+    #[test]
+    fn purge_gap_doubles_and_caps() {
+        assert_eq!(super::purge_gap(0), Duration::from_mins(10));
+        assert_eq!(super::purge_gap(1), Duration::from_mins(20));
+        assert_eq!(super::purge_gap(3), Duration::from_mins(80));
+        assert_eq!(super::purge_gap(8), Duration::from_hours(24));
+        assert_eq!(super::purge_gap(40), Duration::from_hours(24));
+    }
+
+    /// A job that stays on disk after each attempt (a root-owned file, a
+    /// worktree occupied by a live session) is retried on a doubling gap,
+    /// and its history is forgotten once the dir is gone.
+    #[test]
+    fn purge_due_backs_off_while_the_job_stays_on_disk() {
+        let mut attempts = std::collections::HashMap::new();
+        let job = || vec!["deadbeef".to_owned()];
+        let t0 = tokio::time::Instant::from_std(std::time::Instant::now());
+        assert_eq!(super::purge_due(&mut attempts, job(), t0), job(), "first sighting is due");
+        assert!(super::purge_due(&mut attempts, job(), t0 + Duration::from_mins(9)).is_empty());
+        assert_eq!(super::purge_due(&mut attempts, job(), t0 + Duration::from_mins(10)), job());
+        // Second failure: the gap is now 20 minutes.
+        let t1 = t0 + Duration::from_mins(10);
+        assert!(super::purge_due(&mut attempts, job(), t1 + Duration::from_mins(19)).is_empty());
+        assert_eq!(super::purge_due(&mut attempts, job(), t1 + Duration::from_mins(20)), job());
+        assert_eq!(attempts["deadbeef"].failures, 2);
+        // The dir is gone (or the session is no longer archived): forgotten,
+        // so a fresh leak of the same id starts over at the first gap.
+        assert!(super::purge_due(&mut attempts, vec![], t1 + Duration::from_mins(21)).is_empty());
+        assert!(attempts.is_empty());
+        assert_eq!(super::purge_due(&mut attempts, job(), t1 + Duration::from_mins(22)), job());
+        assert_eq!(attempts["deadbeef"].failures, 0);
+    }
+
+    #[test]
+    fn jobs_on_disk_lists_job_dirs_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let jobs = tmp.path().join("jobs");
+        std::fs::create_dir_all(jobs.join("deadbeef")).unwrap();
+        std::fs::create_dir_all(jobs.join("cafebabe")).unwrap();
+        std::fs::create_dir_all(jobs.join("not-a-short")).unwrap();
+        std::fs::write(jobs.join("pins.json"), "{}").unwrap();
+        std::fs::write(jobs.join("0badf00d"), "").unwrap();
+        assert_eq!(super::jobs_on_disk(&jobs), vec!["cafebabe".to_owned(), "deadbeef".to_owned()]);
+        assert!(super::jobs_on_disk(&tmp.path().join("missing")).is_empty());
+    }
+
     /// A claude-code stand-in that never drains its command channel, the way
     /// the real adapter looks while it serialises `Remove`s (kill, wait for the
     /// worker, `claude rm`: tens of seconds each).
@@ -1651,6 +1894,7 @@ mod tests {
             event: cctui_proto::adapter::AdapterEvent::Message {
                 local_id: format!("sess-{}", i % 4),
                 payload: serde_json::json!({ "text": format!("event number {i}"), "n": i }),
+                turn_id: None,
             },
         }
     }
@@ -1670,6 +1914,7 @@ mod tests {
             event: cctui_proto::adapter::AdapterEvent::Message {
                 local_id: format!("s{i}"),
                 payload: serde_json::json!({ "n": i, "blob": blob }),
+                turn_id: None,
             },
         }
     }
@@ -1725,6 +1970,7 @@ mod tests {
             bandwidth: None,
             update_hook: None,
             resources: None,
+            claude_jobs: None,
         };
         let super::Prepared::Frame(text) = super::prepare_send(&hb).unwrap() else {
             panic!("heartbeat must not chunk")
@@ -1852,6 +2098,7 @@ mod tests {
         cctui_proto::adapter::AdapterEvent::Message {
             local_id: local_id.to_owned(),
             payload: serde_json::json!({ "text": "tail" }),
+            turn_id: None,
         }
     }
 

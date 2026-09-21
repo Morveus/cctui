@@ -96,7 +96,7 @@ impl Adapter for ClaudeCodeAdapter {
 
     async fn start(&self, ctx: AdapterCtx) -> anyhow::Result<()> {
         match Mode::from_config(&ctx.config) {
-            Mode::Bg => start_bg(ctx).await,
+            Mode::Bg => Box::pin(start_bg(ctx)).await,
             // Oneshot driver: one transient `claude -p` per turn,
             // mapped onto the AdapterCommand/AdapterEvent surface via the shared
             // stream-json codec. It binds the same `--settings` ask/permission

@@ -229,6 +229,41 @@ impl ServerClient {
         Ok(())
     }
 
+    /// The limits that apply to `session_id` itself: its pinned account, that
+    /// account's usage windows, the caps in force (including the session's own
+    /// `CctuiAgent` dollar budget) and a per-model allow decision.
+    ///
+    /// Returned as raw JSON so the daemon does not have to track the server's
+    /// soft-limit types. Fails soft server-side: an empty usage cache yields
+    /// `stale: true` and an allowing decision rather than an error.
+    pub async fn session_limits(
+        &self,
+        machine_key: &str,
+        session_id: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let url = format!(
+            "{}/api/v1/daemon/sessions/{}/limits",
+            self.base_url.trim_end_matches('/'),
+            session_id,
+        );
+        let mut req = self.http.get(&url).bearer_auth(machine_key);
+        if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+            req = req.query(&[("model", model)]);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            let reason = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+                .unwrap_or(text);
+            anyhow::bail!("CctuiUsage unavailable ({status}): {reason}");
+        }
+        Ok(resp.json().await?)
+    }
+
     /// Ask whether the session token a trusted worker was launched with still
     /// resolves at the gateway. `token_hash` is the sha256 hex of the
     /// token — the token itself never travels on this call. `Err` covers both

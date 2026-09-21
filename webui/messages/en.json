@@ -333,6 +333,7 @@
 	"conversation_filter_group_session": "Session",
 	"conversation_filter_group_tools": "Tools",
 	"conversation_filter_group_user": "User",
+	"conversation_attachment_count": "{count} attachment(s)",
 	"conversation_filter_marker": "System markers",
 	"conversation_filter_mcp": "MCP tool calls",
 	"conversation_filter_menu_aria": "Message categories",

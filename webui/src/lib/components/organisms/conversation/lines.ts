@@ -131,10 +131,13 @@ function buildLine(e: AgentEvent, ctx: LineBuildCtx, poll?: PollSeen): Line | nu
 				return {
 					role: 'marker',
 					ts: Number(e.ts),
-					html: ctx.renderMarkdown(e.content),
-					text: e.content
+					text: e.content,
+					markerTexts: [e.content]
 				};
 			}
+			// Turn annotations are never lines of their own; `buildLines`
+			// re-anchors them onto the turn they describe.
+			if (e.kind === 'turn_annotation') return null;
 			if (e.content.startsWith(USER_PREFIX)) {
 				const content = e.content.slice(USER_PREFIX.length).trimStart();
 				// Classify structurally from content, not the stored `meta` bit —
@@ -235,6 +238,55 @@ function attachSummary(out: Line[], e: AgentEvent & { type: 'turn_summary' }): L
 	return { role: 'summary', ts: summary.ts, summary, text: detail };
 }
 
+// Annotations arrive as `<kind>[:<detail>]` in a `turn_annotation` text event.
+export function parseAnnotation(content: string): { kind: string; detail: string } {
+	const at = content.indexOf(':');
+	return at === -1
+		? { kind: content, detail: '' }
+		: { kind: content.slice(0, at), detail: content.slice(at + 1) };
+}
+
+// Scans back to the nearest line of `roles`, stopping at a turn boundary so an
+// annotation never lands on an earlier turn.
+function ownerLine(out: Line[], roles: Line['role'][], stopAt: Line['role'][]): Line | null {
+	for (let i = out.length - 1; i >= 0; i--) {
+		const ln = out[i];
+		if (roles.includes(ln.role)) return ln;
+		if (stopAt.includes(ln.role)) break;
+	}
+	return null;
+}
+
+// Claude writes `attachment` records *before* the user turn they belong to, so
+// they are counted forward onto the next user line rather than scanned back.
+function attachAnnotation(out: Line[], content: string, pending: { attachments: number }): void {
+	const { kind, detail } = parseAnnotation(content);
+	switch (kind) {
+		case 'attachment':
+			pending.attachments += 1;
+			return;
+		case 'turn_duration': {
+			const ms = Number(detail);
+			const owner = ownerLine(out, ['assistant'], ['user', 'poll', 'peer', 'reset']);
+			if (owner && Number.isFinite(ms) && ms > 0) owner.durationMs = ms;
+			return;
+		}
+		case 'stop_hook_summary': {
+			const owner = ownerLine(out, ['assistant'], ['user', 'poll', 'peer', 'reset']);
+			if (owner && detail) owner.stopHook = detail;
+			return;
+		}
+		case 'file_history': {
+			const owner = ownerLine(out, ['tool'], ['user', 'poll', 'peer', 'reset']);
+			if (owner && detail) {
+				owner.fileHistory ??= [];
+				owner.fileHistory.push(detail);
+			}
+			return;
+		}
+	}
+}
+
 // What the composer wrote for a message that carried uploads: `[name]` tokens
 // in the prose plus an "Attached file(s)" block listing the daemon's staged
 // paths (`/tmp/cctui-uploads/<session>/<name>`). The session id is taken from
@@ -291,8 +343,13 @@ export function buildLines(
 ): Line[] {
 	const out: Line[] = [];
 	const poll: PollSeen = { seen: new Set() };
+	const pending = { attachments: 0 };
 	let prevKey = '';
 	for (const e of events) {
+		if (e.type === 'text' && e.kind === 'turn_annotation') {
+			attachAnnotation(out, e.content, pending);
+			continue;
+		}
 		if (e.type === 'turn_summary') {
 			if (!ctx.visible('summary')) continue;
 			const orphan = attachSummary(out, e);
@@ -316,6 +373,20 @@ export function buildLines(
 					}`;
 		if (key === prevKey) continue;
 		prevKey = key;
+		// Consecutive markers collapse into one row: they arrive in bursts at the
+		// same second and each is a single line of bookkeeping.
+		const prevLine = out[out.length - 1];
+		if (ln.role === 'marker' && prevLine?.role === 'marker') {
+			prevLine.markerTexts = [...(prevLine.markerTexts ?? []), ...(ln.markerTexts ?? [])];
+			prevLine.text = prevLine.markerTexts.join(' · ');
+			continue;
+		}
+		if (ln.role === 'user' || ln.role === 'poll') {
+			if (pending.attachments > 0) {
+				ln.attachmentCount = pending.attachments;
+				pending.attachments = 0;
+			}
+		}
 		if ((ln.role === 'user' || ln.role === 'poll') && delivery) {
 			if (delivery.pending.has(ln.ts)) ln.pending = true;
 			const retry = delivery.retrying.get(ln.ts);
@@ -334,6 +405,8 @@ export function buildLines(
 		const prev = [...out.slice(0, i)]
 			.reverse()
 			.find((l) => l.role === 'user' || l.role === 'assistant');
+		// A `system/turn_duration` annotation is exact; only estimate without one.
+		if (out[i].durationMs !== undefined) continue;
 		if (prev && out[i].ts > prev.ts) out[i].durationMs = out[i].ts - prev.ts;
 	}
 	return assignLineKeys(stampTurns(out));

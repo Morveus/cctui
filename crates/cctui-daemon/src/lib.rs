@@ -18,6 +18,7 @@ pub mod client;
 pub mod config;
 pub mod configsweep;
 pub mod counters;
+pub mod dangerous_rm;
 pub mod dispatch_codex;
 pub mod enroll;
 pub mod fatal;

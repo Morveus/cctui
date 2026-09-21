@@ -421,6 +421,7 @@ impl ThreadListInventory {
                         "type": "userMessage",
                         "content": [{"type": "text", "text": preview}],
                     }),
+                    turn_id: None,
                 })
                 .await;
         }
@@ -705,6 +706,7 @@ fn status_event(local_id: &str, status: Option<&str>) -> Option<AdapterEvent> {
         intent: None,
         model: None,
         effort: None,
+        permission_mode: None,
         children: vec![],
     })
 }
@@ -720,6 +722,7 @@ fn status_name(local_id: &str, name: String) -> AdapterEvent {
         intent: None,
         model: None,
         effort: None,
+        permission_mode: None,
         children: vec![],
     }
 }

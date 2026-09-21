@@ -213,9 +213,15 @@ export function latestTodoLineKey(lines: Line[]): string | undefined {
 // Content signature of an event, used to dedup the live stream against fetched
 // history (the same logical event has a DIFFERENT `ts` in each source — history
 // stamps DB `created_at`, live carries the daemon ts — so ts can't be the key).
-// User messages collapse across their three shapes via `userMsgKey`. Markers
-// (reset/turn_end/heartbeat) key on ts so distinct ones aren't over-collapsed.
+// A turn cctui originated carries a client-minted `turn_id` that the daemon
+// stamps on every encoding Claude stores it in, so identity is the primary key
+// and no text has to be normalised. The content fallback below stays for the
+// turns that can never have one — typed into Claude's own TUI, or persisted
+// before the column existed — where user messages collapse across their three
+// shapes via `userMsgKey`. Markers (reset/turn_end/heartbeat) key on ts so
+// distinct ones aren't over-collapsed.
 export function eventSig(e: AgentEvent): string {
+	if ('turn_id' in e && e.turn_id) return `t:${e.turn_id}`;
 	const u = userMsgKey(e);
 	if (u !== null) return `u:${u}`;
 	switch (e.type) {

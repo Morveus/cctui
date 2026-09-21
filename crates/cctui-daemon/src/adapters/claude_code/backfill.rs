@@ -237,6 +237,7 @@ async fn backfill_one(
                         "text": "context reset (/clear · /compact)",
                         "session_id": resume,
                     }),
+                    turn_id: None,
                 })
                 .await;
             let path = transcript::transcript_path(&cfg.projects_root, cwd, resume);
@@ -395,7 +396,7 @@ mod tests {
         let mut texts = Vec::new();
         let mut saw_reset = false;
         while let Ok(evt) = rx.try_recv() {
-            if let AdapterEvent::Message { local_id, payload } = &evt {
+            if let AdapterEvent::Message { local_id, payload, .. } = &evt {
                 // Everything lands on the immutable local_id, not the rotated id.
                 assert_eq!(local_id, "old-1");
                 let role = payload.get("role").and_then(|r| r.as_str()).unwrap_or("");

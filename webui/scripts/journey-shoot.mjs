@@ -7,11 +7,12 @@
 // Needs a seeded local stack (`make local/demo`). One book pass runs per theme:
 // the theme lives in the server's settings blob rather than in the browser, so
 // it has to be re-seeded between passes and cannot vary within one.
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { changedFiles, journeysForChanges, knownJourneys } from './journeys-for-changes.mjs';
 import { previewStaleness } from './preview-freshness.mjs';
+import { previewRenderFailure } from './preview-render.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const webui = resolve(here, '..');
@@ -42,6 +43,40 @@ if (unknown.length) {
 	process.exit(1);
 }
 
+async function listening(url) {
+	return await fetch(url, { redirect: 'follow' }).then(
+		() => true,
+		() => false
+	);
+}
+
+/** Spawns `vite preview` on `url`'s port unless something already answers
+ *  there, and resolves once it does. Returns the child to kill, or null when an
+ *  existing server (already proven fresh above) is being reused. */
+async function startPreview(url) {
+	if (await listening(url)) return null;
+	const port = new URL(url).port || '5273';
+	const child = spawn('npx', ['vite', 'preview', '--port', port, '--strictPort'], {
+		cwd: webui,
+		env,
+		stdio: 'ignore'
+	});
+	child.on('exit', (code) => {
+		if (code) {
+			console.error(`journey:shoot: vite preview exited with ${code}`);
+			process.exit(1);
+		}
+	});
+	const deadline = Date.now() + 120000;
+	while (Date.now() < deadline) {
+		if (await listening(url)) return child;
+		await new Promise((r) => setTimeout(r, 250));
+	}
+	child.kill();
+	console.error(`journey:shoot: vite preview never came up on ${url}`);
+	process.exit(1);
+}
+
 const byTheme = new Map();
 for (const id of ids) {
 	const ir = compiled.find((j) => j.id === id);
@@ -61,6 +96,20 @@ if (stale) {
 	console.error(`  ${stale.reason}.`);
 	for (const m of stale.missing) console.error(`    ${m}`);
 	console.error('  Stop it and re-run: a journey must document the build it was shot against.');
+	process.exit(1);
+}
+
+// Started here rather than left to `journey book`, so the server is always
+// younger than the build above and the render guard has something to probe.
+const preview = await startPreview(appUrl);
+process.on('exit', () => preview?.kill());
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(1));
+
+const blank = await previewRenderFailure(appUrl);
+if (blank) {
+	console.error(`journey:shoot: ${appUrl} served a page that does not render —`);
+	console.error(`  ${blank}.`);
+	console.error('  Refusing to capture: a blank screenshot is a defect, not documentation.');
 	process.exit(1);
 }
 

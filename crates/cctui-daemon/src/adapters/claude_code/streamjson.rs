@@ -124,7 +124,10 @@ fn parse_system(local_id: &str, v: &Value, out: &mut Vec<AdapterEvent>) -> Strea
             }
         }
         Some("error") => StreamOutcome { session_id: None, end: Some(error_end(v)) },
-        _ => StreamOutcome::default(),
+        other => {
+            transcript::record_unknown("unknown-streamjson-system", other.unwrap_or("<none>"));
+            StreamOutcome::default()
+        }
     }
 }
 
@@ -339,6 +342,24 @@ mod tests {
         assert!(detail.contains("line 6\n"), "{detail}");
         assert!(detail.ends_with("line 45"), "{detail}");
         assert_eq!(exit_detail("claude -p", status, ""), "claude -p exited (exit status: 3)");
+    }
+
+    #[test]
+    fn unknown_system_subtypes_are_counted_by_namespaced_label() {
+        let mut out = Vec::new();
+        for line in [r#"{"type":"system","subtype":"tachyon_burst"}"#, r#"{"type":"system"}"#] {
+            let outcome = parse_stream_line("s", line, &mut out);
+            assert_eq!(outcome, StreamOutcome::default());
+        }
+        assert!(out.is_empty(), "unknown system subtypes must not fabricate events");
+        for label in ["unknown-streamjson-system:tachyon_burst", "unknown-streamjson-system:<none>"]
+        {
+            let count = transcript::transcript_drop_tally()
+                .into_iter()
+                .find(|(k, _)| k == label)
+                .map_or(0, |(_, v)| v);
+            assert!(count >= 1, "{label} must be counted");
+        }
     }
 
     #[test]

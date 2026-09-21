@@ -780,7 +780,11 @@ impl OpenCodeSession {
         }
         for (kind, payload) in normalize::part_payloads(part, &role) {
             let event = match kind {
-                Kind::Message => AdapterEvent::Message { local_id: session_id.to_owned(), payload },
+                Kind::Message => AdapterEvent::Message {
+                    local_id: session_id.to_owned(),
+                    payload,
+                    turn_id: None,
+                },
                 Kind::ToolUse => AdapterEvent::ToolUse { local_id: session_id.to_owned(), payload },
             };
             if self.events.send(event).await.is_err() {
@@ -800,6 +804,7 @@ impl OpenCodeSession {
                     "role": "assistant",
                     "text": format!("· {text}"),
                 }),
+                turn_id: None,
             })
             .await;
     }
@@ -829,6 +834,7 @@ fn status(
         intent: None,
         model: None,
         effort: None,
+        permission_mode: None,
         children: Vec::new(),
     }
 }

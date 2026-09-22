@@ -110,16 +110,16 @@ pub async fn extract_blobs(
     machine_key: &str,
     event: AdapterEvent,
 ) -> AdapterEvent {
-    let (local_id, payload, is_tool) = match event {
-        AdapterEvent::Message { local_id, payload } => (local_id, payload, false),
-        AdapterEvent::ToolUse { local_id, payload } => (local_id, payload, true),
+    let (local_id, payload, turn_id, is_tool) = match event {
+        AdapterEvent::Message { local_id, payload, turn_id } => (local_id, payload, turn_id, false),
+        AdapterEvent::ToolUse { local_id, payload } => (local_id, payload, None, true),
         other => return other,
     };
 
     let mut candidates = Vec::new();
     collect(&payload, &mut candidates);
     if candidates.is_empty() {
-        return rebuild(local_id, payload, is_tool);
+        return rebuild(local_id, payload, turn_id, is_tool);
     }
 
     let mut uploaded = HashSet::new();
@@ -133,19 +133,24 @@ pub async fn extract_blobs(
         }
     }
     if uploaded.is_empty() {
-        return rebuild(local_id, payload, is_tool);
+        return rebuild(local_id, payload, turn_id, is_tool);
     }
 
     let mut payload = payload;
     replace(&mut payload, &uploaded);
-    rebuild(local_id, payload, is_tool)
+    rebuild(local_id, payload, turn_id, is_tool)
 }
 
-const fn rebuild(local_id: String, payload: Value, is_tool: bool) -> AdapterEvent {
+const fn rebuild(
+    local_id: String,
+    payload: Value,
+    turn_id: Option<uuid::Uuid>,
+    is_tool: bool,
+) -> AdapterEvent {
     if is_tool {
         AdapterEvent::ToolUse { local_id, payload }
     } else {
-        AdapterEvent::Message { local_id, payload }
+        AdapterEvent::Message { local_id, payload, turn_id }
     }
 }
 

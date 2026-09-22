@@ -567,6 +567,7 @@ async fn handle_input_mode(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<T
                         content,
                         client_msg_id: None,
                         ask_picks: None,
+                        turn_id: None,
                     })
                     .await;
             }
@@ -646,6 +647,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent) {
         | ServerEvent::AskResolved { .. }
         | ServerEvent::SoftLimitReached { .. }
         | ServerEvent::PtyChunk { .. }
+        | ServerEvent::Heartbeat { .. }
         | ServerEvent::SoftLimitCleared { .. } => {}
     }
 }
@@ -864,8 +866,11 @@ fn clean_user_message(text: &str) -> Option<String> {
 
 fn agent_event_to_line(event: &AgentEvent) -> ConversationLine {
     match event {
-        AgentEvent::Text { content, meta, ts, .. } => {
-            let (kind, text) = if content.starts_with("▷ User:") {
+        AgentEvent::Text { content, meta, ts, kind: text_kind, .. } => {
+            let marker = matches!(text_kind.as_deref(), Some("system_marker" | "turn_annotation"));
+            let (kind, text) = if marker {
+                (LineKind::System, content.clone())
+            } else if content.starts_with("▷ User:") {
                 let user_text = content.trim_start_matches("▷ User: ");
                 // `meta` (set authoritatively at the adapter layer) marks a
                 // system/agent-directed message — render it as System, not a

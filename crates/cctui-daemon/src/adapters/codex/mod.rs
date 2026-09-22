@@ -954,6 +954,7 @@ fn failed_status(local_id: &str, detail: &str) -> AdapterEvent {
         intent: None,
         model: None,
         effort: None,
+        permission_mode: None,
         children: vec![],
     }
 }

@@ -25,7 +25,12 @@ npm install
 npm run dev        # http://localhost:5273
 npm run check      # svelte-check
 npm run build      # static SPA into build/
+npm run preview    # serve build/ — restart it after every rebuild
 ```
+
+`vite preview` resolves the build directory once, at startup: a server left
+running across a rebuild serves HTML referencing asset hashes it no longer has,
+and the page comes up blank. Restart it rather than reloading.
 
 The API origin is runtime config: `static/config.js` sets
 `window.CCTUI_CONFIG.apiBase`. Override that file per-deployment (it is served

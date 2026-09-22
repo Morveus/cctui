@@ -1157,7 +1157,8 @@ launched a harness itself and the resulting agent was invisible to cctui.
 
 ### The tool
 
-`cctui-daemon` serves a local **stdio MCP server** exposing exactly one tool:
+`cctui-daemon` serves a local **stdio MCP server** exposing two tools —
+`CctuiAgent`, below, and [`CctuiUsage`](#cctuiusage--the-limits-that-apply-to-this-session-cct-1076):
 
 ```
 CctuiAgent(
@@ -1272,6 +1273,62 @@ can spawn an opencode/Fireworks child on the same account.
 `budget_usd` is optional and usually unnecessary: the account's own `session_usd`
 cap already bounds a child, gateway-side. Naming a ceiling in the launcher only
 adds a second limit that can deny the spawn. Prefer the account cap.
+
+### `CctuiUsage` — the limits that apply to *this* session (CCT-1076)
+
+The same relay exposes a second tool:
+
+```
+CctuiUsage(
+  model: string?   # ask about one model instead of the session's current one
+) -> one-line summary + the full JSON
+```
+
+It answers from the session's **own** identity, not the human's. A session runs
+on the single account its gateway token is pinned to
+(`session_tokens.account_id`) — possibly elected from a pool, possibly shared and
+owned by someone else — so the account it reports is the one that will 429 it.
+The owner is never returned, and no key on disk is involved: the daemon calls
+`GET /api/v1/daemon/sessions/{id}/limits` with its machine key, and the session
+id is the one baked into the relay's argv.
+
+The payload carries the pinned account (name, emoji, provider, pool), the usage
+windows with pace, the caps actually in force — the account's `SoftLimits` with
+any `CctuiAgent` per-child budget merged in as `session_usd` — this session's
+spend so far, any durable block already written onto the session row, the
+`decision` for the current model, and a `per_model` map so an orchestrator can
+see that one model's weekly window is blocked while another is fine.
+
+```jsonc
+{
+  "account": { "name": "dorsk-main", "emoji": "🐧", "provider": "anthropic", "pool": "personal" },
+  "windows": [ { "key": "session", "label": "5h", "utilization": 46.0, "resets_at": "…" } ],
+  "caps": { "session": { "cap_pct": 90 }, "session_usd": { "cap_usd": 20 } },
+  "spend": { "session_usd": 3.42 },
+  "decision": { "allow": true },
+  "per_model": {
+    "claude-fable-5-1": { "allow": false, "retry_after_secs": 5400, "key": "weekly_model:fable" },
+    "claude-opus-5": { "allow": true }
+  },
+  "age_secs": 41, "stale": false
+}
+```
+
+The one-line rendering that precedes it reads:
+
+```
+🐧dorsk-main · 5h 46% resets in 2h10 · weekly 71% · budget $3.42/$20 · claude-fable-5-1 weekly_model:fable BLOCKED for 1h30 · claude-opus-5 ok
+```
+
+**It fails soft, on purpose.** An empty or cold usage cache returns no windows, an
+allowing `decision` and `stale: true` rather than an error — a refusal would be
+read as "I am blocked" and stall a wave that was fine. A session with no gateway
+token at all (a non-proxied adapter) gets a `404` whose reason says so; nothing
+on cctui's side is capping such a session.
+
+Do **not** use the human `GET /api/v1/accounts/usage` for this. It is
+`require_human`, it lists every credential the owner holds, and a pooled or
+shared session cannot tell which gauge is its own.
 
 A harness that names its own session (opencode returns `ses_…`) is metered under
 the spawn key until it registers; `rebind_spawn_key` moves the token, the recorded

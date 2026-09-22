@@ -591,7 +591,7 @@ pub async fn rescrub_settings(
             }
             if !req.dry_run {
                 // A redacted payload can collide with an existing redacted row on
-                // the (session, type, content_hash) dedup index — ignore that,
+                // the (session, type, content_hash, turn) dedup index — ignore that,
                 // the equivalent row already exists.
                 if let Err(e) = sqlx::query("UPDATE stream_events SET payload = $1 WHERE id = $2")
                     .bind(&payload)

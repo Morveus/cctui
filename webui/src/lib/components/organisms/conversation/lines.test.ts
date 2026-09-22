@@ -516,3 +516,76 @@ describe('task lists', () => {
 		expect(ln.role).toBe('tool');
 	});
 });
+
+describe('CCT-1055 system record reclassification', () => {
+	const annotation = (detail: string, ts: number) => text(detail, ts, 'turn_annotation');
+	const marker = (body: string, ts: number) => text(`· ${body}`, ts, 'system_marker');
+	const user = (body: string, ts: number) => text(`▷ User: ${body}`, ts);
+
+	it('collapses attachments to a count on the user turn they precede, with no bubble', () => {
+		const lines = buildLines(
+			[
+				annotation('attachment:prompt_snapshot', 1),
+				annotation('attachment:queued_command', 2),
+				user('do the thing', 3)
+			],
+			ctx()
+		);
+		expect(lines.map((l) => l.role)).toEqual(['user']);
+		expect(lines[0].attachmentCount).toBe(2);
+	});
+
+	it('drops attachment annotations that never reach a user turn', () => {
+		const lines = buildLines([annotation('attachment:prompt_snapshot', 1)], ctx());
+		expect(lines).toHaveLength(0);
+	});
+
+	it('renders queue-operation as a timeline line', () => {
+		const [ln] = buildLines([marker('queued: deploy the thing', 1)], ctx());
+		expect(ln.role).toBe('marker');
+		expect(ln.text).toBe('· queued: deploy the thing');
+	});
+
+	it('groups consecutive markers into one row, keeping every text', () => {
+		const lines = buildLines([marker('mode: normal', 1), marker('worktree state: clean', 2)], ctx());
+		expect(lines).toHaveLength(1);
+		expect(lines[0].markerTexts).toEqual(['· mode: normal', '· worktree state: clean']);
+	});
+
+	it('takes turn_duration as the exact assistant duration instead of the ts estimate', () => {
+		const lines = buildLines(
+			[user('go', 1000), text('done', 9000), annotation('turn_duration:1200', 9001)],
+			ctx()
+		);
+		const assistant = lines.find((l) => l.role === 'assistant');
+		expect(assistant?.durationMs).toBe(1200);
+	});
+
+	it('still estimates an assistant duration when no annotation arrives', () => {
+		const lines = buildLines([user('go', 1000), text('done', 9000)], ctx());
+		expect(lines.find((l) => l.role === 'assistant')?.durationMs).toBe(8000);
+	});
+
+	it('attaches a stop_hook_summary to the assistant turn, not the timeline', () => {
+		const lines = buildLines(
+			[user('go', 1), text('done', 2), annotation('stop_hook_summary:hook ran', 3)],
+			ctx()
+		);
+		expect(lines.map((l) => l.role)).toEqual(['user', 'assistant']);
+		expect(lines[1].stopHook).toBe('hook ran');
+	});
+
+	it('attaches file-history provenance to the adjacent tool call', () => {
+		const tool: AgentEvent = {
+			type: 'tool_call',
+			tool: 'Edit',
+			input: { file_path: 'src/a.rs' },
+			kind: null,
+			ts: 1,
+			seq: 1
+		};
+		const lines = buildLines([tool, annotation('file_history:snapshot:src/a.rs', 2)], ctx());
+		expect(lines.map((l) => l.role)).toEqual(['tool']);
+		expect(lines[0].fileHistory).toEqual(['snapshot:src/a.rs']);
+	});
+});

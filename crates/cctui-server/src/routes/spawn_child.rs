@@ -126,7 +126,7 @@ fn deny(code: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ApiError>
 }
 
 /// Authenticate the caller as a daemon machine key and return its user id.
-async fn machine_user(
+pub async fn machine_user(
     state: &AppState,
     headers: &axum::http::HeaderMap,
 ) -> Result<Uuid, (StatusCode, Json<ApiError>)> {

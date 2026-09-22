@@ -414,6 +414,7 @@ fn notice_event(local_id: &str, method: &str, level: &str, params: Option<&Value
             "text": notice_text(method, params),
             "params": params.cloned().unwrap_or(Value::Null),
         }),
+        turn_id: None,
     }
 }
 
@@ -457,6 +458,7 @@ fn map_plan_updated(local_id: &str, v: &Value) -> Incoming {
     Incoming::Event(AdapterEvent::Message {
         local_id: local_id.to_owned(),
         payload: json!({"type": "plan", "text": text, "plan": steps}),
+        turn_id: None,
     })
 }
 
@@ -472,6 +474,7 @@ fn map_compacted(local_id: &str, v: &Value) -> Incoming {
                 .and_then(Value::as_str)
                 .unwrap_or("context compacted"),
         }),
+        turn_id: None,
     })
 }
 
@@ -495,6 +498,7 @@ fn map_error_notification(local_id: &str, v: &Value) -> Incoming {
         intent: None,
         model: None,
         effort: None,
+        permission_mode: None,
         children: vec![],
     })
 }
@@ -522,6 +526,7 @@ fn map_turn_completed(local_id: &str, v: &Value) -> Incoming {
         intent: None,
         model: None,
         effort: None,
+        permission_mode: None,
         children: vec![],
     })
 }
@@ -548,7 +553,7 @@ pub fn item_event(local_id: &str, item: &Value) -> AdapterEvent {
         | "webSearch"
         | "imageView"
         | "imageGeneration" => AdapterEvent::ToolUse { local_id: local_id.to_owned(), payload },
-        _ => AdapterEvent::Message { local_id: local_id.to_owned(), payload },
+        _ => AdapterEvent::Message { local_id: local_id.to_owned(), payload, turn_id: None },
     }
 }
 
@@ -594,6 +599,7 @@ fn map_status(local_id: &str, v: &Value) -> Incoming {
         intent: None,
         model: None,
         effort: None,
+        permission_mode: None,
         children: vec![],
     })
 }
@@ -645,6 +651,7 @@ fn map_name(local_id: &str, v: &Value) -> Incoming {
         intent: None,
         model: None,
         effort: None,
+        permission_mode: None,
         children: vec![],
     })
 }
@@ -1967,6 +1974,7 @@ impl CodexSession {
                 intent: None,
                 model: None,
                 effort: None,
+                permission_mode: None,
                 children: Vec::new(),
             })
             .await
@@ -2344,6 +2352,7 @@ impl CodexSession {
                                     intent: None,
                                     model: None,
                                     effort: None,
+                                    permission_mode: None,
                                     children: Vec::new(),
                                 })
                                 .await
@@ -2484,6 +2493,7 @@ impl CodexSession {
                                         intent: None,
                                         model,
                                         effort,
+                                        permission_mode: None,
                                         children: vec![],
                                     })
                                     .await
@@ -2743,6 +2753,7 @@ impl CodexSession {
                                             intent: None,
                                             model: None,
                                             effort: None,
+                                            permission_mode: None,
                                             children: vec![],
                                         })
                                         .await
@@ -2773,6 +2784,7 @@ impl CodexSession {
                                         intent: None,
                                         model: None,
                                         effort: None,
+                                        permission_mode: None,
                                         children: vec![],
                                     })
                                     .await
@@ -2939,6 +2951,7 @@ impl CodexSession {
                     intent: None,
                     model: None,
                     effort: None,
+                    permission_mode: None,
                     children: Vec::new(),
                 })
                 .await
@@ -2995,6 +3008,7 @@ impl CodexSession {
                     intent: None,
                     model: None,
                     effort: None,
+                    permission_mode: None,
                     children: Vec::new(),
                 })
                 .await
@@ -3059,6 +3073,7 @@ async fn set_thread_name(
             intent: None,
             model: None,
             effort: None,
+            permission_mode: None,
             children: Vec::new(),
         })
         .await
@@ -3111,6 +3126,7 @@ async fn record_model_override(
             intent: None,
             model: model.map(str::to_owned),
             effort: effort.map(str::to_owned),
+            permission_mode: None,
             children: Vec::new(),
         })
         .await

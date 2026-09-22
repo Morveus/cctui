@@ -128,7 +128,11 @@
 		{#if ln.role === 'peer' && ln.peerFrom}
 			<span class="who peer-from" title={ln.peerFrom}>· {ln.peerFrom}</span>
 		{/if}
-		<Timestamp value={ln.ts} mode="time" tone="faint" size="xs" />
+		{#if ln.role === 'marker'}
+			<span class="marker-ts"><Timestamp value={ln.ts} mode="time" tone="faint" size="xs" /></span>
+		{:else}
+			<Timestamp value={ln.ts} mode="time" tone="faint" size="xs" />
+		{/if}
 		{#if ln.failed}
 			<span class="meta-end">
 				<Text tone="danger" size="xs" nowrap title={ln.failed}>{m.conversation_not_delivered()}</Text>
@@ -231,12 +235,25 @@
 				{thinkingExpanded ? m.conversation_show_less() : m.conversation_show_more()}
 			</Button>
 		{/if}
+	{:else if ln.role === 'marker'}
+		<div class="marker-body">
+			{#each ln.markerTexts ?? [ln.text ?? ''] as mt, i (i)}
+				<span class="marker-item">{mt}</span>
+			{/each}
+		</div>
 	{:else if ln.html}
 		<div class="bubble">{@html ln.html}</div>
 	{:else if ln.htmlCode}
 		<pre class="bubble mono code">{@html ln.htmlCode}</pre>
 	{:else if ln.text}
 		<pre class="bubble mono code">{ln.text}</pre>
+	{/if}
+	{#if ln.attachmentCount}
+		<div class="line-foot row">
+			<Text tone="faint" size="xs"
+				>{m.conversation_attachment_count({ count: ln.attachmentCount })}</Text
+			>
+		</div>
 	{/if}
 	{#if uploadRefs && uploadRefs.names.length}
 		<UserAttachments refs={uploadRefs} ts={ln.ts} {archived} />
@@ -251,6 +268,16 @@
 			     token breakdown (no Σ; that's the conversation-wide aggregate). -->
 			{#if dur}<Text tone="faint" size="xs">⏱ {dur}</Text>{/if}
 			{#if ln.usage}<TokenUsage usage={ln.usage} showSum={false} />{/if}
+		</div>
+	{/if}
+	{#if ln.stopHook}
+		<div class="line-foot row"><Text tone="faint" size="xs">⏹ {ln.stopHook}</Text></div>
+	{/if}
+	{#if ln.fileHistory?.length}
+		<div class="line-foot row">
+			<Text tone="faint" size="xs" title={ln.fileHistory.join('\n')}
+				>✎ {ln.fileHistory.length}</Text
+			>
 		</div>
 	{/if}
 </div>
@@ -431,6 +458,26 @@
 		border-color: var(--border);
 		color: var(--text-faint);
 		font-size: var(--fs-xs);
+	}
+	/* Markers are bookkeeping, not messages: one quiet line, no bubble, and the
+	   timestamp only on hover so a burst of them cannot dominate the log. */
+	.line.marker .marker-body {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--sp-2);
+		color: var(--text-faint);
+		font-size: var(--fs-xs);
+		line-height: 1.4;
+	}
+	.line.marker .marker-item::before {
+		content: '· ';
+	}
+	.line.marker .marker-ts {
+		visibility: hidden;
+	}
+	.line.marker:hover .marker-ts,
+	.line.marker:focus-within .marker-ts {
+		visibility: visible;
 	}
 	/* Optimistic reply: muted/amber until the agent acknowledges, then it
 	   settles into the regular green user tint above. */

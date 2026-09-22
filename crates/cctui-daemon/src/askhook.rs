@@ -21,6 +21,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::dangerous_rm::dangerous_removal;
+
 /// Run the hook for `event` (`"pre"` = question appeared, `"post"` = answered).
 ///
 /// Always returns `Ok(())` — a delivery failure must not break the user's
@@ -205,8 +207,44 @@ fn enter_plan_mode_decision(payload: &Value, whip: bool) -> Option<Value> {
     }))
 }
 
+/// Refuse a `Bash` call in `bypassPermissions` whose `rm`/`rmdir` would trip
+/// Claude Code's `dangerousRemoval` check. That check is bypass-immune, so it
+/// renders a prompt even in yolo/whip, where nothing answers it and the worker
+/// parks. Denying instead hands the agent a rewrite it can retry immediately.
+/// `None` (defer) for every other command and every other mode.
+fn bypass_rm_decision(payload: &Value, tool: &str) -> Option<Value> {
+    if tool != "Bash" {
+        return None;
+    }
+    if payload.get("permission_mode").and_then(Value::as_str) != Some("bypassPermissions") {
+        return None;
+    }
+    let command =
+        payload.get("tool_input").and_then(|t| t.get("command")).and_then(Value::as_str)?;
+    let found = dangerous_removal(command, payload.get("cwd").and_then(Value::as_str))?;
+    Some(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": format!(
+                "Refused: this rm targets {} (`{}`), which trips Claude Code's bypass-immune \
+                 dangerousRemoval check — it cannot be auto-approved and would park this session \
+                 on a prompt nobody can answer.\nRewrite it with an explicit, literal target — \
+                 e.g. `find \"$D\" -maxdepth 1 -name '*.json' -delete` or \
+                 `rm -f -- \"${{D:?}}\"/*.json` — and retry.",
+                found.risk.description(),
+                found.target,
+            ),
+        },
+    }))
+}
+
 fn run_perm(sock: &Path, session_id: &str, payload: &Value) {
     let tool = payload.get("tool_name").and_then(Value::as_str).unwrap_or_default();
+    if let Some(decision) = bypass_rm_decision(payload, tool) {
+        println!("{decision}");
+        return;
+    }
     // AskUserQuestion is answered via its own hook + the reply path, and in
     // `bypassPermissions` (yolo) mode no prompt should ever render — see
     // `perm_hook_defers`. Both cases defer immediately so we never park here.
@@ -513,6 +551,64 @@ mod tests {
         // AskUserQuestion is never a tool permission, in any mode.
         assert!(perm_hook_defers(&json!({"permission_mode": "default"}), "AskUserQuestion"));
         assert!(perm_hook_defers(&json!({}), "AskUserQuestion"));
+    }
+
+    fn bash_payload(mode: &str, command: &str) -> Value {
+        json!({
+            "session_id": "c4f46329-163c-4faf-a72a-6e49168d1b88",
+            "transcript_path": "/home/dorsk/.claude/projects/repo/c4f46329.jsonl",
+            "cwd": "/home/dorsk/Documents/repo",
+            "permission_mode": mode,
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command, "description": "clean cache"},
+        })
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn bypass_denies_dangerous_rm_with_guidance() {
+        let payload = bash_payload(
+            "bypassPermissions",
+            "D=~/.claude/artifacts/win; mkdir -p $D; rm -f $D/*.json",
+        );
+        let decision = bypass_rm_decision(&payload, "Bash").expect("deny");
+        let out = &decision["hookSpecificOutput"];
+        assert_eq!(out["hookEventName"], "PreToolUse");
+        assert_eq!(out["permissionDecision"], "deny");
+        let reason = out["permissionDecisionReason"].as_str().unwrap();
+        assert!(reason.contains("$D/*.json"), "{reason}");
+        assert!(reason.contains("dangerousRemoval"), "{reason}");
+        assert!(reason.contains("-name '*.json' -delete"), "{reason}");
+        assert!(reason.contains("${D:?}"), "{reason}");
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn bypass_defers_ordinary_commands() {
+        let payload = bash_payload("bypassPermissions", "cargo test -p cctui-daemon");
+        assert!(bypass_rm_decision(&payload, "Bash").is_none());
+        assert!(perm_hook_defers(&payload, "Bash"));
+
+        let safe = bash_payload("bypassPermissions", r#"rm -f -- "${D:?}"/*.json"#);
+        assert!(bypass_rm_decision(&safe, "Bash").is_none());
+        assert!(perm_hook_defers(&safe, "Bash"));
+    }
+
+    #[test]
+    fn dangerous_rm_outside_bypass_is_unchanged() {
+        for mode in ["default", "acceptEdits", "plan"] {
+            let payload = bash_payload(mode, "rm -rf $D");
+            assert!(bypass_rm_decision(&payload, "Bash").is_none(), "{mode}");
+            assert!(!perm_hook_defers(&payload, "Bash"), "{mode}");
+        }
+    }
+
+    #[test]
+    fn non_bash_tools_are_never_rm_denied() {
+        let mut payload = bash_payload("bypassPermissions", "rm -rf $D");
+        payload["tool_name"] = json!("Edit");
+        assert!(bypass_rm_decision(&payload, "Edit").is_none());
     }
 
     #[test]

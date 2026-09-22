@@ -2,15 +2,6 @@ import type { Query, Schema, ValueOption } from '@dorsk/tsumikit';
 import { filters } from '@dorsk/tsumikit';
 import { endpoints } from '$lib/queries';
 
-const QUOTE_RE = /[\s,()]/;
-
-// Empty path keeps the bare `cwd:` prefix so focus lands on the value step
-// (recent dirs) instead of re-offering the field.
-export function cwdToQuery(dir: string): string {
-	if (!dir) return 'cwd:';
-	return `cwd:${QUOTE_RE.test(dir) ? `"${dir}"` : dir}`;
-}
-
 export function dirFromQuery(q: Query): string {
 	return filters(q).find((f) => f.field === 'cwd')?.values[0] ?? '';
 }

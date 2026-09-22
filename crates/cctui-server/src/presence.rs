@@ -289,6 +289,19 @@ mod tests {
         )
     }
 
+    fn prefix(tag: &str) -> String {
+        format!("cct1070-{tag}-{}-", Uuid::new_v4().simple())
+    }
+
+    /// `live_peer_pods` is unscoped by design — in production every `pods` row
+    /// is a real peer — so on a shared test database it also returns other
+    /// tests' pods. Assert against this test's own IPs only.
+    async fn live_peer_ips(pool: &PgPool, self_pod: &str, prefix: &str) -> Vec<String> {
+        let mut ips = live_peer_pods(pool, self_pod).await;
+        ips.retain(|ip| ip.starts_with(prefix));
+        ips
+    }
+
     async fn wipe(pool: &PgPool, prefix: &str) {
         let like = format!("{prefix}%");
         sqlx::query("DELETE FROM pods WHERE pod LIKE $1").bind(&like).execute(pool).await.unwrap();
@@ -334,19 +347,19 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_re_registers_a_reaped_pods_row() {
         let Some(pool) = pool().await else { return };
-        let prefix = "cct976-rereg-";
-        wipe(&pool, prefix).await;
-        let a = PodIdentity::for_test(&format!("{prefix}a"), "10.0.0.1");
-        let b = PodIdentity::for_test(&format!("{prefix}b"), "10.0.0.2");
+        let prefix = prefix("rereg");
+        let ip_a = format!("{prefix}10.0.0.1");
+        let a = PodIdentity::for_test(&format!("{prefix}a"), &ip_a);
+        let b = PodIdentity::for_test(&format!("{prefix}b"), &format!("{prefix}10.0.0.2"));
 
         heartbeat_tick(&pool, &a).await;
         assert!(pod_exists(&pool, &a.pod).await);
         sqlx::query("DELETE FROM pods WHERE pod = $1").bind(&a.pod).execute(&pool).await.unwrap();
-        assert!(live_peer_pods(&pool, &b.pod).await.is_empty());
+        assert!(live_peer_ips(&pool, &b.pod, &prefix).await.is_empty());
 
         heartbeat_tick(&pool, &a).await;
-        assert_eq!(live_peer_pods(&pool, &b.pod).await, vec!["10.0.0.1".to_owned()]);
-        wipe(&pool, prefix).await;
+        assert_eq!(live_peer_ips(&pool, &b.pod, &prefix).await, vec![ip_a]);
+        wipe(&pool, &prefix).await;
     }
 
     /// The reap deletes stale peers but never this pod's own row, even when
@@ -354,11 +367,11 @@ mod tests {
     #[tokio::test]
     async fn reap_skips_self_and_removes_stale_peers() {
         let Some(pool) = pool().await else { return };
-        let prefix = "cct976-reap-";
-        wipe(&pool, prefix).await;
-        let a = PodIdentity::for_test(&format!("{prefix}a"), "10.0.1.1");
-        let b = PodIdentity::for_test(&format!("{prefix}b"), "10.0.1.2");
-        let c = PodIdentity::for_test(&format!("{prefix}c"), "10.0.1.3");
+        let prefix = prefix("reap");
+        let ip_a = format!("{prefix}10.0.1.1");
+        let a = PodIdentity::for_test(&format!("{prefix}a"), &ip_a);
+        let b = PodIdentity::for_test(&format!("{prefix}b"), &format!("{prefix}10.0.1.2"));
+        let c = PodIdentity::for_test(&format!("{prefix}c"), &format!("{prefix}10.0.1.3"));
         for p in [&a, &b, &c] {
             heartbeat_tick(&pool, p).await;
         }
@@ -369,8 +382,8 @@ mod tests {
         assert!(pod_exists(&pool, &a.pod).await, "a must never reap itself");
         assert!(!pod_exists(&pool, &b.pod).await, "stale peer b is reaped");
         assert!(pod_exists(&pool, &c.pod).await, "live peer c is kept");
-        assert_eq!(live_peer_pods(&pool, &c.pod).await, vec!["10.0.1.1".to_owned()]);
-        wipe(&pool, prefix).await;
+        assert_eq!(live_peer_ips(&pool, &c.pod, &prefix).await, vec![ip_a]);
+        wipe(&pool, &prefix).await;
     }
 
     /// Owned `ws_presence` rows are re-upserted on every tick, so a reaped row
@@ -378,18 +391,19 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_restores_owned_ws_rows_without_stealing_peer_rows() {
         let Some(pool) = pool().await else { return };
-        let prefix = "cct976-ws-";
-        wipe(&pool, prefix).await;
-        let a = PodIdentity::for_test(&format!("{prefix}a"), "10.0.2.1");
+        let prefix = prefix("ws");
+        let ip_a = format!("{prefix}10.0.2.1");
+        let a = PodIdentity::for_test(&format!("{prefix}a"), &ip_a);
         let reaped = Uuid::new_v4();
         let moved = Uuid::new_v4();
         a.owned.insert((Kind::Daemon, reaped), ());
         a.owned.insert((Kind::Session, moved), ());
         sqlx::query(
-            "INSERT INTO ws_presence (kind, entity_id, pod, pod_ip) VALUES ('session', $1, $2, '10.0.2.2')",
+            "INSERT INTO ws_presence (kind, entity_id, pod, pod_ip) VALUES ('session', $1, $2, $3)",
         )
         .bind(moved)
         .bind(format!("{prefix}b"))
+        .bind(format!("{prefix}10.0.2.2"))
         .execute(&pool)
         .await
         .unwrap();
@@ -402,8 +416,8 @@ mod tests {
         );
         assert_eq!(
             peer_owner_ip(&pool, &format!("{prefix}b"), Kind::Daemon, reaped).await.as_deref(),
-            Some("10.0.2.1")
+            Some(ip_a.as_str())
         );
-        wipe(&pool, prefix).await;
+        wipe(&pool, &prefix).await;
     }
 }

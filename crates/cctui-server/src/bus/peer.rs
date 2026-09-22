@@ -504,6 +504,7 @@ mod tests {
                 ask_picks: None,
                 env: std::collections::BTreeMap::new(),
                 command_id: None,
+                turn_id: None,
             }),
         };
         assert_eq!(frame_session(&reply), Some("sess-1"));

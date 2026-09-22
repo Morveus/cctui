@@ -109,6 +109,23 @@ describe('watchdog (CCT-1048)', () => {
 		c.disconnect();
 	});
 
+	it('the server heartbeat rearms the window with no other traffic', () => {
+		const c = openClient();
+		const sock = last();
+
+		for (let i = 0; i < 15; i++) {
+			vi.advanceTimersByTime(20_000);
+			sock.deliver({ type: 'heartbeat' });
+		}
+
+		expect(sock.closed).toBe(false);
+		expect(sockets).toHaveLength(1);
+
+		vi.advanceTimersByTime(WATCHDOG_MS + 1);
+		expect(sockets).toHaveLength(2);
+		c.disconnect();
+	});
+
 	it('stops watching once disconnected', () => {
 		const c = openClient();
 		c.disconnect();

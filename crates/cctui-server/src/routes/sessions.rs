@@ -278,6 +278,22 @@ pub const fn attention_from_bucket(bucket: Bucket) -> Option<Attention> {
     }
 }
 
+/// Newest `message` event per listed session.
+///
+/// `event_type = 'message'` must stay character-identical to the predicate of
+/// `idx_stream_events_latest_message` (migration 118); narrowing it here (a
+/// role filter, say) without narrowing the index costs the single probe. The
+/// per-session `LIMIT 1` is the other half: any shape that groups or sorts the
+/// whole fan-out instead reads every message row of every listed session.
+const LAST_MESSAGE_SQL: &str = "SELECT s.session_id, e.payload, e.created_at \
+     FROM unnest($1::text[]) AS s(session_id) \
+     JOIN LATERAL ( \
+         SELECT se.payload, se.created_at FROM stream_events se \
+         WHERE se.session_id = s.session_id AND se.event_type = 'message' \
+         ORDER BY se.created_at DESC \
+         LIMIT 1 \
+     ) e ON true";
+
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 pub async fn list_sessions(
     State(state): State<AppState>,
@@ -616,24 +632,19 @@ async fn enrich_and_sort(
         }
     }
 
-    // Last message text + timestamp per session, from stream_events.
-    // `event_type = 'message'` is also the predicate of the partial index
-    // `idx_stream_events_latest_message`; narrowing it here (a role filter,
-    // say) without narrowing the index costs the per-session single probe.
     if !session_ids.is_empty() {
-        let rows: Vec<(String, serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT DISTINCT ON (session_id) session_id, payload, created_at \
-             FROM stream_events \
-             WHERE session_id = ANY($1) AND event_type = 'message' \
-             ORDER BY session_id, created_at DESC",
-        )
-        .bind(&session_ids)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(|e| {
-            tracing::error!("db error (last message lookup): {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "database error".into() }))
-        })?;
+        let rows: Vec<(String, serde_json::Value, DateTime<Utc>)> =
+            sqlx::query_as(LAST_MESSAGE_SQL)
+                .bind(&session_ids)
+                .fetch_all(&state.pool)
+                .await
+                .map_err(|e| {
+                    tracing::error!("db error (last message lookup): {e}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiError { error: "database error".into() }),
+                    )
+                })?;
         let mut by_session: std::collections::HashMap<String, (Option<String>, DateTime<Utc>)> =
             std::collections::HashMap::new();
         for (sid, payload, ts) in rows {
@@ -1646,16 +1657,74 @@ pub enum ConversationOrder {
 const fn conversation_sql(order: ConversationOrder) -> &'static str {
     match order {
         ConversationOrder::Desc => {
-            "SELECT id, event_type, payload, created_at FROM stream_events \
+            "SELECT id, event_type, payload, created_at, turn_id FROM stream_events \
              WHERE session_id = $1 AND ($2::bigint IS NULL OR id < $2) \
                AND ($4::bigint IS NULL OR id > $4) \
              ORDER BY id DESC LIMIT $3"
         }
         ConversationOrder::Asc => {
-            "SELECT id, event_type, payload, created_at FROM stream_events \
+            "SELECT id, event_type, payload, created_at, turn_id FROM stream_events \
              WHERE session_id = $1 AND ($2::bigint IS NULL OR id < $2) \
                AND ($4::bigint IS NULL OR id > $4) \
              ORDER BY id ASC LIMIT $3"
+        }
+    }
+}
+
+/// `(id, event_type, payload, created_at, turn_id)` — the column list of
+/// [`conversation_sql`], in order.
+type ConversationRow = (i64, String, serde_json::Value, DateTime<Utc>, Option<uuid::Uuid>);
+
+/// `(id, client payload, created_at, turn_id)`: a stored row the client can
+/// render, in the query's own order (newest-first for `Desc`).
+type RenderableRow = (i64, serde_json::Value, DateTime<Utc>, Option<uuid::Uuid>);
+
+/// Reads rows until `limit` of them survive [`crate::normalize::for_client`],
+/// or the table is exhausted in the paging direction. Some stored rows carry
+/// nothing renderable (turn bookkeeping, unknown roles); counting the limit
+/// against raw rows let them shorten a page, which the client reads as "end of
+/// transcript". Callers may rely on it: a page shorter than `limit` has no
+/// more rows beyond it.
+///
+/// Orders by `id` (the BIGSERIAL insert sequence), not `created_at`: `id` is
+/// the causal `seq` and a strict total order, so a late-flushed
+/// `AskUserQuestion` card+preamble keep their insert position even when their
+/// `created_at` ties or lands after the user's answer.
+async fn fetch_renderable_rows(
+    pool: &sqlx::PgPool,
+    session_id: &str,
+    adapter_id: &str,
+    params: &ConversationQuery,
+) -> Result<Vec<RenderableRow>, sqlx::Error> {
+    let limit = params.limit.map(|l| l.clamp(1, 10_000));
+    let mut before = params.before;
+    let mut after = params.after;
+    let mut out: Vec<RenderableRow> = Vec::new();
+    loop {
+        let want = limit.map(|l| l - i64::try_from(out.len()).unwrap_or(i64::MAX));
+        let rows: Vec<ConversationRow> = sqlx::query_as(conversation_sql(params.order))
+            .bind(session_id)
+            .bind(before)
+            .bind(want)
+            .bind(after)
+            .fetch_all(pool)
+            .await?;
+        let fetched = i64::try_from(rows.len()).unwrap_or(i64::MAX);
+        let last_id = rows.last().map(|r| r.0);
+        out.extend(rows.into_iter().filter_map(
+            |(id, event_type, payload, created_at, turn_id)| {
+                crate::normalize::for_client(adapter_id, &event_type, payload)
+                    .map(|v| (id, v, created_at, turn_id))
+            },
+        ));
+        let Some(limit) = limit else { return Ok(out) };
+        let exhausted = want.is_some_and(|w| fetched < w);
+        if exhausted || out.len() >= usize::try_from(limit).unwrap_or(usize::MAX) {
+            return Ok(out);
+        }
+        match params.order {
+            ConversationOrder::Desc => before = last_id,
+            ConversationOrder::Asc => after = last_id,
         }
     }
 }
@@ -1672,25 +1741,13 @@ pub async fn get_conversation(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "database error".into() }))
         })?;
 
-    // Order by `id` (the BIGSERIAL insert sequence), not `created_at`: `id` is
-    // the causal `seq` and is a strict total order, so a late-flushed
-    // AskUserQuestion card+preamble keep their insert position even when their
-    // `created_at` ties or lands after the user's answer.
-    let mut rows: Vec<(i64, String, serde_json::Value, DateTime<Utc>)> =
-        sqlx::query_as(conversation_sql(params.order))
-            .bind(&session_id)
-            .bind(params.before)
-            .bind(params.limit.map(|l| l.clamp(1, 10_000)))
-            .bind(params.after)
-            .fetch_all(&state.pool)
-            .await
-            .map_err(|e| {
-                tracing::error!("db error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError { error: "database error".into() }),
-                )
-            })?;
+    let adapter_id = adapter.as_deref().unwrap_or("claude-code");
+    let mut rows = fetch_renderable_rows(&state.pool, &session_id, adapter_id, &params)
+        .await
+        .map_err(|e| {
+            tracing::error!("db error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "database error".into() }))
+        })?;
     if params.order == ConversationOrder::Desc {
         rows.reverse();
     }
@@ -1731,28 +1788,26 @@ pub async fn get_conversation(
         })
         .collect();
 
-    let adapter_id = adapter.as_deref().unwrap_or("claude-code");
     // Stamp each event with `ts` (unix millis, matching the live `AgentEvent`
     // shape) derived from `created_at`, so the client renders real timestamps
     // instead of "Invalid Date". Legacy payloads that already carry `ts` keep
     // their own value.
     let normalized: Vec<serde_json::Value> = rows
         .into_iter()
-        .filter_map(|(id, event_type, payload, created_at)| {
-            crate::normalize::for_client(adapter_id, &event_type, payload).map(|mut v| {
-                if let Some(obj) = v.as_object_mut() {
-                    obj.entry("ts")
-                        .or_insert_with(|| serde_json::json!(created_at.timestamp_millis()));
-                    obj.insert("seq".to_owned(), serde_json::json!(id));
-                    if let Some(message_id) =
-                        obj.get("message_id").and_then(serde_json::Value::as_str)
-                        && let Some(usage) = usage_by_message.get(message_id)
-                    {
-                        obj.insert("usage".to_owned(), serde_json::json!(usage));
-                    }
+        .map(|(id, mut v, created_at, turn_id)| {
+            if let Some(obj) = v.as_object_mut() {
+                obj.entry("ts").or_insert_with(|| serde_json::json!(created_at.timestamp_millis()));
+                obj.insert("seq".to_owned(), serde_json::json!(id));
+                if let Some(turn_id) = turn_id {
+                    obj.insert("turn_id".to_owned(), serde_json::json!(turn_id));
                 }
-                v
-            })
+                if let Some(message_id) = obj.get("message_id").and_then(serde_json::Value::as_str)
+                    && let Some(usage) = usage_by_message.get(message_id)
+                {
+                    obj.insert("usage".to_owned(), serde_json::json!(usage));
+                }
+            }
+            v
         })
         .collect();
     Ok(crate::http_cache::json_with_etag(&req_headers, &normalized))
@@ -1809,6 +1864,7 @@ pub async fn send_message(
             ask_picks: None,
             env,
             command_id: Some(command_id),
+            turn_id: req.turn_id,
         },
     )
     .await;
@@ -2514,14 +2570,12 @@ pub async fn archive_one(
         }
     }
     dispatch_remove(state, session_id).await;
-    // Archive the session AND any Task-tool subagents nested under it:
-    // a parent's children should never outlive it in the list.
-    // Subagents are observe-only (no worker), so they need no `claude rm` —
-    // only the parent does, handled by the dispatch above. Archiving a
-    // *child* does not touch the parent (no `parent_id` cascade upward).
-    // A pinned child is never swept along with its parent unless forced.
-    let children: Vec<String> =
-        crate::store::sessions::child_ids(&state.pool, session_id).await.unwrap_or_default();
+    // Archive the session AND every child nested under it: a parent's
+    // children should never outlive it in the list. Archiving a *child* does
+    // not touch the parent (no `parent_id` cascade upward), and a pinned child
+    // is never swept along with its parent unless forced.
+    let children =
+        crate::store::sessions::children(&state.pool, session_id).await.unwrap_or_default();
     // Clear the classifier signals on archive so a session that was waiting on
     // input doesn't keep its ✋ "needs input" glyph in the archived view — an
     // archived session is, by definition, no longer waiting on anyone.
@@ -2535,7 +2589,14 @@ pub async fn archive_one(
     .bind(force)
     .fetch_all(&state.pool)
     .await?;
-    let children: Vec<String> = children.into_iter().filter(|c| archived.contains(c)).collect();
+    // Task-tool subagents are observe-only and covered by the parent's
+    // `Remove`; CctuiAgent children and forks own a claude job each, which
+    // stays in `claude agents` until removed.
+    for child in crate::store::sessions::job_children(&children, &archived) {
+        dispatch_remove(state, child).await;
+    }
+    let children: Vec<String> =
+        children.into_iter().map(|c| c.id).filter(|c| archived.contains(c)).collect();
     {
         let mut registry = state.registry.write().await;
         registry.deregister(session_id);
@@ -2885,6 +2946,137 @@ mod tests {
             ).unwrap(),
         }))
         .unwrap()
+    }
+
+    async fn seeded_session(test_name: &str) -> Option<(sqlx::PgPool, String)> {
+        let url = crate::routes::gateway::test_db_url(test_name)?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect test db");
+        let uid = uuid::Uuid::new_v4();
+        let machine = uuid::Uuid::new_v4();
+        let sid = format!("cct1086-{}", uuid::Uuid::new_v4());
+        sqlx::query("INSERT INTO users (id, name, key_hash) VALUES ($1, $2, $3)")
+            .bind(uid)
+            .bind(format!("u-{uid}"))
+            .bind(format!("k-{uid}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO machines (id, user_id, name, key_hash) VALUES ($1, $2, 'm', $3)")
+            .bind(machine)
+            .bind(uid)
+            .bind(format!("mk-{machine}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, machine_id, machine_uuid, user_id, working_dir, status) \
+             VALUES ($1, $2, $2, $3, '/w', 'active')",
+        )
+        .bind(&sid)
+        .bind(machine)
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Renderable assistant lines interleaved with turn bookkeeping the
+        // client never sees; the newest row is bookkeeping, as after any
+        // completed turn.
+        let payloads = [
+            serde_json::json!({"role": "assistant", "text": "one"}),
+            serde_json::json!({"role": "no_such_role", "text": "hidden a"}),
+            serde_json::json!({"role": "assistant", "text": "two"}),
+            serde_json::json!({"role": "assistant", "text": "three"}),
+            serde_json::json!({"role": "no_such_role", "text": "hidden b"}),
+            serde_json::json!({"role": "assistant", "text": "four"}),
+            serde_json::json!({"role": "no_such_role", "text": "hidden c"}),
+        ];
+        for p in payloads {
+            sqlx::query(
+                "INSERT INTO stream_events (session_id, event_type, payload) VALUES ($1, 'message', $2)",
+            )
+            .bind(&sid)
+            .bind(p)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        Some((pool, sid))
+    }
+
+    fn contents(rows: &[super::RenderableRow]) -> Vec<String> {
+        rows.iter().map(|(_, v, _, _)| v["content"].as_str().unwrap().to_owned()).collect()
+    }
+
+    #[tokio::test]
+    async fn conversation_page_counts_the_limit_against_renderable_rows() {
+        let Some((pool, sid)) =
+            seeded_session("conversation_page_counts_the_limit_against_renderable_rows").await
+        else {
+            return;
+        };
+        let page = |limit, before, order| {
+            let params =
+                super::ConversationQuery { limit: Some(limit), before, after: None, order };
+            let pool = pool.clone();
+            let sid = sid.clone();
+            async move {
+                super::fetch_renderable_rows(&pool, &sid, "claude-code", &params).await.unwrap()
+            }
+        };
+
+        let newest = page(1, None, super::ConversationOrder::Desc).await;
+        assert_eq!(contents(&newest), ["four"]);
+
+        let tail = page(3, None, super::ConversationOrder::Desc).await;
+        assert_eq!(contents(&tail), ["four", "three", "two"]);
+
+        let rest = page(3, Some(tail.last().unwrap().0), super::ConversationOrder::Desc).await;
+        assert_eq!(contents(&rest), ["one"], "a short page means the transcript is exhausted");
+
+        let head = page(2, None, super::ConversationOrder::Asc).await;
+        assert_eq!(contents(&head), ["one", "two"]);
+
+        let all = super::fetch_renderable_rows(
+            &pool,
+            &sid,
+            "claude-code",
+            &super::ConversationQuery::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(contents(&all), ["four", "three", "two", "one"], "unlimited fetch, query order");
+    }
+
+    #[test]
+    fn last_message_sql_probes_once_per_session_under_the_partial_index() {
+        let sql = super::LAST_MESSAGE_SQL;
+        let migration =
+            include_str!("../../../../migrations/118_stream_events_latest_message.up.sql");
+
+        assert!(
+            migration.contains("WHERE event_type = 'message'"),
+            "migration 118 no longer carries the predicate this query is written against"
+        );
+        assert!(
+            sql.contains("event_type = 'message'"),
+            "the query must repeat the index predicate character for character"
+        );
+        assert!(
+            sql.contains("JOIN LATERAL") && sql.contains("LIMIT 1"),
+            "the per-session LIMIT 1 is what makes each session one index probe"
+        );
+        assert!(
+            !sql.contains("DISTINCT ON"),
+            "DISTINCT ON reads every message row of every listed session"
+        );
+        assert!(
+            !sql.contains("role"),
+            "a role filter here without the same filter in migration 118 loses the index"
+        );
     }
 
     #[test]

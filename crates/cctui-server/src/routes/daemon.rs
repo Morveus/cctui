@@ -548,13 +548,10 @@ async fn handle(socket: WebSocket, state: AppState, machine_id: Uuid, user_id: U
 
     // Resume marks must follow Reconcile: the daemon needs its adapters live to
     // route the marks to before it can clamp their tail cursors.
-    let archived = load_archived(&state, machine_id).await.unwrap_or_else(|err| {
-        tracing::error!(%err, "load_archived failed");
-        Vec::new()
-    });
     match load_resume_marks(&state, machine_id).await {
-        Ok(session_marks) if !session_marks.is_empty() || !archived.is_empty() => {
-            if tx.send(DaemonFrameDown::ResumeMarks { session_marks, archived }).await.is_err() {
+        Ok(session_marks) if !session_marks.is_empty() => {
+            let frame = DaemonFrameDown::ResumeMarks { session_marks, archived: Vec::new() };
+            if tx.send(frame).await.is_err() {
                 tracing::warn!("daemon tx closed before resume marks");
             }
         }
@@ -955,7 +952,7 @@ async fn process_frame(
             resolve_read_file_result(state, request_id, ok, file, error_kind, error);
             Ok(())
         }
-        DaemonFrameUp::Heartbeat { bandwidth, update_hook, resources, .. } => {
+        DaemonFrameUp::Heartbeat { bandwidth, update_hook, resources, claude_jobs, .. } => {
             // A daemon too old to advertise omits the field; leave the stored
             // flag alone rather than reading silence as "no hook".
             if let Some(has_hook) = update_hook {
@@ -985,6 +982,10 @@ async fn process_frame(
             }
             if let Some(resources) = resources {
                 crate::machine_resources::record_and_broadcast(state, machine_id, resources).await;
+            }
+            // Only a daemon that reports its jobs can parse the reply.
+            if let Some(shorts) = claude_jobs {
+                reconcile_claude_jobs(state, machine_id, &shorts).await;
             }
             Ok(())
         }
@@ -1075,8 +1076,12 @@ async fn handle_event(
         | AdapterEvent::Status { local_id, .. } => Some(local_id.clone()),
         _ => None,
     };
+    let event_turn_id = match &event {
+        AdapterEvent::Message { turn_id, .. } => *turn_id,
+        _ => None,
+    };
     let broadcast_pair: Option<(String, cctui_proto::ws::AgentEvent)> = match &event {
-        AdapterEvent::Message { local_id, payload } => {
+        AdapterEvent::Message { local_id, payload, .. } => {
             crate::normalize::to_agent_event(adapter_id, "message", payload)
                 .map(|ae| (local_id.clone(), ae))
         }
@@ -1136,13 +1141,13 @@ async fn handle_event(
             }
             crate::auto_archive::claim_intent(state, &local_id, spawn_key_hint.as_deref()).await;
         }
-        AdapterEvent::Message { local_id, payload } => {
-            inserted_seq = insert_event(state, &local_id, "message", payload).await?;
+        AdapterEvent::Message { local_id, payload, turn_id } => {
+            inserted_seq = insert_event(state, &local_id, "message", payload, turn_id).await?;
             newly_inserted = inserted_seq.is_some();
             note_insert(state, machine_id, newly_inserted);
         }
         AdapterEvent::ToolUse { local_id, payload } => {
-            inserted_seq = insert_event(state, &local_id, "tool_use", payload).await?;
+            inserted_seq = insert_event(state, &local_id, "tool_use", payload, None).await?;
             newly_inserted = inserted_seq.is_some();
             note_insert(state, machine_id, newly_inserted);
         }
@@ -1375,6 +1380,7 @@ async fn handle_event(
             intent,
             model,
             effort,
+            permission_mode,
             children,
         } => {
             // Persist the classifier signals + display metadata so
@@ -1392,6 +1398,9 @@ async fn handle_event(
                     intent: intent.as_deref(),
                     model: model.as_deref(),
                     effort: effort.as_deref(),
+                    permission_mode: permission_mode
+                        .and_then(|m| serde_json::to_value(m).ok())
+                        .and_then(|v| v.as_str().map(str::to_owned)),
                     children: &children,
                 },
             )
@@ -1450,6 +1459,9 @@ async fn handle_event(
         if let Some(seq) = inserted_seq {
             data.set_seq(seq);
         }
+        if let Some(turn_id) = event_turn_id {
+            data.set_turn_id(turn_id);
+        }
         state.bus.publish_server(cctui_proto::ws::ServerEvent::Stream { session_id, data });
     }
     Ok(())
@@ -1475,6 +1487,7 @@ struct StatusSignals<'a> {
     intent: Option<&'a str>,
     model: Option<&'a str>,
     effort: Option<&'a str>,
+    permission_mode: Option<String>,
     children: &'a [cctui_proto::adapter::SessionChild],
 }
 
@@ -1544,6 +1557,7 @@ async fn update_status_signals(
             intent = COALESCE($6, sessions.intent), \
             model = COALESCE(sessions.model, $7), \
             effort = COALESCE($8, sessions.effort), \
+            permission_mode = COALESCE($11, sessions.permission_mode), \
             children = CASE WHEN jsonb_array_length($9) > 0 THEN $9 ELSE sessions.children END \
          FROM prev \
          WHERE sessions.id = prev.id \
@@ -1559,6 +1573,7 @@ async fn update_status_signals(
     .bind(s.effort)
     .bind(children)
     .bind(decorated.as_deref())
+    .bind(s.permission_mode.as_deref())
     .fetch_optional(&state.pool)
     .await?;
 
@@ -1931,6 +1946,7 @@ async fn insert_event(
     local_id: &str,
     event_type: &str,
     mut payload: serde_json::Value,
+    turn_id: Option<uuid::Uuid>,
 ) -> anyhow::Result<Option<i64>> {
     // Postgres jsonb/text cannot store the NUL code point (`\0`); a
     // payload carrying one (e.g. binary-ish tool output) fails the INSERT and
@@ -1945,15 +1961,20 @@ async fn insert_event(
     // `WHERE EXISTS` makes that case a clean no-op (0 rows) instead — when the
     // session is present this is identical to the old insert.
     let links = crate::routes::fs::extract_links(&payload);
+    // The ON CONFLICT target must stay character-identical to migration 123's
+    // `stream_events_dedup_turn_idx` expression list or inference fails.
     let id: Option<i64> = sqlx::query_scalar(
-        "INSERT INTO stream_events (session_id, event_type, payload) \
-         SELECT $1, $2, $3 WHERE EXISTS (SELECT 1 FROM sessions WHERE id = $1) \
-         ON CONFLICT (session_id, event_type, content_hash) DO NOTHING \
+        "INSERT INTO stream_events (session_id, event_type, payload, turn_id) \
+         SELECT $1, $2, $3, $4 WHERE EXISTS (SELECT 1 FROM sessions WHERE id = $1) \
+         ON CONFLICT (session_id, event_type, content_hash, \
+                      COALESCE(turn_id, '00000000-0000-0000-0000-000000000000'::uuid)) \
+         DO NOTHING \
          RETURNING id",
     )
     .bind(local_id)
     .bind(event_type)
     .bind(payload)
+    .bind(turn_id)
     .fetch_optional(&state.pool)
     .await?;
     if id.is_some() {
@@ -2104,7 +2125,9 @@ async fn persist_session_end(
     sqlx::query(
         "INSERT INTO stream_events (session_id, event_type, payload) \
          SELECT $1, 'session_ended', $2 WHERE EXISTS (SELECT 1 FROM sessions WHERE id = $1) \
-         ON CONFLICT (session_id, event_type, content_hash) DO NOTHING",
+         ON CONFLICT (session_id, event_type, content_hash, \
+                      COALESCE(turn_id, '00000000-0000-0000-0000-000000000000'::uuid)) \
+         DO NOTHING",
     )
     .bind(local_id)
     .bind(&payload)
@@ -2168,18 +2191,46 @@ pub async fn load_resume_marks(
     Ok(rows.into_iter().map(|(id, off)| (id, u64::try_from(off).unwrap_or(0))).collect())
 }
 
-/// Archived claude-code sessions on `machine_id`, newest first. The daemon
-/// removes any job still on disk for one of these, converging a machine whose
-/// removals were lost. Bounded so the frame stays small on a long-lived machine.
-pub async fn load_archived(state: &AppState, machine_id: Uuid) -> anyhow::Result<Vec<String>> {
-    Ok(sqlx::query_scalar(
+/// Among the claude job `shorts` a daemon reports on disk, the sessions this
+/// machine has archived. The daemon removes their jobs so `claude agents`
+/// converges on the archive state.
+pub async fn archived_jobs(
+    pool: &sqlx::PgPool,
+    machine_id: Uuid,
+    shorts: &[String],
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
         "SELECT id FROM sessions \
          WHERE machine_uuid = $1 AND status = 'archived' AND adapter_id = 'claude-code' \
-         ORDER BY COALESCE(ended_at, last_heartbeat) DESC LIMIT 500",
+           AND left(id, 8) = ANY($2)",
     )
     .bind(machine_id)
-    .fetch_all(&state.pool)
-    .await?)
+    .bind(shorts)
+    .fetch_all(pool)
+    .await
+}
+
+/// Answer a heartbeat's `claude_jobs` with the archived subset, if any.
+async fn reconcile_claude_jobs(state: &AppState, machine_id: Uuid, shorts: &[String]) {
+    if shorts.is_empty() {
+        return;
+    }
+    let session_ids = match archived_jobs(&state.pool, machine_id, shorts).await {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!(%err, %machine_id, "archived job lookup failed");
+            return;
+        }
+    };
+    if session_ids.is_empty() {
+        return;
+    }
+    tracing::info!(%machine_id, count = session_ids.len(), "archived sessions still have claude jobs");
+    if let Err(err) =
+        state.bus.command_daemon(machine_id, DaemonFrameDown::ArchivedJobs { session_ids }).await
+    {
+        tracing::warn!(%err, %machine_id, "could not send ArchivedJobs");
+    }
 }
 
 /// Union the machine's `adapters_enabled` rows with [`KNOWN_ADAPTERS`]: every
@@ -2637,27 +2688,160 @@ mod tests {
     #[test]
     fn resume_marks_frame_carries_stored_offsets() {
         let rows: Vec<(String, u64)> = vec![("sess-a".into(), 4096), ("sess-b".into(), 12)];
-        let frame = DaemonFrameDown::ResumeMarks {
-            session_marks: rows.clone(),
-            archived: vec!["sess-z".into()],
-        };
+        let frame = DaemonFrameDown::ResumeMarks { session_marks: rows.clone(), archived: vec![] };
         let json = serde_json::to_string(&frame).unwrap();
         assert!(json.contains(r#""type":"resume_marks""#));
+        assert!(!json.contains("archived"), "{json}");
         match serde_json::from_str::<DaemonFrameDown>(&json).unwrap() {
             DaemonFrameDown::ResumeMarks { session_marks, archived } => {
                 assert_eq!(session_marks, rows);
-                assert_eq!(archived, vec!["sess-z".to_owned()]);
+                assert!(archived.is_empty());
             }
             _ => panic!("expected ResumeMarks"),
         }
     }
 
-    #[test]
-    fn resume_marks_frame_from_older_server_omits_archived() {
-        let json = r#"{"type":"resume_marks","session_marks":[["sess-a",4096]]}"#;
-        match serde_json::from_str::<DaemonFrameDown>(json).unwrap() {
-            DaemonFrameDown::ResumeMarks { archived, .. } => assert!(archived.is_empty()),
-            _ => panic!("expected ResumeMarks"),
+    #[tokio::test]
+    async fn turn_id_persists_and_widens_the_dedup_key() {
+        let name = "turn_id_persists_and_widens_the_dedup_key";
+        let Some(url) = crate::routes::gateway::test_db_url(name) else { return };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect test db");
+        let uid = Uuid::new_v4();
+        let machine = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, name, key_hash) VALUES ($1, $2, $3)")
+            .bind(uid)
+            .bind(format!("{name}-{uid}"))
+            .bind(format!("h-{uid}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO machines (id, user_id, name, key_hash) VALUES ($1, $2, 'm', $3)")
+            .bind(machine)
+            .bind(uid)
+            .bind(format!("mk-{machine}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let sid = format!("{name}-{uid}");
+        sqlx::query(
+            "INSERT INTO sessions (id, machine_id, machine_uuid, user_id, working_dir, status, \
+             adapter_id) VALUES ($1, $2, $2, $3, '/w', 'active', 'claude-code')",
+        )
+        .bind(&sid)
+        .bind(machine)
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let sql = "INSERT INTO stream_events (session_id, event_type, payload, turn_id) \
+                   SELECT $1, $2, $3, $4 WHERE EXISTS (SELECT 1 FROM sessions WHERE id = $1) \
+                   ON CONFLICT (session_id, event_type, content_hash, \
+                                COALESCE(turn_id, '00000000-0000-0000-0000-000000000000'::uuid)) \
+                   DO NOTHING \
+                   RETURNING id";
+        let payload = serde_json::json!({"role": "user", "text": "continue"});
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut inserted = Vec::new();
+        for turn_id in [Some(first), Some(first), Some(second), None, None] {
+            let id: Option<i64> = sqlx::query_scalar(sql)
+                .bind(&sid)
+                .bind("message")
+                .bind(&payload)
+                .bind(turn_id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+            inserted.push(id.is_some());
+        }
+        assert_eq!(
+            inserted,
+            vec![true, false, true, true, false],
+            "a replayed turn dedups, two distinct turns with the same text both persist, \
+             and a turn-less row keys on content alone"
+        );
+
+        let stored: Vec<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT turn_id FROM stream_events WHERE session_id = $1 ORDER BY id",
+        )
+        .bind(&sid)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, vec![Some(first), Some(second), None]);
+
+        sqlx::query("DELETE FROM sessions WHERE id = $1").bind(&sid).execute(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn archived_jobs_matches_reported_shorts_on_this_machine_only() {
+        let name = "archived_jobs_matches_reported_shorts_on_this_machine_only";
+        let Some(url) = crate::routes::gateway::test_db_url(name) else { return };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect test db");
+        let uid = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, name, key_hash) VALUES ($1, $2, $3)")
+            .bind(uid)
+            .bind(format!("{name}-{uid}"))
+            .bind(format!("h-{uid}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (mine, other) = (Uuid::new_v4(), Uuid::new_v4());
+        for machine in [mine, other] {
+            sqlx::query(
+                "INSERT INTO machines (id, user_id, name, key_hash) VALUES ($1, $2, 'm', $3)",
+            )
+            .bind(machine)
+            .bind(uid)
+            .bind(format!("mk-{machine}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let sid = |short: &str| format!("{short}-{}", &uid.to_string()[9..]);
+        let rows = [
+            (sid("aaaaaaaa"), mine, "archived", "claude-code"),
+            (sid("bbbbbbbb"), mine, "active", "claude-code"),
+            (sid("cccccccc"), mine, "archived", "codex"),
+            (sid("dddddddd"), other, "archived", "claude-code"),
+            (sid("eeeeeeee"), mine, "archived", "claude-code"),
+        ];
+        for (id, machine, status, adapter) in &rows {
+            sqlx::query(
+                "INSERT INTO sessions (id, machine_id, machine_uuid, user_id, working_dir, \
+                 status, adapter_id) VALUES ($1, $2, $2, $3, '/w', $4, $5)",
+            )
+            .bind(id)
+            .bind(machine)
+            .bind(uid)
+            .bind(status)
+            .bind(adapter)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let reported: Vec<String> =
+            ["aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd", "ffffffff"].map(String::from).into();
+        let got = super::archived_jobs(&pool, mine, &reported).await.unwrap();
+        assert_eq!(got, vec![sid("aaaaaaaa")]);
+        assert!(super::archived_jobs(&pool, mine, &[]).await.unwrap().is_empty());
+
+        for sql in [
+            "DELETE FROM sessions WHERE user_id = $1",
+            "DELETE FROM machines WHERE user_id = $1",
+            "DELETE FROM users WHERE id = $1",
+        ] {
+            sqlx::query(sql).bind(uid).execute(&pool).await.unwrap();
         }
     }
 
@@ -2667,6 +2851,7 @@ mod tests {
             event: cctui_proto::adapter::AdapterEvent::Message {
                 local_id: local_id.into(),
                 payload: json!({ "text": filler.to_string().repeat(600 * 1024) }),
+                turn_id: None,
             },
         };
         let bytes = serde_json::to_vec(&event).unwrap();
@@ -2773,6 +2958,7 @@ mod tests {
             event: cctui_proto::adapter::AdapterEvent::Message {
                 local_id: local_id.into(),
                 payload: json!({ "text": "x".repeat(8 * 1024) }),
+                turn_id: None,
             },
         }
     }
@@ -2836,6 +3022,7 @@ mod tests {
                 event: cctui_proto::adapter::AdapterEvent::Message {
                     local_id: format!("s{i}"),
                     payload: json!({ "n": i, "blob": blob(4000) }),
+                    turn_id: None,
                 },
             })
             .collect();

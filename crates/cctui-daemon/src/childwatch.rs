@@ -23,6 +23,15 @@ use tokio::sync::Notify;
 /// After a done-classified status, how long to keep waiting for the final
 /// assistant text to land (claude's transcript tail can lag the status poll).
 pub const DONE_TEXT_GRACE: Duration = Duration::from_secs(20);
+/// How long assistant text must stand as a child's last output before the turn
+/// counts as over.
+///
+/// The claude driver emits a `Status` only when the polled snapshot *changes*,
+/// so a follow-up turn running between two identical idle readings produces no
+/// done status and the text is the only turn-end evidence there is. Text and
+/// the tool call that follows it belong to one assistant response and arrive
+/// together, so a gap this long is real.
+pub const TEXT_QUIET_GRACE: Duration = Duration::from_secs(10);
 /// Trust window for early done readings.
 ///
 /// A done classification observed before the child was ever seen working is
@@ -69,6 +78,9 @@ struct WatchState {
     ended: bool,
     error: Option<String>,
     tail_is_thinking: bool,
+    /// When assistant text became the child's last output; cleared by anything
+    /// proving the turn carried on.
+    text_tail_at: Option<Instant>,
     tool_errors: u32,
     tokens: u64,
 }
@@ -94,6 +106,7 @@ pub struct ChildSnapshot {
     error: Option<String>,
     registered_at: Instant,
     tail_is_thinking: bool,
+    text_tail_at: Option<Instant>,
     tool_errors: u32,
     tokens: u64,
 }
@@ -124,6 +137,10 @@ impl ChildSnapshot {
     /// in, after [`DONE_TEXT_GRACE`] without one, and never off a quiet early
     /// done reading (see [`QUIET_DONE_MIN_AGE`]) unless text already proves
     /// the turn ran.
+    ///
+    /// Also finished when assistant text has stood as the child's last output
+    /// for [`TEXT_QUIET_GRACE`], which is all a turn between two identical
+    /// deduped status polls ever produces.
     #[must_use]
     pub fn assess(&self, now: Instant) -> Assessment {
         if self.ended || self.error.is_some() {
@@ -142,6 +159,13 @@ impl ChildSnapshot {
             {
                 return Assessment::Finished(self.outcome());
             }
+        }
+        if self.blocked.is_none()
+            && !self.tail_is_thinking
+            && let Some(text_at) = self.text_tail_at
+            && now.duration_since(text_at) >= TEXT_QUIET_GRACE
+        {
+            return Assessment::Finished(self.outcome());
         }
         Assessment::Running(self.progress_line())
     }
@@ -265,6 +289,7 @@ impl ChildWatch {
             error: w.state.error.clone(),
             registered_at: w.registered_at,
             tail_is_thinking: w.state.tail_is_thinking,
+            text_tail_at: w.state.text_tail_at,
             tool_errors: w.state.tool_errors,
             tokens: w.state.tokens,
         })
@@ -282,7 +307,7 @@ impl ChildWatch {
             AdapterEvent::SessionStarted { local_id, meta } => {
                 bind(watches, local_id, &meta.extra);
             }
-            AdapterEvent::Message { local_id, payload } => {
+            AdapterEvent::Message { local_id, payload, .. } => {
                 if let Some(w) = find_mut(watches, local_id) {
                     apply_message(w, payload);
                 }
@@ -391,6 +416,7 @@ fn apply_status(
         Bucket::Working => {
             w.state.saw_working = true;
             w.state.done_since = None;
+            w.state.text_tail_at = None;
             clear_blocked(w, BlockKind::Status);
         }
         Bucket::Blocked => {
@@ -420,9 +446,11 @@ fn apply_message(w: &mut Watch, payload: &serde_json::Value) {
     if let Some(text) = assistant_text(payload) {
         w.state.final_text = Some(text);
         w.state.tail_is_thinking = false;
+        w.state.text_tail_at = Some(Instant::now());
         w.notify.notify_waiters();
     } else if is_thinking_message(payload) {
         w.state.tail_is_thinking = true;
+        w.state.text_tail_at = None;
         w.notify.notify_waiters();
     } else if is_turn_summary(payload) {
         apply_summary(w, payload);
@@ -432,6 +460,7 @@ fn apply_message(w: &mut Watch, payload: &serde_json::Value) {
         w.state.final_text = None;
         w.state.done_since = None;
         w.state.tail_is_thinking = false;
+        w.state.text_tail_at = None;
         w.state.tool_errors = 0;
     }
 }
@@ -452,6 +481,7 @@ fn apply_tool_use(w: &mut Watch, payload: &serde_json::Value) {
     // Tool traffic is proof of an in-flight turn.
     w.state.saw_working = true;
     w.state.done_since = None;
+    w.state.text_tail_at = None;
     w.notify.notify_waiters();
 }
 
@@ -459,16 +489,18 @@ fn set_blocked(w: &mut Watch, kind: BlockKind, reason: String) {
     w.state.blocked = Some(reason);
     w.state.blocked_kind = Some(kind);
     w.state.done_since = None;
+    w.state.text_tail_at = None;
     w.notify.notify_waiters();
 }
 
-/// A done reading captured while the block was pending is stale, so the done
-/// clock resets too.
+/// A done reading or text tail captured while the block was pending is stale,
+/// so both clocks reset too.
 fn clear_blocked(w: &mut Watch, kind: BlockKind) {
     if w.state.blocked_kind == Some(kind) {
         w.state.blocked = None;
         w.state.blocked_kind = None;
         w.state.done_since = None;
+        w.state.text_tail_at = None;
         w.notify.notify_waiters();
     }
 }
@@ -610,6 +642,7 @@ mod tests {
         AdapterEvent::Message {
             local_id: local_id.to_owned(),
             payload: json!({ "role": role, "text": text }),
+            turn_id: None,
         }
     }
 
@@ -629,6 +662,7 @@ mod tests {
             intent: None,
             model: None,
             effort: None,
+            permission_mode: None,
             children: Vec::new(),
         }
     }
@@ -726,6 +760,92 @@ mod tests {
         watch.observe(&msg("child-1", "assistant", "turn two answer"));
         watch.observe(&status("child-1", None, Some("done"), Some("success")));
         assert_eq!(finished(&h).unwrap().final_text.as_deref(), Some("turn two answer"));
+    }
+
+    #[test]
+    fn a_follow_up_turn_ends_on_text_then_silence_with_no_status_event_at_all() {
+        // The claude driver dedupes an unchanged status poll: a child idle
+        // before the follow-up and idle after it emits no done status for the
+        // turn in between, so the text is the only evidence there is.
+        let watch = Arc::new(ChildWatch::default());
+        let h = watch.register_bound("child-1");
+        watch.observe(&msg("child-1", "user", "Reply with exactly the word: pong"));
+        watch.observe(&msg("child-1", "assistant", "pong"));
+        assert!(finished(&h).is_none(), "the turn stays open inside the quiet grace");
+        let snap = h.snapshot().unwrap();
+        let later = Instant::now() + TEXT_QUIET_GRACE + Duration::from_secs(1);
+        let Assessment::Finished(out) = snap.assess(later) else {
+            panic!("silence after the answer must end the turn")
+        };
+        assert_eq!(out.final_text.as_deref(), Some("pong"));
+        assert!(out.error.is_none());
+    }
+
+    #[test]
+    fn a_turn_landing_as_the_watch_attaches_is_not_finished_by_the_previous_done_reading() {
+        // The stale done status from the turn before the follow-up arrives
+        // just after register_bound; only the new turn's text may finish it.
+        let watch = Arc::new(ChildWatch::default());
+        let h = watch.register_bound("child-1");
+        watch.observe(&status("child-1", None, Some("done"), Some("success")));
+        let snap = h.snapshot().unwrap();
+        let later = Instant::now() + TEXT_QUIET_GRACE + DONE_TEXT_GRACE;
+        assert!(
+            matches!(snap.assess(later), Assessment::Running(_)),
+            "a done reading predating the follow-up must not answer it"
+        );
+        watch.observe(&msg("child-1", "user", "now say pong"));
+        watch.observe(&msg("child-1", "assistant", "pong"));
+        let snap = h.snapshot().unwrap();
+        let later = Instant::now() + TEXT_QUIET_GRACE + Duration::from_secs(1);
+        let Assessment::Finished(out) = snap.assess(later) else { panic!("the new turn ended") };
+        assert_eq!(out.final_text.as_deref(), Some("pong"));
+    }
+
+    #[test]
+    fn text_that_is_not_the_tail_never_ends_a_turn_on_silence() {
+        let watch = Arc::new(ChildWatch::default());
+        let later = || Instant::now() + TEXT_QUIET_GRACE * 3;
+
+        let tooling = watch.register_bound("child-1");
+        watch.observe(&msg("child-1", "assistant", "let me check the tests"));
+        watch.observe(&AdapterEvent::ToolUse {
+            local_id: "child-1".into(),
+            payload: json!({ "tool": "Bash" }),
+        });
+        assert!(
+            matches!(tooling.snapshot().unwrap().assess(later()), Assessment::Running(_)),
+            "a tool call after the text proves the turn carried on"
+        );
+
+        let thinking = watch.register_bound("child-2");
+        watch.observe(&msg("child-2", "assistant", "let me check the tests"));
+        watch.observe(&msg("child-2", "assistant_thinking", "which test first?"));
+        assert!(
+            matches!(thinking.snapshot().unwrap().assess(later()), Assessment::Running(_)),
+            "a thinking tail is mid-turn narration, not an answer"
+        );
+
+        let working = watch.register_bound("child-3");
+        watch.observe(&msg("child-3", "assistant", "let me check the tests"));
+        watch.observe(&status("child-3", Some("active"), Some("working"), None));
+        assert!(
+            matches!(working.snapshot().unwrap().assess(later()), Assessment::Running(_)),
+            "a working status after the text reopens the turn"
+        );
+
+        let asked = watch.register_bound("child-4");
+        watch.observe(&msg("child-4", "assistant", "Before I continue:"));
+        watch.observe(&AdapterEvent::AskQuestion {
+            local_id: "child-4".into(),
+            question: "which database?".into(),
+            questions: None,
+            preamble: None,
+        });
+        assert!(
+            matches!(asked.snapshot().unwrap().assess(later()), Assessment::Running(_)),
+            "a pending question is not a finished turn"
+        );
     }
 
     #[test]

@@ -45,7 +45,19 @@ token or a new common component is never quietly missed.
 
 Capture replays against a production build (`vite preview`), which the shoot
 builds and starts for you; a dev server transforms modules on demand and can
-lose the first click to hydration. Screens are then palette-quantised, which
+lose the first click to hydration.
+
+**A `vite preview` you started yourself must be restarted after every rebuild.**
+It resolves its output directory once, at startup, so a server left over from an
+earlier build — or from another worktree holding the port — answers with markup
+whose hashed assets it no longer has, and the page loads blank. The shoot
+defends against committing that twice over: it refuses to run when a
+pre-existing server cannot serve the assets its own HTML references, and it
+drives the page in a real browser before any capture, failing if no root element
+rendered. Left to itself it starts the preview *after* the build, so the server
+is never older than what it documents.
+
+Screens are then palette-quantised, which
 takes them to roughly a third of their size. That pass runs over the journeys
 the shoot just captured, and only those: quantisation is lossy and cannot be
 detected after the fact, so re-running it over the whole record would both

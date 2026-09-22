@@ -11,6 +11,7 @@ import type { AgentEvent } from '@bindings/AgentEvent';
 import {
 	ws,
 	userMsgKey,
+	turnIdOf,
 	type PermReq,
 	type LiveAsk,
 	type LivePlan,
@@ -20,6 +21,7 @@ import { eventSig, parseAsk, parseTodos, todoProgress as deriveTodoProgress } fr
 import { lastProseLine, toolInvocationSummary, type ActivityTool } from './activity';
 import type { AskQuestion, TodoItem, TodoProgress } from './types';
 import { endpoints } from '$lib/queries';
+import { newTurnId } from '$lib/turnid';
 
 // Fold a live ws event into the cached conversation tail. Returns `prev` by
 // identity when nothing changes, so a known event doesn't re-render the drawer.
@@ -127,6 +129,10 @@ export class ConversationStream {
 			// optimistic one instead. The drawer collapses the pair by `eventSig`.
 			this.#opts.mergeIntoCache(sid, ev);
 			// Skip a server-echoed user message that duplicates our optimistic one.
+			// By identity first: Claude re-encodes one turn several ways, so only
+			// the turn id recognises the second and third copies as the same turn.
+			const turnId = turnIdOf(ev);
+			if (turnId !== null && this.live.some((e) => turnIdOf(e) === turnId)) return;
 			const key = userMsgKey(ev);
 			if (key !== null && this.live.some((e) => userMsgKey(e) === key)) return;
 			this.live = [...this.live, ev];
@@ -321,7 +327,7 @@ export class ConversationStream {
 	// local `live`) so a resubscribe/reconnect that rebuilds `live` doesn't drop a
 	// message claude already received. Stamps the echo just past the newest known
 	// event rather than with the browser clock so it sorts last.
-	#pushOptimisticReply(text: string): number {
+	#pushOptimisticReply(text: string, turnId: string): number {
 		const id = this.#opts.id();
 		const known = [...(this.#opts.historyData() ?? []), ...this.live];
 		const maxTs = known.reduce((m, e) => Math.max(m, e.ts), 0);
@@ -329,7 +335,7 @@ export class ConversationStream {
 		// Stamp a causal `seq` just past the newest known event so the
 		// echo sorts last under `orderEvents`, matching the `ts` bump above.
 		const maxSeq = known.reduce((m, e) => Math.max(m, e.seq ?? 0), 0);
-		const ev: AgentEvent = { type: 'reply', content: text, ts, seq: maxSeq + 1 };
+		const ev: AgentEvent = { type: 'reply', content: text, ts, seq: maxSeq + 1, turn_id: turnId };
 		ws.recordOptimistic(id, ev);
 		this.live = [...this.live, ev];
 		return ts;
@@ -339,8 +345,9 @@ export class ConversationStream {
 	// owns dispatch + ack timeout + auto-retry). Returns true if the first frame
 	// left the socket.
 	#sendTracked(text: string): boolean {
-		const ts = this.#pushOptimisticReply(text);
-		return ws.trackedSend(this.#opts.id(), text, ts);
+		const turnId = newTurnId();
+		const ts = this.#pushOptimisticReply(text, turnId);
+		return ws.trackedSend(this.#opts.id(), text, ts, undefined, turnId);
 	}
 
 	// Send a final message body (text + any appended staged-attachment paths).
@@ -368,8 +375,9 @@ export class ConversationStream {
 	// the carrier for the free-text/fallback path.
 	answerQuestion(text: string, picks: number[][] | null, qs?: AskQuestion[] | null) {
 		if (this.#opts.archived()) return;
-		const ts = this.#pushOptimisticReply(text);
-		const ok = ws.trackedSend(this.#opts.id(), text, ts, picks ?? undefined);
+		const turnId = newTurnId();
+		const ts = this.#pushOptimisticReply(text, turnId);
+		const ok = ws.trackedSend(this.#opts.id(), text, ts, picks ?? undefined, turnId);
 		if (!ok) return;
 		// Lock both ask render sites to their answered state immediately,
 		// and remember the answered questions so the late transcript line never
@@ -392,8 +400,9 @@ export class ConversationStream {
 	// `picks = null`. Same trackedSend grammar as `answerQuestion`.
 	answerPlan(text: string, picks: number[][] | null) {
 		if (this.#opts.archived()) return;
-		const ts = this.#pushOptimisticReply(text);
-		const ok = ws.trackedSend(this.#opts.id(), text, ts, picks ?? undefined);
+		const turnId = newTurnId();
+		const ts = this.#pushOptimisticReply(text, turnId);
+		const ok = ws.trackedSend(this.#opts.id(), text, ts, picks ?? undefined, turnId);
 		if (!ok) return;
 		this.answering = true;
 		this.working = true;

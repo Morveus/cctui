@@ -228,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
         // resolves (by sha256 hash — no token material on the wire). Same
         // machine-key self-auth as gateway-env.
         .route("/api/v1/daemon/sessions/{id}/token-valid", get(routes::daemon::session_token_valid))
+        .route("/api/v1/daemon/sessions/{id}/limits", get(routes::session_limits::session_limits))
         .route("/api/v1/daemon/sessions/{id}/spawn-child", post(routes::spawn_child::spawn_child))
         .route(
             "/api/v1/daemon/sessions/{id}/message-child",

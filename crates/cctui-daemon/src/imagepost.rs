@@ -198,7 +198,7 @@ pub async fn process_event(
     allowed_roots: &[PathBuf],
 ) -> AdapterEvent {
     let event = crate::blobs::extract_blobs(client, machine_key, event).await;
-    let AdapterEvent::Message { local_id, payload } = &event else { return event };
+    let AdapterEvent::Message { local_id, payload, .. } = &event else { return event };
     if payload.get("role").and_then(|r| r.as_str()) != Some("assistant") {
         return event;
     }
@@ -215,7 +215,7 @@ pub async fn process_event(
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("text".to_owned(), serde_json::Value::String(rewritten));
     }
-    AdapterEvent::Message { local_id: local_id.clone(), payload }
+    AdapterEvent::Message { local_id: local_id.clone(), payload, turn_id: None }
 }
 
 #[cfg(test)]

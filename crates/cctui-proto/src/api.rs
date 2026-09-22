@@ -800,6 +800,12 @@ pub struct SpawnRequest {
     /// bytes stay client-side until launch).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachment_names: Vec<String>,
+    /// Labels to attach to the session this spawn creates. The server keeps
+    /// them under the spawn key and attaches them when the worker registers,
+    /// so a launch that returns no session id (machine spawns, draft launches)
+    /// still lands labelled. Stored with a draft and carried to its launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub label_ids: Vec<String>,
     /// What this session may spawn through the `CctuiAgent` tool. Omitted →
     /// the session cannot spawn children.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -830,6 +836,7 @@ impl std::fmt::Debug for SpawnRequest {
             .field("auto_archive", &self.auto_archive)
             .field("env_keys", &self.env_keys)
             .field("attachment_names", &self.attachment_names)
+            .field("label_ids", &self.label_ids)
             .field("spawn_capability", &self.spawn_capability)
             .finish()
     }

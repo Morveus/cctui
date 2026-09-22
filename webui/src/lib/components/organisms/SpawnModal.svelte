@@ -77,7 +77,7 @@
 		type ProfileSpec
 	} from './spawn/profiles';
 	import { buildDispatchBody } from './spawn/dispatchBody';
-	import { attachLabelsTo, attachLabelsToSpawned } from './spawn/labelAttach';
+	import { attachLabelsTo } from './spawn/labelAttach';
 	import { settings, type SpawnDockSide } from '$lib/settings.svelte';
 	import { SPAWN_DOCK_WIDTH } from '$lib/spawnDock.svelte';
 	import { DOCK_MIN_PX, maxDockWidth } from '$lib/dock';
@@ -181,7 +181,7 @@
 		try {
 			const saved: SpawnSlotPayload = readSpawnSlot(slotKey) ?? {};
 			const raw = Object.keys(saved).length > 0;
-			const { draft_id, env_keys, ...prefillForm } = prefill ?? {};
+			const { draft_id, env_keys, label_ids, ...prefillForm } = prefill ?? {};
 			draftId = draft_id ?? saved.draftId ?? null;
 			loadedDraft = (raw || !!draft_id) && !(prefill && !draft_id);
 			// Values never come back from disk: only the keys are re-proposed.
@@ -199,6 +199,7 @@
 				Object.entries(prefillForm).filter(([, v]) => v !== '' && v != null)
 			);
 			const seeded = { ...blank, ...savedForm, ...given } as Form;
+			if (label_ids !== undefined) seeded.labels = label_ids.split(',').filter(Boolean);
 			// Fresh open: propose the last submitted name with a bumped suffix and
 			// the last-used label set.
 			if (!raw && !prefill) {
@@ -210,7 +211,7 @@
 			}
 			return seeded;
 		} catch {
-			const { draft_id: _d, env_keys: _k, ...rest } = prefill ?? {};
+			const { draft_id: _d, env_keys: _k, label_ids: _l, ...rest } = prefill ?? {};
 			return { ...blank, ...rest } as Form;
 		}
 	}
@@ -606,7 +607,10 @@
 			// "Auto" delegates the choice to the server; a pool is the bounded form.
 			auto_account: !noAccount && !pool && !f.account.trim(),
 			pool,
-			save_draft: false
+			save_draft: false,
+			// Attached by the server once the session registers, so a draft
+			// launched later keeps them too.
+			label_ids: [...f.labels]
 		};
 	}
 
@@ -638,10 +642,9 @@
 		spawnFailure = null;
 		const body: SpawnRequest = buildSpawnBody();
 		const labelIds = [...form.labels];
-		const labelCwd = normalizeDir(form.working_dir.trim());
-		const labelMachine = form.machine_id;
+		const memoryCwd = normalizeDir(form.working_dir.trim());
+		const memoryMachine = form.machine_id;
 		const profile = selectedProfile;
-		const requestedAt = Date.now();
 		const res = await actions.spawn(body, files);
 		if (res.account) toasts.info(m.spawn_toast_bound_account({ account: res.account }));
 		drafts.set(LAST_MACHINE, form.machine_id);
@@ -649,7 +652,7 @@
 		drafts.set(LAST_SPAWN_LABELS, labelIds.join(','));
 		// Saved on submit (not on confirmed success) so a slow spawn still
 		// records the operator's intent.
-		settings.rememberSpawn(machineMemoryKey(labelMachine, labelCwd), {
+		settings.rememberSpawn(machineMemoryKey(memoryMachine, memoryCwd), {
 			...entryFromForm(effectiveForm),
 			profile_id: profile?.id
 		});
@@ -671,13 +674,11 @@
 		});
 		if (result.ok) {
 			toasts.ok(m.spawn_toast_spawned());
-			void attachLabelsToSpawned(labelApi, labelMachine, labelCwd, requestedAt, labelIds);
 			discardMirror();
 			resetForm();
 			onspawned();
 			onclose();
 		} else if (result.timedOut) {
-			void attachLabelsToSpawned(labelApi, labelMachine, labelCwd, requestedAt, labelIds);
 			// No confirmation ≠ failed: cold spawns routinely land after the wait.
 			// Keep the draft so a real miss is one re-open away; re-submitting
 			// blindly would dispatch a second agent.

@@ -625,8 +625,9 @@ export function draftPreview(s: SessionListItem): string {
 
 /** Prefill for editing a draft: its stored payload, falling back to the row.
  * Only carries what the draft actually holds, so a blank draft field never
- * wipes what the open form has; `draft_id` ties the form back to the row and
- * `env_keys` re-proposes the env var names (values are re-entered). */
+ * wipes what the open form has; `draft_id` ties the form back to the row,
+ * `env_keys` re-proposes the env var names (values are re-entered) and
+ * `label_ids` the labels, from the payload and the draft card alike. */
 export function draftEditPrefill(s: SessionListItem): Record<string, string> {
 	const d = draftPayload(s);
 	const adapter = (typeof d.adapter_id === 'string' && d.adapter_id) || s.adapter_id || 'claude-code';
@@ -645,9 +646,19 @@ export function draftEditPrefill(s: SessionListItem): Record<string, string> {
 		permission_mode: str(d.permission_mode),
 		[modelField]: str(d.model),
 		[effortField]: str(d.effort),
-		env_keys: Array.isArray(d.env_keys) ? d.env_keys.filter((k) => typeof k === 'string').join(',') : ''
+		env_keys: Array.isArray(d.env_keys) ? d.env_keys.filter((k) => typeof k === 'string').join(',') : '',
+		label_ids: draftLabelIds(d, s).join(',')
 	};
 	return Object.fromEntries(Object.entries(full).filter(([, v]) => v !== ''));
+}
+
+/** The labels a draft will launch with: its payload's, then any put on the
+ * draft card since it was saved. */
+function draftLabelIds(d: Record<string, unknown>, s: SessionListItem): string[] {
+	const stored = Array.isArray(d.label_ids)
+		? d.label_ids.filter((id): id is string => typeof id === 'string')
+		: [];
+	return [...new Set([...stored, ...s.labels.map((l) => l.id)])];
 }
 
 /** Whether opening draft `targetId` for editing must ask first: the form in
@@ -692,7 +703,8 @@ export function spawnRequestFromSlot(p: SpawnSlotPayload): SpawnRequest | null {
 		auto_account: !noAccount && !p.account?.trim(),
 		save_draft: false,
 		env_keys: (p.envRows ?? []).map((r) => r.key.trim()).filter(Boolean),
-		attachment_names: p.attachmentNames ?? []
+		attachment_names: p.attachmentNames ?? [],
+		label_ids: p.labels ?? []
 	};
 }
 

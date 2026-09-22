@@ -756,6 +756,23 @@ describe('draft payload + prefills', () => {
 		expect('name' in p).toBe(false);
 	});
 
+	it('draftEditPrefill carries the stored labels and those put on the draft card', () => {
+		const p = draftEditPrefill(
+			session({
+				machine_id: 'm',
+				working_dir: '/w',
+				labels: [label('l-2', 'infra'), label('l-3', 'urgent')],
+				metadata: { draft: { prompt: 'p', label_ids: ['l-1', 'l-2', 7] } }
+			})
+		);
+		expect(p.label_ids).toBe('l-1,l-2,l-3');
+	});
+
+	it('draftEditPrefill omits label_ids for an unlabelled draft', () => {
+		const p = draftEditPrefill(session({ machine_id: 'm', working_dir: '/w', metadata: { draft: { prompt: 'p' } } }));
+		expect('label_ids' in p).toBe(false);
+	});
+
 	it('draftSavedAt prefers the autosave stamp over the creation time', () => {
 		const at = '2026-09-04T10:00:00Z';
 		expect(draftSavedAt(session({ registered_at: '2026-09-01T00:00:00Z', metadata: { draft_saved_at: at } }))).toBe(at);
@@ -815,6 +832,12 @@ describe('spawnRequestFromSlot', () => {
 			attachment_names: ['a.txt']
 		});
 		expect(JSON.stringify(r)).not.toContain('secret');
+	});
+
+	it('carries the slot labels so the draft launches labelled', () => {
+		const r = spawnRequestFromSlot({ machine_id: 'm', working_dir: '/w', prompt: 'p', labels: ['l-1', 'l-2'] });
+		expect(r?.label_ids).toEqual(['l-1', 'l-2']);
+		expect(spawnRequestFromSlot({ machine_id: 'm', working_dir: '/w', prompt: 'p' })?.label_ids).toEqual([]);
 	});
 });
 

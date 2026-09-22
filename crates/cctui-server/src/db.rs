@@ -4,14 +4,15 @@ use std::time::Duration;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{ConnectOptions, PgPool};
 
+/// The embedded migrations. A `static` keeps the list off the stack: built
+/// inline in `connect`, it outgrew clippy's `large_stack_arrays` limit.
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
 /// Read a `u32` env var, falling back to `default` when unset or unparseable.
 fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-// `sqlx::migrate!` embeds every migration in one local array; with the fork's
-// own migrations on top of upstream's it crosses clippy's 16 KiB threshold.
-#[allow(clippy::large_stack_arrays)]
 pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
     // Pool sizing is env-tunable so prod can scale connections without a rebuild.
     // Defaults are generous enough to absorb gateway proxying + heartbeats +
@@ -36,7 +37,7 @@ pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
 
     reconcile_migration_checksums(&pool).await?;
 
-    sqlx::migrate!("../../migrations").run(&pool).await?;
+    MIGRATOR.run(&pool).await?;
 
     tracing::info!(
         max_connections,

@@ -116,4 +116,11 @@ env_keys?: Array<string>,
  * Draft bookkeeping: names of the files attached in the browser (the
  * bytes stay client-side until launch).
  */
-attachment_names?: Array<string>, };
+attachment_names?: Array<string>, 
+/**
+ * Labels to attach to the session this spawn creates. The server keeps
+ * them under the spawn key and attaches them when the worker registers,
+ * so a launch that returns no session id (machine spawns, draft launches)
+ * still lands labelled. Stored with a draft and carried to its launch.
+ */
+label_ids?: Array<string>, };

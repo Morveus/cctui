@@ -4,9 +4,9 @@
 //! caller's accounts instead of refusing to guess. "Best" here means *most
 //! allocation left for the session about to run*, which is not the same as
 //! "least used": an account can sit at 0% of its 5h window and still be at 100%
-//! of its weekly one, so it would rate-limit on the first request. The score is
-//! therefore the account's **narrowest** margin across the windows that apply,
-//! and the winner is the account whose narrowest margin is widest.
+//! of its weekly one, so it would rate-limit on the first request. An account is
+//! therefore judged on its **narrowest** window among those that apply, never
+//! on its idlest one.
 //!
 //! Three rules shape which windows apply:
 //!
@@ -18,9 +18,26 @@
 //!   * dollar windows are excluded from the margin (a percent of a USD budget
 //!     means nothing), though their caps still block through the soft limit.
 //!
+//! A margin alone is not room, though: 35% of a weekly window that resets in
+//! 18 hours can be spent far faster than 35% of one that resets in two hours
+//! would ever need to be. The `headroom` score is therefore a **sustainable
+//! rate**: each applicable percent window contributes `margin / hours until its
+//! reset` (hours floored at [`MIN_HOURS_TO_RESET`]; a window with no reset time
+//! contributes its raw margin), the account's score is the lowest of those
+//! rates, divided by its pace penalty, then shared with the sessions already in
+//! flight on it (`score / (1 + in_flight × RESERVATION)`). The last step is what
+//! walks a wave of spawns across the pool: usage read between two spawns has
+//! not moved yet, so without it every spawn of the wave lands on the same
+//! account and they all hit its wall in the same second.
+//!
 //! An account that opted into pace limits and is burning faster than its linear
-//! budget has its margin discounted by that burn rate, so equal room goes to
-//! the calmer account.
+//! budget has its score further discounted by that burn rate, so equal room
+//! goes to the calmer account.
+//!
+//! Pools choose between these two rankers with their `strategy`. Moving a live
+//! session to a sibling when its account refuses is also a pool setting
+//! (`failover` on the pool itself); `CCTUI_GATEWAY_FAILOVER=1` only governs the
+//! explicit `account_redirects` rules, never in-pool moves.
 //!
 //! This module is pure: the caller does the DB reads and the usage fetches, so
 //! every rule above is unit-testable without a database or a network.
@@ -43,6 +60,10 @@ pub struct Candidate {
     /// endpoint failed has no windows, which must NOT be read as "wide open"
     /// nor as "exhausted" — only as unknown.
     pub usage_known: bool,
+    /// Sessions already bound to (and served by) this account that are still
+    /// live, or were bound too recently to show up in its usage yet. Counted
+    /// by the caller; see [`RESERVATION`].
+    pub in_flight: u32,
 }
 
 /// Why one candidate is out of the running.
@@ -56,28 +77,73 @@ pub struct Blocked {
 /// The outcome of ranking.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pick {
-    /// Bind this account. `headroom_pct` is the winning margin, `None` when the
-    /// pick was made without usage data.
-    Chosen { name: String, headroom_pct: Option<f64> },
+    /// Bind this account. `headroom_pct` is the raw margin of the window that
+    /// decided its score, `score` the sustainable rate it was ranked on and
+    /// `resets_at` that window's reset. All `None` when the pick was made
+    /// without usage data.
+    Chosen {
+        name: String,
+        headroom_pct: Option<f64>,
+        score: Option<f64>,
+        resets_at: Option<DateTime<Utc>>,
+    },
     /// Every candidate was readable AND out of allocation.
     Exhausted(Vec<Blocked>),
     /// No candidate at all.
     None,
 }
 
+/// Floor, in hours, on the time left before a window resets when turning its
+/// margin into a rate: a window resetting in the next minutes (or already past
+/// its reset, on a stale reading) must rank as very roomy, not divide by zero.
+pub const MIN_HOURS_TO_RESET: f64 = 0.25;
+
+/// Share of an account's sustainable rate each session already in flight on it
+/// is assumed to take. `1.0` means a new session gets a fair share of the rate:
+/// with `n` sessions running, it can count on `score / (n + 1)`. Smaller values
+/// under-count what a running session burns: at `0.15`, the incident this was
+/// written for (16 spawns in three hours, see the tests) still piles every
+/// spawn onto the same account.
+pub const RESERVATION: f64 = 1.0;
+
 /// Percent windows carry a meaningful margin; dollar ones do not.
 const fn is_percent_window(window: &UsageWindow) -> bool {
     window.amount_usd.is_none()
 }
 
-/// The narrowest margin across the applicable percent windows, or `None` when
-/// there are none to measure.
-fn narrowest_margin(windows: &[&UsageWindow]) -> Option<f64> {
+/// How much room a candidate has, once time and load are weighed in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Standing {
+    /// What the candidate is ranked on (higher is better).
+    score: f64,
+    /// Raw margin of the window that set the score.
+    headroom_pct: f64,
+    /// That window's reset.
+    resets_at: Option<DateTime<Utc>>,
+}
+
+/// Margin per hour left in `window`: the rate at which it can be spent without
+/// hitting its wall before it resets. A window that never resets keeps its raw
+/// margin.
+fn sustainable_rate(window: &UsageWindow, now: DateTime<Utc>) -> f64 {
+    let margin = 100.0 - window.utilization;
+    window.resets_at.map_or(margin, |resets_at| {
+        let hours = (resets_at - now).num_seconds() as f64 / 3600.0;
+        margin / hours.max(MIN_HOURS_TO_RESET)
+    })
+}
+
+/// The tightest applicable percent window (lowest sustainable rate) with that
+/// rate, or `None` when there is none to measure.
+fn tightest_window<'w>(
+    windows: &[&'w UsageWindow],
+    now: DateTime<Utc>,
+) -> Option<(f64, &'w UsageWindow)> {
     windows
         .iter()
         .filter(|w| is_percent_window(w))
-        .map(|w| 100.0 - w.utilization)
-        .fold(None, |acc: Option<f64>, margin| Some(acc.map_or(margin, |a| a.min(margin))))
+        .map(|w| (sustainable_rate(w, now), *w))
+        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
 }
 
 /// A window at or past 100% is spent regardless of any configured cap.
@@ -100,12 +166,12 @@ fn resets_phrase(window: &UsageWindow, now: DateTime<Utc>) -> String {
 
 /// Rank `candidates` and pick one.
 ///
-/// Ordering: accounts with a known, positive margin first (widest margin wins,
+/// Ordering: accounts with a known, positive margin first (highest score wins,
 /// ties broken by name so the choice is deterministic); then accounts whose
-/// usage could not be read. An unreadable account ranks behind every readable
-/// one with room — we have positive evidence for the latter and none for the
-/// former — but it stays eligible, so a flaky usage endpoint degrades the
-/// choice instead of blocking the launch.
+/// usage could not be read, least loaded first, then by name. An unreadable
+/// account ranks behind every readable one with room — we have positive
+/// evidence for the latter and none for the former — but it stays eligible, so
+/// a flaky usage endpoint degrades the choice instead of blocking the launch.
 ///
 /// [`Pick::Exhausted`] is returned only when every candidate was read AND every
 /// one is out. "Usage unavailable" must never masquerade as "you are out of
@@ -115,8 +181,8 @@ pub fn pick_account(candidates: &[Candidate], model: Option<&str>, now: DateTime
         return Pick::None;
     }
 
-    let mut ranked: Vec<(f64, &str)> = Vec::new();
-    let mut unknown: Vec<&str> = Vec::new();
+    let mut ranked: Vec<(Standing, &str)> = Vec::new();
+    let mut unknown: Vec<(u32, &str)> = Vec::new();
     let mut blocked: Vec<Blocked> = Vec::new();
 
     for candidate in candidates {
@@ -125,29 +191,40 @@ pub fn pick_account(candidates: &[Candidate], model: Option<&str>, now: DateTime
             // Readable, but nothing measurable (no percent window at all):
             // eligible, yet with no margin to compare, so it queues with the
             // unknowns rather than outranking a measured account.
-            Ok(None) => unknown.push(&candidate.name),
-            Ok(Some(margin)) => ranked.push((margin, &candidate.name)),
+            Ok(None) => unknown.push((candidate.in_flight, &candidate.name)),
+            Ok(Some(standing)) => ranked.push((standing, &candidate.name)),
         }
     }
 
-    // Widest margin first; name ascending breaks ties so repeated spawns under
-    // identical usage always land on the same account.
+    // Highest score first; name ascending breaks ties so repeated spawns under
+    // identical usage and load always land on the same account.
     ranked.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(b.1))
+        b.0.score.partial_cmp(&a.0.score).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(b.1))
     });
-    if let Some((margin, name)) = ranked.first() {
-        return Pick::Chosen { name: (*name).to_owned(), headroom_pct: Some(*margin) };
+    if let Some((standing, name)) = ranked.first() {
+        return Pick::Chosen {
+            name: (*name).to_owned(),
+            headroom_pct: Some(standing.headroom_pct),
+            score: Some(standing.score),
+            resets_at: standing.resets_at,
+        };
     }
+    // Nothing measured to compare: spread by load, then by name.
     unknown.sort_unstable();
-    if let Some(name) = unknown.first() {
-        return Pick::Chosen { name: (*name).to_owned(), headroom_pct: None };
+    if let Some((_, name)) = unknown.first() {
+        return Pick::Chosen {
+            name: (*name).to_owned(),
+            headroom_pct: None,
+            score: None,
+            resets_at: None,
+        };
     }
     blocked.sort_by(|a, b| a.name.cmp(&b.name));
     Pick::Exhausted(blocked)
 }
 
 /// One candidate's standing: `Err` when it is out (spent window or a cap the
-/// gateway would enforce), `Ok(Some(margin))` when it has measured room, and
+/// gateway would enforce), `Ok(Some(standing))` when it has measured room, and
 /// `Ok(None)` when it is eligible but unmeasurable — usage unreadable, or read
 /// with no percent window to compare. The three cases are what both strategies
 /// need, so they share one evaluation and can never disagree about who is out.
@@ -155,7 +232,7 @@ fn availability(
     candidate: &Candidate,
     model: Option<&str>,
     now: DateTime<Utc>,
-) -> Result<Option<f64>, Blocked> {
+) -> Result<Option<Standing>, Blocked> {
     if !candidate.usage_known {
         return Ok(None);
     }
@@ -183,10 +260,15 @@ fn availability(
         return Err(Blocked { name: candidate.name.clone(), reason });
     }
     let penalty = pace_penalty(candidate, &applicable, now);
-    Ok(narrowest_margin(&applicable).map(|margin| margin / penalty))
+    let load = f64::from(candidate.in_flight).mul_add(RESERVATION, 1.0);
+    Ok(tightest_window(&applicable, now).map(|(rate, window)| Standing {
+        score: rate / penalty / load,
+        headroom_pct: 100.0 - window.utilization,
+        resets_at: window.resets_at,
+    }))
 }
 
-/// Divisor discounting the margin of an account that is burning faster than its
+/// Divisor discounting the score of an account that is burning faster than its
 /// windows' linear budget, so a new session prefers a calmer sibling with the
 /// same room. `1.0` (no discount) unless the account opted into pace limits and
 /// some applicable window is actually over pace.
@@ -221,8 +303,13 @@ pub fn pick_in_order(candidates: &[Candidate], model: Option<&str>, now: DateTim
     for candidate in candidates {
         match availability(candidate, model, now) {
             Err(reason) => blocked.push(reason),
-            Ok(headroom_pct) => {
-                return Pick::Chosen { name: candidate.name.clone(), headroom_pct };
+            Ok(standing) => {
+                return Pick::Chosen {
+                    name: candidate.name.clone(),
+                    headroom_pct: standing.map(|s| s.headroom_pct),
+                    score: standing.map(|s| s.score),
+                    resets_at: standing.and_then(|s| s.resets_at),
+                };
             }
         }
     }
@@ -258,7 +345,22 @@ mod tests {
             windows,
             limits: SoftLimits::default(),
             usage_known: true,
+            in_flight: 0,
         }
+    }
+
+    /// A pick's name, or a panic naming what came back instead.
+    fn chosen(pick: &Pick) -> &str {
+        let Pick::Chosen { name, .. } = pick else { panic!("expected a pick, got {pick:?}") };
+        name
+    }
+
+    /// A pick's raw margin, for the assertions that pin the logged value.
+    fn chosen_headroom(pick: &Pick) -> Option<f64> {
+        let Pick::Chosen { headroom_pct, .. } = pick else {
+            panic!("expected a pick, got {pick:?}")
+        };
+        *headroom_pct
     }
 
     /// Equal room, opposite burn rates: both at 40% of the 5h window, but
@@ -277,24 +379,27 @@ mod tests {
                 .collect(),
             },
             usage_known: true,
+            in_flight: 0,
         };
         let candidates = vec![paced("aburner", 4), paced("zcalm", 1)];
-        assert!(matches!(
-            pick_account(&candidates, None, now()),
-            Pick::Chosen { ref name, .. } if name == "zcalm"
-        ));
+        assert_eq!(chosen(&pick_account(&candidates, None, now())), "zcalm");
 
-        // Without an opted-in pace cap the margins stay equal and the
-        // deterministic name tiebreak decides, exactly as before.
+        // Without a pace cap the calmer account still wins: the same 60% left
+        // over one hour is a far faster sustainable rate than over four. Before
+        // the score weighed time, this fell through to the name tiebreak.
         let unpaced: Vec<Candidate> = candidates
             .iter()
             .cloned()
             .map(|c| Candidate { limits: SoftLimits::default(), ..c })
             .collect();
-        assert!(matches!(
-            pick_account(&unpaced, None, now()),
-            Pick::Chosen { ref name, .. } if name == "aburner"
-        ));
+        assert_eq!(chosen(&pick_account(&unpaced, None, now())), "zcalm");
+
+        // And the penalty still bites on its own: `aburner` is at twice its
+        // linear pace, so its score is halved (60% over 4h = 15%/h, then 7.5).
+        let Pick::Chosen { score, .. } = pick_account(&candidates[..1], None, now()) else {
+            panic!("expected a pick")
+        };
+        assert!((score.unwrap() - 7.5).abs() < 1e-9, "{score:?}");
     }
 
     #[test]
@@ -304,7 +409,8 @@ mod tests {
             candidate("cheap", vec![window(KEY_SESSION, "5h", 80.0, 3)]),
             candidate("spare", vec![window(KEY_SESSION, "5h", 1.0, 3)]),
         ];
-        let Pick::Chosen { name, headroom_pct } = pick_in_order(&candidates, None, now()) else {
+        let Pick::Chosen { name, headroom_pct, .. } = pick_in_order(&candidates, None, now())
+        else {
             panic!("expected a pick");
         };
         assert_eq!(name, "cheap");
@@ -352,7 +458,8 @@ mod tests {
         unreadable.usage_known = false;
         let candidates =
             vec![unreadable, candidate("second", vec![window(KEY_SESSION, "5h", 1.0, 3)])];
-        let Pick::Chosen { name, headroom_pct } = pick_in_order(&candidates, None, now()) else {
+        let Pick::Chosen { name, headroom_pct, .. } = pick_in_order(&candidates, None, now())
+        else {
             panic!("expected a pick");
         };
         assert_eq!(name, "first");
@@ -392,7 +499,17 @@ mod tests {
     #[test]
     fn picks_the_widest_narrowest_margin_not_the_idlest_window() {
         let pick = pick_account(&real_world(), Some("opus"), now());
-        assert_eq!(pick, Pick::Chosen { name: "Patrigeon".to_owned(), headroom_pct: Some(52.0) });
+        // The weekly window decides: 52% over 96h is a slower rate than 85% of
+        // a 5h window resetting in 3h.
+        assert_eq!(
+            pick,
+            Pick::Chosen {
+                name: "Patrigeon".to_owned(),
+                headroom_pct: Some(52.0),
+                score: Some(52.0 / 96.0),
+                resets_at: Some(now() + chrono::Duration::hours(96)),
+            }
+        );
     }
 
     #[test]
@@ -408,10 +525,9 @@ mod tests {
         )];
 
         // An Opus session does not care about the Fable window.
-        assert_eq!(
-            pick_account(&candidates, Some("opus"), now()),
-            Pick::Chosen { name: "Solo".to_owned(), headroom_pct: Some(90.0) }
-        );
+        let pick = pick_account(&candidates, Some("opus"), now());
+        assert_eq!(chosen(&pick), "Solo");
+        assert_eq!(chosen_headroom(&pick), Some(90.0));
 
         // A Fable session does, and there is nothing left for it. The alias
         // `fable` must match the window's `claude-fable-5` key.
@@ -423,7 +539,8 @@ mod tests {
 
     #[test]
     fn an_unknown_model_keeps_every_window() {
-        let Pick::Chosen { name, headroom_pct } = pick_account(&real_world(), None, now()) else {
+        let Pick::Chosen { name, headroom_pct, .. } = pick_account(&real_world(), None, now())
+        else {
             panic!("expected a pick")
         };
         assert_eq!(name, "Patrigeon");
@@ -466,6 +583,7 @@ mod tests {
             windows: vec![],
             limits: SoftLimits::default(),
             usage_known: false,
+            in_flight: 0,
         });
         // Patrigeon is measured and has room, so it wins despite the unknown
         // sorting first by name.
@@ -483,18 +601,25 @@ mod tests {
                 windows: vec![],
                 limits: SoftLimits::default(),
                 usage_known: false,
+                in_flight: 0,
             },
             Candidate {
                 name: "Alpha".to_owned(),
                 windows: vec![],
                 limits: SoftLimits::default(),
                 usage_known: false,
+                in_flight: 0,
             },
         ];
         // No data anywhere: deterministic fallback, never an error.
         assert_eq!(
             pick_account(&candidates, Some("opus"), now()),
-            Pick::Chosen { name: "Alpha".to_owned(), headroom_pct: None }
+            Pick::Chosen {
+                name: "Alpha".to_owned(),
+                headroom_pct: None,
+                score: None,
+                resets_at: None
+            }
         );
     }
 
@@ -506,10 +631,16 @@ mod tests {
             windows: vec![],
             limits: SoftLimits::default(),
             usage_known: false,
+            in_flight: 0,
         });
         assert_eq!(
             pick_account(&candidates, Some("opus"), now()),
-            Pick::Chosen { name: "Unknown".to_owned(), headroom_pct: None }
+            Pick::Chosen {
+                name: "Unknown".to_owned(),
+                headroom_pct: None,
+                score: None,
+                resets_at: None,
+            }
         );
     }
 
@@ -519,14 +650,141 @@ mod tests {
             candidate("Zeta", vec![window(KEY_SESSION, "5h", 10.0, 1)]),
             candidate("Alpha", vec![window(KEY_SESSION, "5h", 10.0, 1)]),
         ];
-        assert_eq!(
-            pick_account(&candidates, Some("opus"), now()),
-            Pick::Chosen { name: "Alpha".to_owned(), headroom_pct: Some(90.0) }
-        );
+        let pick = pick_account(&candidates, Some("opus"), now());
+        assert_eq!(chosen(&pick), "Alpha");
+        assert_eq!(chosen_headroom(&pick), Some(90.0));
     }
 
     #[test]
     fn no_candidates_is_not_exhaustion() {
         assert_eq!(pick_account(&[], Some("opus"), now()), Pick::None);
+    }
+
+    fn weekly(name: &str, utilization: f64, resets_in_hours: i64) -> Candidate {
+        candidate(name, vec![window(KEY_WEEKLY_ALL, "weekly", utilization, resets_in_hours)])
+    }
+
+    #[test]
+    fn same_margin_the_closer_reset_wins() {
+        // Same 35% left; spending it over 2h is room, over 18h it is not.
+        let candidates = vec![weekly("Afar", 65.0, 18), weekly("Bsoon", 65.0, 2)];
+        let pick = pick_account(&candidates, None, now());
+        assert_eq!(chosen(&pick), "Bsoon");
+        let Pick::Chosen { score, resets_at, .. } = pick else { unreachable!() };
+        assert_eq!(score, Some(35.0 / 2.0));
+        assert_eq!(resets_at, Some(now() + chrono::Duration::hours(2)));
+    }
+
+    #[test]
+    fn a_smaller_margin_about_to_reset_beats_a_larger_one_far_from_it() {
+        // 20% left for the next hour against 35% left for the next 18 hours.
+        let candidates = vec![weekly("Awide", 65.0, 18), weekly("Zimminent", 80.0, 1)];
+        let pick = pick_account(&candidates, None, now());
+        assert_eq!(chosen(&pick), "Zimminent");
+        // What is logged stays the raw margin of the window that decided.
+        assert_eq!(chosen_headroom(&pick), Some(20.0));
+    }
+
+    #[test]
+    fn a_reset_already_due_is_floored_not_divided_by_zero() {
+        let candidates = vec![weekly("Adue", 90.0, 0)];
+        let Pick::Chosen { score, .. } = pick_account(&candidates, None, now()) else {
+            panic!("expected a pick")
+        };
+        assert_eq!(score, Some(10.0 / MIN_HOURS_TO_RESET));
+    }
+
+    /// The night of 21 to 22 September 2026: a `headroom` pool of three
+    /// Anthropic accounts, A with 35% of its weekly left and a reset 18h away,
+    /// B with 95% left and a reset a week away, C with 23% left and 3 days to
+    /// go. The cockpit dispatched 16 sessions in three hours; the usage read
+    /// between two spawns never moved, so all 16 landed on A, which hit its
+    /// weekly wall with every one of them at once. Counting the sessions
+    /// already in flight must walk the same wave across the whole pool.
+    #[test]
+    fn a_wave_of_sixteen_spawns_spreads_across_the_pool() {
+        let mut pool =
+            vec![weekly("A", 65.0, 18), weekly("B", 5.0, 7 * 24), weekly("C", 77.0, 3 * 24)];
+        let mut elected = std::collections::BTreeMap::<String, u32>::new();
+        for _ in 0..16 {
+            let name = chosen(&pick_account(&pool, Some("opus"), now())).to_owned();
+            pool.iter_mut().find(|c| c.name == name).unwrap().in_flight += 1;
+            *elected.entry(name).or_default() += 1;
+        }
+        assert_eq!(elected.len(), 3, "every account should take part: {elected:?}");
+        // A still takes the most: its 35% over 18h is by far the fastest
+        // sustainable rate, just not sixteen sessions' worth.
+        assert!(elected["A"] > elected["B"] && elected["B"] > elected["C"], "{elected:?}");
+        assert!(elected["A"] < 16);
+
+        // Without the in-flight count, the incident reproduces exactly.
+        let fresh =
+            vec![weekly("A", 65.0, 18), weekly("B", 5.0, 7 * 24), weekly("C", 77.0, 3 * 24)];
+        for _ in 0..16 {
+            assert_eq!(chosen(&pick_account(&fresh, Some("opus"), now())), "A");
+        }
+    }
+
+    #[test]
+    fn a_window_without_a_reset_keeps_its_raw_margin() {
+        let mut open = weekly("Open", 70.0, 0);
+        open.windows[0].resets_at = None;
+        // 30% with no reset scores 30; 40% over 10h scores 4.
+        let candidates = vec![open, weekly("Timed", 60.0, 10)];
+        let Pick::Chosen { name, score, resets_at, headroom_pct } =
+            pick_account(&candidates, None, now())
+        else {
+            panic!("expected a pick")
+        };
+        assert_eq!(name, "Open");
+        assert_eq!(score, Some(30.0));
+        assert_eq!(headroom_pct, Some(30.0));
+        assert_eq!(resets_at, None);
+    }
+
+    #[test]
+    fn unreadable_accounts_spread_by_load_and_stay_behind_measured_ones() {
+        let unreadable = |name: &str, in_flight: u32| Candidate {
+            name: name.to_owned(),
+            windows: vec![],
+            limits: SoftLimits::default(),
+            usage_known: false,
+            in_flight,
+        };
+        // No data anywhere: the less loaded unknown goes first, then the name.
+        let candidates = vec![unreadable("Alpha", 2), unreadable("Beta", 0)];
+        assert_eq!(chosen(&pick_account(&candidates, None, now())), "Beta");
+
+        // A measured account with room, however loaded, still outranks them.
+        let mut busy = weekly("Measured", 90.0, 100);
+        busy.in_flight = 50;
+        let candidates = vec![unreadable("Alpha", 0), busy];
+        assert_eq!(chosen(&pick_account(&candidates, None, now())), "Measured");
+    }
+
+    #[test]
+    fn a_loaded_pool_is_still_exhausted_only_when_every_member_is_out() {
+        let mut spent = weekly("A", 100.0, 18);
+        spent.in_flight = 16;
+        let mut also_spent = weekly("B", 100.0, 40);
+        also_spent.in_flight = 1;
+        let Pick::Exhausted(blocked) = pick_account(&[spent, also_spent], None, now()) else {
+            panic!("expected exhaustion")
+        };
+        assert_eq!(blocked.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), vec!["A", "B"]);
+
+        // One member with room, even heavily loaded, keeps the pool open.
+        let mut roomy = weekly("C", 99.0, 150);
+        roomy.in_flight = 40;
+        let candidates = vec![weekly("A", 100.0, 18), roomy];
+        assert_eq!(chosen(&pick_account(&candidates, None, now())), "C");
+    }
+
+    #[test]
+    fn ordered_ignores_load_and_reset_times() {
+        let mut first = weekly("first", 90.0, 150);
+        first.in_flight = 30;
+        let candidates = vec![first, weekly("second", 0.0, 1)];
+        assert_eq!(chosen(&pick_in_order(&candidates, None, now())), "first");
     }
 }

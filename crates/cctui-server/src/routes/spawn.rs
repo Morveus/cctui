@@ -558,25 +558,32 @@ async fn auto_account_name(
     let providers: std::collections::HashMap<Uuid, Uuid> =
         rows.iter().map(|(account_id, _, provider_id, _)| (*account_id, *provider_id)).collect();
 
-    let usages =
-        futures_util::future::join_all(rows.iter().map(|(account_id, _, provider_id, _)| {
-            // Follow the chain to whoever will actually serve; fall back to the
-            // account's own credential when the target is not one we can read.
-            let effective = crate::store::account_redirects::follow_account_chain(
+    // Follow the chain to whoever will actually serve; fall back to the
+    // account's own credential when the target is not one we can read. Usage
+    // and the sessions already in flight are both measured on that credential.
+    let effective: Vec<Uuid> = rows
+        .iter()
+        .map(|(account_id, _, provider_id, _)| {
+            crate::store::account_redirects::follow_account_chain(
                 &rules,
                 *account_id,
                 family.label(),
             )
             .and_then(|to| providers.get(&to).copied())
-            .unwrap_or(*provider_id);
-            async move { crate::routes::gateway::usage_for_soft_limit(state, effective).await }
-        }))
-        .await;
+            .unwrap_or(*provider_id)
+        })
+        .collect();
+    let usages = futures_util::future::join_all(effective.iter().map(|provider| async move {
+        crate::routes::gateway::usage_for_soft_limit(state, *provider).await
+    }))
+    .await;
+    let in_flight = crate::account_resolve::in_flight_by_provider(state, &effective).await;
 
     let candidates: Vec<crate::account_pick::Candidate> = rows
         .iter()
         .zip(usages)
-        .map(|((_, name, _, soft_limits_json), usage)| crate::account_pick::Candidate {
+        .zip(&effective)
+        .map(|(((_, name, _, soft_limits_json), usage), provider)| crate::account_pick::Candidate {
             name: name.clone(),
             windows: usage
                 .as_ref()
@@ -584,13 +591,16 @@ async fn auto_account_name(
                 .unwrap_or_default(),
             limits: crate::soft_limit::SoftLimits::from_json(soft_limits_json.as_ref()),
             usage_known: usage.is_some(),
+            in_flight: in_flight.get(provider).copied().unwrap_or(0),
         })
         .collect();
 
     match crate::account_pick::pick_account(&candidates, model, chrono::Utc::now()) {
-        crate::account_pick::Pick::Chosen { name, headroom_pct } => {
+        crate::account_pick::Pick::Chosen { name, headroom_pct, score, resets_at } => {
+            let in_flight = candidates.iter().find(|c| c.name == name).map_or(0, |c| c.in_flight);
             tracing::info!(
-                %user_id, account = %name, %adapter_id, headroom_pct,
+                %user_id, account = %name, %adapter_id, headroom_pct, score,
+                resets_at = resets_at.map(|t| t.to_rfc3339()), in_flight,
                 "auto account: bound the account with the most allocation left"
             );
             Ok(Some(name))

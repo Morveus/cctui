@@ -205,6 +205,7 @@ pub async fn launch(
         auto_archive: false,
         env_keys: Vec::new(),
         attachment_names: Vec::new(),
+        label_ids: Vec::new(),
         spawn_capability: None,
     };
     match spawn::dispatch_spawn(&state, &ctx, req, Vec::new(), Vec::new()).await {

@@ -1140,6 +1140,8 @@ async fn handle_event(
                 publish_session_registered(state, &local_id).await;
             }
             crate::auto_archive::claim_intent(state, &local_id, spawn_key_hint.as_deref()).await;
+            crate::spawn_labels::claim_intent(&state.pool, &local_id, spawn_key_hint.as_deref())
+                .await;
         }
         AdapterEvent::Message { local_id, payload, turn_id } => {
             inserted_seq = insert_event(state, &local_id, "message", payload, turn_id).await?;

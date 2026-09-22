@@ -32,6 +32,7 @@ mod session_emoji;
 mod settings_catalog;
 mod skill_store;
 mod soft_limit;
+mod spawn_labels;
 mod state;
 mod store;
 mod update_check;
@@ -1623,6 +1624,7 @@ async fn reaper_task(state: AppState) {
         auto_archive_stale(&state).await;
         auto_archive::sweep(&state).await;
         admission::drain(&state).await;
+        spawn_labels::sweep(&state.pool).await;
 
         // Soft-delete ephemeral (dispatch/worker) machines that have gone
         // quiet past the TTL — pods that died before self-deenroll.

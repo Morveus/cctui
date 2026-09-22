@@ -166,6 +166,7 @@ pub async fn dispatch_spawn_as(
     if req.auto_archive {
         crate::auto_archive::remember_intent(state, &token_session_id).await;
     }
+    crate::spawn_labels::remember_intent(&state.pool, &token_session_id, &req.label_ids).await;
     let mut env = req.env.clone();
     // The session's model before any per-account remapping. When a
     // named account is selected below, its alias map can rewrite this to a
@@ -766,6 +767,7 @@ async fn save_draft(
         (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "database error".into() }))
     })?;
 
+    crate::spawn_labels::sync_draft(&state.pool, &draft_id.to_string(), &req.label_ids).await;
     tracing::info!(machine = %req.machine_id, draft = %draft_id, "draft session saved");
     Ok((
         StatusCode::CREATED,
@@ -867,6 +869,12 @@ pub async fn launch_draft(
     // Env is entered fresh at launch; account gateway env is minted in dispatch.
     req.env = launch.env;
     req.save_draft = false;
+    // Labels put on the draft card after it was saved travel with the launch.
+    for id in crate::spawn_labels::draft_label_ids(&state.pool, &session_id).await {
+        if !req.label_ids.contains(&id) {
+            req.label_ids.push(id);
+        }
+    }
 
     let outcome =
         crate::admission::spawn_or_queue(&state, &ctx, req, Vec::new(), Vec::new()).await?;

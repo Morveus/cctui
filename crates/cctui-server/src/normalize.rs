@@ -576,6 +576,12 @@ fn map_daemon_message(payload: &Value) -> Option<Value> {
             "meta": true,
             "kind": text_kind(role),
         })),
+        "turn_annotation" => Some(json!({
+            "type": "text",
+            "content": text,
+            "meta": true,
+            "kind": text_kind(role),
+        })),
         "summary" => turn_summary_parts(payload).map(|(detail, category, needs_action)| {
             json!({
                 "type": "turn_summary",
@@ -797,6 +803,16 @@ mod tests {
                 other => panic!("expected Text, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn daemon_turn_annotation_reaches_the_client_as_meta_text() {
+        let p = json!({ "role": "turn_annotation", "annotation": "turn_duration", "text": "turn_duration:1234" });
+        let n = for_client("claude-code", "message", p).unwrap();
+        assert_eq!(n["type"], "text");
+        assert_eq!(n["content"], "turn_duration:1234");
+        assert_eq!(n["meta"], true);
+        assert_eq!(n["kind"], "turn_annotation");
     }
 
     #[test]

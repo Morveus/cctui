@@ -199,6 +199,9 @@
 	// refetch still lands in its correct place.
 	// Older pages fetched via the `before` cursor; the query cache only ever
 	// holds the newest CONVERSATION_FETCH_LIMIT events, so refetches stay small.
+	// The server counts `limit` against renderable events and fills the page
+	// from further back when a stored row has nothing to show, so a page
+	// shorter than the limit is the head of the transcript.
 	let earlier = $state<AgentEvent[]>([]);
 	let earlierExhausted = $state(false);
 	let fetchingEarlier = $state(false);

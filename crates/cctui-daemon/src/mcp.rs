@@ -846,8 +846,14 @@ mod tests {
             out.flush().unwrap();
             true
         });
-        let (text, is_error) =
-            call_daemon("parent-1", &sock, "spawn_agent", &json!({ "prompt": "x" }), None, &Outbox::new());
+        let (text, is_error) = call_daemon(
+            "parent-1",
+            &sock,
+            "spawn_agent",
+            &json!({ "prompt": "x" }),
+            None,
+            &Outbox::new(),
+        );
         assert!(is_error);
         assert_eq!(text, "child agent failed");
     }

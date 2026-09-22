@@ -9,6 +9,9 @@ fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+// `sqlx::migrate!` embeds every migration in one local array; with the fork's
+// own migrations on top of upstream's it crosses clippy's 16 KiB threshold.
+#[allow(clippy::large_stack_arrays)]
 pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
     // Pool sizing is env-tunable so prod can scale connections without a rebuild.
     // Defaults are generous enough to absorb gateway proxying + heartbeats +

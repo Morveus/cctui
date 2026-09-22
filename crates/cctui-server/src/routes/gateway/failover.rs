@@ -253,6 +253,10 @@ async fn pick_within_pool(
         members.iter().map(|m| super::usage_for_soft_limit(state, m.provider_id)),
     )
     .await;
+    // A 429 burst moves many sessions off one account at once; counting the
+    // ones already moved keeps them from all landing on the same sibling.
+    let providers: Vec<Uuid> = members.iter().map(|m| m.provider_id).collect();
+    let in_flight = crate::account_resolve::in_flight_by_provider(state, &providers).await;
     let candidates: Vec<crate::account_pick::Candidate> = members
         .iter()
         .zip(usages.iter())
@@ -264,10 +268,10 @@ async fn pick_within_pool(
                 .unwrap_or_default(),
             limits: crate::soft_limit::SoftLimits::from_json(m.soft_limits_json.as_ref()),
             usage_known: usage.is_some(),
+            in_flight: in_flight.get(&m.provider_id).copied().unwrap_or(0),
         })
         .collect();
 
-    let providers: Vec<Uuid> = members.iter().map(|m| m.provider_id).collect();
     elect_replacement(
         pool,
         &candidates,
@@ -557,6 +561,7 @@ mod tests {
             },
             limits: crate::soft_limit::SoftLimits::default(),
             usage_known,
+            in_flight: 0,
         }
     }
 

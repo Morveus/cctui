@@ -50,6 +50,18 @@ pub fn choose_target(name: &str, account_exists: bool, pool: Option<AccountPool>
     }
 }
 
+/// The member an election bound, with what decided it (for the log).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Elected {
+    pub name: String,
+    /// Raw margin of the window that decided, `None` without usage data.
+    pub headroom_pct: Option<f64>,
+    /// Sustainable-rate score the member was ranked on.
+    pub score: Option<f64>,
+    /// Reset of the deciding window.
+    pub resets_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Rank `candidates` by the pool's strategy and return the elected member.
 ///
 /// Split from the DB work so the election is unit-testable: `Exhausted` is
@@ -62,14 +74,16 @@ pub fn elect(
     candidates: &[crate::account_pick::Candidate],
     model: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<String, ResolveError> {
+) -> Result<Elected, ResolveError> {
     let pick = if strategy == STRATEGY_ORDERED {
         pick_in_order(candidates, model, now)
     } else {
         pick_account(candidates, model, now)
     };
     match pick {
-        Pick::Chosen { name, .. } => Ok(name),
+        Pick::Chosen { name, headroom_pct, score, resets_at } => {
+            Ok(Elected { name, headroom_pct, score, resets_at })
+        }
         Pick::Exhausted(blocked) => {
             let detail = blocked
                 .iter()
@@ -85,6 +99,50 @@ pub fn elect(
         Pick::None => Err(ResolveError::Rejected(format!(
             "no account in pool {pool_name:?} can serve this session"
         ))),
+    }
+}
+
+/// How long after it was bound a session counts as in flight on its account
+/// even if it has not reached the gateway yet: a wave of spawns binds its
+/// sessions well before any of them shows up in the account's usage.
+pub const IN_FLIGHT_RECENT_BINDING_MINUTES: i32 = 30;
+
+/// Sessions in flight on each of `providers` (provider-row ids, what
+/// `session_tokens.account_id` references), for [`crate::account_pick`]'s load
+/// reservation. A live token counts when it was minted less than
+/// [`IN_FLIGHT_RECENT_BINDING_MINUTES`] ago, or when its session is working,
+/// i.e. presented it at the gateway within the active-liveness window. An idle
+/// session waiting for its human costs nothing and does not count; an ended one
+/// has its tokens revoked.
+///
+/// Best-effort: a failed read leaves every count at zero, which only degrades
+/// the election to the usage alone.
+pub async fn in_flight_by_provider(
+    state: &AppState,
+    providers: &[Uuid],
+) -> std::collections::HashMap<Uuid, u32> {
+    let rows: Result<Vec<(Uuid, i64)>, sqlx::Error> = sqlx::query_as(
+        "SELECT account_id, COUNT(*) FROM session_tokens \
+         WHERE account_id = ANY($1) AND revoked_at IS NULL \
+           AND (expires_at IS NULL OR expires_at > now()) \
+           AND (created_at > now() - make_interval(mins => $2) \
+                OR last_used_at > now() - make_interval(secs => $3)) \
+         GROUP BY account_id",
+    )
+    .bind(providers)
+    .bind(IN_FLIGHT_RECENT_BINDING_MINUTES)
+    .bind(crate::routes::sessions::LIVENESS_ACTIVE_SECS as f64)
+    .fetch_all(&state.pool)
+    .await;
+    match rows {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(provider, n)| (provider, u32::try_from(n).unwrap_or(u32::MAX)))
+            .collect(),
+        Err(e) => {
+            tracing::warn!("account election: counting sessions in flight failed: {e}");
+            std::collections::HashMap::new()
+        }
     }
 }
 
@@ -146,22 +204,31 @@ pub async fn elect_pool_member(
         });
     let providers: std::collections::HashMap<Uuid, Uuid> =
         members.iter().map(|m| (m.account_id, m.provider_id)).collect();
-    let usages = futures_util::future::join_all(members.iter().map(|m| {
-        let effective = crate::store::account_redirects::follow_account_chain(
-            &rules,
-            m.account_id,
-            family.label(),
-        )
-        .and_then(|to| providers.get(&to).copied())
-        .unwrap_or(m.provider_id);
-        async move { crate::routes::gateway::usage_for_soft_limit(state, effective).await }
+    // The credential that will actually serve each member: usage and load are
+    // both measured there.
+    let effective: Vec<Uuid> = members
+        .iter()
+        .map(|m| {
+            crate::store::account_redirects::follow_account_chain(
+                &rules,
+                m.account_id,
+                family.label(),
+            )
+            .and_then(|to| providers.get(&to).copied())
+            .unwrap_or(m.provider_id)
+        })
+        .collect();
+    let usages = futures_util::future::join_all(effective.iter().map(|provider| async move {
+        crate::routes::gateway::usage_for_soft_limit(state, *provider).await
     }))
     .await;
+    let in_flight = in_flight_by_provider(state, &effective).await;
 
     let candidates: Vec<crate::account_pick::Candidate> = members
         .iter()
         .zip(usages)
-        .map(|(m, usage)| crate::account_pick::Candidate {
+        .zip(&effective)
+        .map(|((m, usage), provider)| crate::account_pick::Candidate {
             name: m.name.clone(),
             windows: usage
                 .as_ref()
@@ -169,15 +236,19 @@ pub async fn elect_pool_member(
                 .unwrap_or_default(),
             limits: crate::soft_limit::SoftLimits::from_json(m.soft_limits_json.as_ref()),
             usage_known: usage.is_some(),
+            in_flight: in_flight.get(provider).copied().unwrap_or(0),
         })
         .collect();
 
-    let name = elect(&pool.name, &pool.strategy, &candidates, model, chrono::Utc::now())?;
+    let elected = elect(&pool.name, &pool.strategy, &candidates, model, chrono::Utc::now())?;
+    let in_flight = candidates.iter().find(|c| c.name == elected.name).map_or(0, |c| c.in_flight);
     tracing::info!(
-        %user_id, account = %name, pool = %pool.name, strategy = %pool.strategy,
-        family = %family.label(), "pool account: bound a member of the pool"
+        %user_id, account = %elected.name, pool = %pool.name, strategy = %pool.strategy,
+        family = %family.label(), headroom_pct = elected.headroom_pct, score = elected.score,
+        resets_at = elected.resets_at.map(|t| t.to_rfc3339()), in_flight,
+        "pool account: bound a member of the pool"
     );
-    Ok(name)
+    Ok(elected.name)
 }
 
 /// The pool half of resolution only: `name` must name a pool.
@@ -295,6 +366,7 @@ mod tests {
             }],
             limits: SoftLimits::default(),
             usage_known: true,
+            in_flight: 0,
         }
     }
 
@@ -323,7 +395,7 @@ mod tests {
     fn election_skips_the_exhausted_member() {
         let candidates = [candidate("hirobot", 100.0), candidate("pafin", 9.0)];
         assert_eq!(
-            elect("work", STRATEGY_HEADROOM, &candidates, None, chrono::Utc::now()).unwrap(),
+            elect("work", STRATEGY_HEADROOM, &candidates, None, chrono::Utc::now()).unwrap().name,
             "pafin"
         );
     }
@@ -332,7 +404,7 @@ mod tests {
     fn ordered_election_skips_an_exhausted_first_member() {
         let candidates = [candidate("hirobot", 100.0), candidate("pafin", 9.0)];
         assert_eq!(
-            elect("work", STRATEGY_ORDERED, &candidates, None, chrono::Utc::now()).unwrap(),
+            elect("work", STRATEGY_ORDERED, &candidates, None, chrono::Utc::now()).unwrap().name,
             "pafin"
         );
     }
@@ -355,7 +427,7 @@ mod tests {
         unknown.windows.clear();
         let candidates = [candidate("hirobot", 100.0), unknown];
         assert_eq!(
-            elect("work", STRATEGY_HEADROOM, &candidates, None, chrono::Utc::now()).unwrap(),
+            elect("work", STRATEGY_HEADROOM, &candidates, None, chrono::Utc::now()).unwrap().name,
             "pafin"
         );
     }

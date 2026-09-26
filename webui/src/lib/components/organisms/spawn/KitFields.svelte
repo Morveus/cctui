@@ -86,7 +86,12 @@
 						? codexModelsFor(codexCatalog)
 						: withAliasTargets(claudeModels, provider?.model_aliases)
 				);
-		const out = list.map((o) => ({ value: o.v, label: o.v ? o.label : m.spawn_model_default() }));
+		const out: SelectOption[] = list.map((o) => ({
+			value: o.v,
+			label: o.v ? o.label : m.spawn_model_default(),
+			hint: o.hint,
+			disabled: o.disabled
+		}));
 		if (!out.some((o) => o.value === '')) out.unshift({ value: '', label: m.spawn_model_default() });
 		const current = draft.model_alias ?? '';
 		if (current && !out.some((o) => o.value === current)) out.push({ value: current, label: current });

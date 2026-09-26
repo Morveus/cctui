@@ -15,6 +15,7 @@ import type { ReorderProfilesRequest } from "@bindings/ReorderProfilesRequest";
 import type { SpawnResponse } from "@bindings/SpawnResponse";
 import type { ForkRequest } from "@bindings/ForkRequest";
 import type { ForkResponse } from "@bindings/ForkResponse";
+import type { BriefResponse } from "@bindings/BriefResponse";
 import type { StageFilesResponse } from "@bindings/StageFilesResponse";
 import type { DispatchRequest } from "@bindings/DispatchRequest";
 import type { DispatchResponse } from "@bindings/DispatchResponse";
@@ -42,6 +43,9 @@ import type { SelfUpdateRun } from "@bindings/SelfUpdateRun";
 import type { SelfUpdateTarget } from "@bindings/SelfUpdateTarget";
 import type { SelfUpdateTargetInfo } from "@bindings/SelfUpdateTargetInfo";
 import type { SelfUpdateTargetRequest } from "@bindings/SelfUpdateTargetRequest";
+import type { HarnessAutoupdateInfo } from "@bindings/HarnessAutoupdateInfo";
+import type { HarnessPolicyRequest } from "@bindings/HarnessPolicyRequest";
+import type { HarnessUpdatePolicy } from "@bindings/HarnessUpdatePolicy";
 import type { InstanceUpdateRequest } from "@bindings/InstanceUpdateRequest";
 import type { MeResponse } from "@bindings/MeResponse";
 import type { CapabilitiesResponse } from "@bindings/CapabilitiesResponse";
@@ -112,6 +116,18 @@ export const endpoints = {
     api.put<SelfUpdateTargetInfo>("/admin/instance/self-update", {
       target,
     } satisfies SelfUpdateTargetRequest),
+  /** Harness auto-update: instance default plus every machine's override and report (admin). */
+  harnessAutoupdate: () => api.get<HarnessAutoupdateInfo>("/admin/harness-autoupdate"),
+  /** Set (or clear with `null`) the instance-wide harness auto-update default (admin). */
+  setHarnessAutoupdate: (policy: HarnessUpdatePolicy | null) =>
+    api.put<HarnessAutoupdateInfo>("/admin/harness-autoupdate", {
+      policy,
+    } satisfies HarnessPolicyRequest),
+  /** Set (or clear with `null`, inheriting the default) one machine's override (admin). */
+  setMachineHarnessAutoupdate: (machineId: string, policy: HarnessUpdatePolicy | null) =>
+    api.put<HarnessAutoupdateInfo>(`/admin/harness-autoupdate/${encodeURIComponent(machineId)}`, {
+      policy,
+    } satisfies HarnessPolicyRequest),
   /** Which optional integrations this server has, and whether each is live.
    *  Drives capability-gated UI: the lazy `/github` route + nav. */
   capabilities: () => api.get<CapabilitiesResponse>("/capabilities"),
@@ -300,6 +316,10 @@ export const endpoints = {
    *  Returns a `command_id` to await on the ws like spawn. */
   fork: (sessionId: string, body: ForkRequest) =>
     api.post<ForkResponse>(`/sessions/${sessionId}/fork`, body),
+  brief: (sessionId: string, maxBytes?: number) =>
+    api.get<BriefResponse>(
+      `/sessions/${sessionId}/brief${maxBytes ? `?max_bytes=${maxBytes}` : ""}`,
+    ),
   resume: (sessionId: string) =>
     api.post<void>(`/sessions/${sessionId}/resume`, {}),
   /** Rebind one of a session's per-family gateway bindings.

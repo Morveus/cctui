@@ -8,6 +8,7 @@ import {
 	withDeclaredModels,
 	customModelValue,
 	preferCatalog,
+	compareVersions,
 	withCurrentModel
 } from './harnessModels';
 
@@ -110,5 +111,51 @@ describe('declaredModelOptions', () => {
 				{ model: '', label: 'nothing' }
 			])
 		).toEqual([{ v: 'claude-opus-5', label: 'claude-opus-5' }]);
+	});
+});
+
+describe('compareVersions', () => {
+	it('orders numerically and ignores prerelease metadata', () => {
+		expect(compareVersions('0.153.0', '0.156.1')).toBe(-1);
+		expect(compareVersions('0.156.1', '0.153.0')).toBe(1);
+		expect(compareVersions('0.156.1', '0.156.1')).toBe(0);
+		expect(compareVersions('0.156.1-rc.1', '0.156.1')).toBe(0);
+		expect(compareVersions('1.0', '1.0.0')).toBe(0);
+		expect(compareVersions('nonsense', '0.1.0')).toBe(0);
+	});
+});
+
+describe('codexModelsFor gating', () => {
+	const gatedCatalog = (clientVersion?: string): CodexModelCatalog => ({
+		client_version: clientVersion,
+		models: [
+			{ ...catalog('gpt-5.5').models[0] },
+			{ ...catalog('gpt-6-astra').models[0], minimal_client_version: '0.153.0' },
+			{ ...catalog('gpt-7').models[0], minimal_client_version: '0.999.0' },
+			{ ...catalog('codex-auto-review').models[0], hidden: true }
+		]
+	});
+
+	it('disables a model the catalog view cannot offer and hints the minimum', () => {
+		const options = codexModelsFor(gatedCatalog('0.156.1'));
+		expect(options.map((o) => o.v)).toEqual(['', 'gpt-5.5', 'gpt-6-astra', 'gpt-7']);
+		expect(options[1].hint).toBeUndefined();
+		expect(options[1].disabled).toBeUndefined();
+		expect(options[2].disabled).toBe(false);
+		expect(options[2].hint).toContain('0.153.0');
+		expect(options[3].disabled).toBe(true);
+		expect(options[3].hint).toContain('0.999.0');
+	});
+
+	it('hints without disabling when no client version is known', () => {
+		const options = codexModelsFor(gatedCatalog());
+		expect(options[3].disabled).toBe(false);
+		expect(options[3].hint).toContain('0.999.0');
+	});
+
+	it('drops hidden models', () => {
+		expect(codexModelsFor(gatedCatalog('0.156.1')).some((o) => o.v === 'codex-auto-review')).toBe(
+			false
+		);
 	});
 });

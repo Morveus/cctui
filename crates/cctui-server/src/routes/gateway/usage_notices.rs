@@ -1,12 +1,14 @@
-//! Usage ticker: a `<system-reminder>` appended to the last user message of a
-//! proxied turn whenever one of the account's usage windows crossed a new
-//! `step_pct` bucket since the last notice to that session. Off by default;
-//! any failure forwards the body untouched.
+//! Usage ticker: a message delivered to the session whenever one of the
+//! account's usage windows crossed a new `step_pct` bucket since the last
+//! notice. Off by default.
+//!
+//! Delivery rides the session-messaging path, never the proxied request body:
+//! re-serializing a body in flight reorders every JSON object's keys, which
+//! busts the prompt cache for the whole history.
 
 use std::fmt::Write as _;
 
 use chrono::{DateTime, Datelike, Utc};
-use dashmap::DashMap;
 
 use super::{Account, session_id_for_token, usage_for_soft_limit};
 use crate::soft_limit::{SoftLimits, UsageWindow};
@@ -70,40 +72,43 @@ impl UsageNotices {
     }
 }
 
-/// Last bucket notified per `(session_id, window key)`.
-pub type NoticeBuckets = DashMap<(String, String), u32>;
-
 pub fn bucket(utilization: f64, step_pct: u32) -> u32 {
     let step = f64::from(step_pct.max(1));
     (utilization.max(0.0) / step).floor() as u32
 }
 
-/// Windows whose bucket moved up since the last notice, with the bucket to record
-/// after delivery. A drop (window reset) lowers the recorded bucket immediately so
-/// the next climb notifies again.
-pub fn moved_windows<'a>(
-    buckets: &NoticeBuckets,
-    session_id: &str,
+/// What a window's current bucket owes, given the step last notified for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepAction {
+    /// Climbed into a new bucket: notify, then record this step.
+    Notify(u32),
+    /// Dropped (window reset) or first sighting below the first step: record
+    /// only, so the next climb notifies again.
+    Record(u32),
+    Unchanged,
+}
+
+pub const fn step_action(last: Option<u32>, now: u32) -> StepAction {
+    match last {
+        Some(l) if now > l => StepAction::Notify(now),
+        Some(l) if now < l => StepAction::Record(now),
+        Some(_) => StepAction::Unchanged,
+        None if now > 0 => StepAction::Notify(now),
+        None => StepAction::Record(0),
+    }
+}
+
+/// Each percent window paired with the action its current utilization owes.
+pub fn window_actions<'a>(
+    last_steps: &std::collections::HashMap<String, u32>,
     windows: &'a [UsageWindow],
     step_pct: u32,
-) -> Vec<(&'a UsageWindow, u32)> {
-    let mut moved = Vec::new();
-    for w in windows.iter().filter(|w| w.amount_usd.is_none()) {
-        let now = bucket(w.utilization, step_pct);
-        let key = (session_id.to_owned(), w.key.clone());
-        match buckets.get(&key).map(|b| *b) {
-            Some(last) if now > last => moved.push((w, now)),
-            Some(last) if now < last => {
-                buckets.insert(key, now);
-            }
-            Some(_) => {}
-            None if now > 0 => moved.push((w, now)),
-            None => {
-                buckets.insert(key, 0);
-            }
-        }
-    }
-    moved
+) -> Vec<(&'a UsageWindow, StepAction)> {
+    windows
+        .iter()
+        .filter(|w| w.amount_usd.is_none())
+        .map(|w| (w, step_action(last_steps.get(&w.key).copied(), bucket(w.utilization, step_pct))))
+        .collect()
 }
 
 fn fmt_countdown(secs: i64) -> String {
@@ -146,96 +151,124 @@ pub fn notice_text(windows: &[UsageWindow], limits: &SoftLimits, now: DateTime<U
     out
 }
 
-fn reminder_block(text: &str) -> String {
-    format!("<system-reminder>\n{text}\n</system-reminder>")
+async fn last_steps(
+    pool: &sqlx::PgPool,
+    session_id: &str,
+) -> std::collections::HashMap<String, u32> {
+    sqlx::query_as::<_, (String, i32)>(
+        "SELECT window_key, step FROM usage_notice_steps WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(k, s)| (k, u32::try_from(s).unwrap_or(0)))
+    .collect()
 }
 
-fn append_to_content(content: &mut serde_json::Value, text: &str, block_type: &str) -> bool {
-    match content {
-        serde_json::Value::String(s) => {
-            s.push_str("\n\n");
-            s.push_str(text);
-            true
-        }
-        serde_json::Value::Array(items) => {
-            items.push(serde_json::json!({ "type": block_type, "text": text }));
-            true
-        }
-        _ => false,
-    }
+/// Claim a step for one window. `true` only for the caller that actually moved
+/// the stored step up, so two replicas racing the same climb notify once.
+async fn claim_step(pool: &sqlx::PgPool, session_id: &str, window_key: &str, step: u32) -> bool {
+    sqlx::query_scalar::<_, i32>(
+        "INSERT INTO usage_notice_steps (session_id, window_key, step) VALUES ($1, $2, $3) \
+         ON CONFLICT (session_id, window_key) DO UPDATE \
+             SET step = EXCLUDED.step, notified_at = now() \
+             WHERE usage_notice_steps.step < EXCLUDED.step \
+         RETURNING step",
+    )
+    .bind(session_id)
+    .bind(window_key)
+    .bind(i32::try_from(step).unwrap_or(i32::MAX))
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .is_some()
 }
 
-fn last_user_message(items: &mut [serde_json::Value]) -> Option<&mut serde_json::Value> {
-    items
-        .iter_mut()
-        .rev()
-        .find(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+async fn forget_step(pool: &sqlx::PgPool, session_id: &str, window_key: &str) {
+    let _ = sqlx::query("DELETE FROM usage_notice_steps WHERE session_id = $1 AND window_key = $2")
+        .bind(session_id)
+        .bind(window_key)
+        .execute(pool)
+        .await;
 }
 
-/// Append the reminder to the last user message of an anthropic `messages` or
-/// openai `input` body. `false` when the shape is unknown (body untouched).
-pub fn inject(body: &mut serde_json::Value, text: &str) -> bool {
-    let block = reminder_block(text);
-    if let Some(messages) = body.get_mut("messages").and_then(serde_json::Value::as_array_mut) {
-        return last_user_message(messages)
-            .and_then(|m| m.get_mut("content"))
-            .is_some_and(|c| append_to_content(c, &block, "text"));
-    }
-    match body.get_mut("input") {
-        Some(input @ serde_json::Value::String(_)) => {
-            append_to_content(input, &block, "input_text")
-        }
-        Some(serde_json::Value::Array(items)) => last_user_message(items)
-            .and_then(|m| m.get_mut("content"))
-            .is_some_and(|c| append_to_content(c, &block, "input_text")),
-        _ => false,
-    }
+async fn record_step(pool: &sqlx::PgPool, session_id: &str, window_key: &str, step: u32) {
+    let _ = sqlx::query(
+        "INSERT INTO usage_notice_steps (session_id, window_key, step) VALUES ($1, $2, $3) \
+         ON CONFLICT (session_id, window_key) DO UPDATE \
+             SET step = EXCLUDED.step, notified_at = now()",
+    )
+    .bind(session_id)
+    .bind(window_key)
+    .bind(i32::try_from(step).unwrap_or(i32::MAX))
+    .execute(pool)
+    .await;
 }
 
-/// A notice due for this turn; `commit` after a successful injection.
-#[derive(Debug)]
-pub struct PendingNotice {
-    pub text: String,
-    buckets: Vec<((String, String), u32)>,
+/// Hand the notice to the running session as an ordinary turn.
+async fn deliver(state: &AppState, session_id: &str, text: String) -> bool {
+    let row: Option<(Option<uuid::Uuid>, Option<String>)> =
+        sqlx::query_as("SELECT machine_uuid, adapter_id FROM sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten();
+    let Some((Some(machine), adapter_id)) = row else { return false };
+    let frame = cctui_proto::ws::DaemonFrameDown::Command {
+        adapter_id: adapter_id.unwrap_or_else(|| "claude-code".to_owned()),
+        command: Box::new(cctui_proto::adapter::AdapterCommand::SendMessage {
+            local_id: session_id.to_owned(),
+            text,
+        }),
+    };
+    state.bus.command_daemon_for_session(machine, session_id, frame).await.is_ok()
 }
 
-impl PendingNotice {
-    pub fn inject(&self, body: &mut serde_json::Value) -> bool {
-        inject(body, &self.text)
-    }
-
-    pub fn commit(self, state: &AppState) {
-        for (key, b) in self.buckets {
-            state.usage_notice_buckets.insert(key, b);
-        }
-    }
-}
-
-/// Resolve whether this turn owes the session a notice. Off ⇒ `None` at the
-/// cost of one field read.
-pub async fn pending(
-    state: &AppState,
-    acct: &Account,
-    session_token: &str,
-) -> Option<PendingNotice> {
+/// Deliver a usage notice to the session if one of the account's windows just
+/// crossed a step. Never touches the proxied request.
+pub async fn deliver_if_due(state: &AppState, acct: &Account, session_token: &str) {
     if !acct.usage_notices.enabled {
-        return None;
+        return;
     }
-    let session_id = session_id_for_token(state, session_token).await?;
-    let usage = usage_for_soft_limit(state, acct.id).await?;
+    let Some(session_id) = session_id_for_token(state, session_token).await else { return };
+    let Some(usage) = usage_for_soft_limit(state, acct.id).await else { return };
     let windows = crate::soft_limit::normalize_usage_windows(&usage);
-    let moved = moved_windows(
-        &state.usage_notice_buckets,
-        &session_id,
-        &windows,
-        acct.usage_notices.step_pct,
-    );
-    if moved.is_empty() {
-        return None;
+    let stored = last_steps(&state.pool, &session_id).await;
+    let actions = window_actions(&stored, &windows, acct.usage_notices.step_pct);
+
+    let mut claimed: Vec<(String, Option<u32>)> = Vec::new();
+    for (w, action) in actions {
+        match action {
+            StepAction::Notify(step) => {
+                if claim_step(&state.pool, &session_id, &w.key, step).await {
+                    claimed.push((w.key.clone(), stored.get(&w.key).copied()));
+                }
+            }
+            StepAction::Record(step) => record_step(&state.pool, &session_id, &w.key, step).await,
+            StepAction::Unchanged => {}
+        }
     }
-    let buckets = moved.iter().map(|(w, b)| ((session_id.clone(), w.key.clone()), *b)).collect();
-    tracing::debug!(account = %acct.id, session = %session_id, "usage notice due");
-    Some(PendingNotice { text: notice_text(&windows, &acct.soft_limits, Utc::now()), buckets })
+    if claimed.is_empty() {
+        return;
+    }
+    let text = notice_text(&windows, &acct.soft_limits, Utc::now());
+    if deliver(state, &session_id, text).await {
+        tracing::debug!(account = %acct.id, session = %session_id, "usage notice delivered");
+        return;
+    }
+    // Undelivered: give the step back so the next turn tries again rather than
+    // swallowing the notice for this bucket forever.
+    for (key, prev) in claimed {
+        if let Some(step) = prev {
+            record_step(&state.pool, &session_id, &key, step).await;
+        } else {
+            forget_step(&state.pool, &session_id, &key).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -266,20 +299,31 @@ mod tests {
         vec![window("session", "session", "5h", pct, None)]
     }
 
+    /// Apply the actions to a step map the way the DB layer does, reporting
+    /// whether the sweep would have notified.
+    fn tick(steps: &mut std::collections::HashMap<String, u32>, pct: f64) -> bool {
+        let windows = session_at(pct);
+        let mut notified = false;
+        for (w, action) in window_actions(steps, &windows, 10) {
+            match action {
+                StepAction::Notify(s) => {
+                    notified = true;
+                    steps.insert(w.key.clone(), s);
+                }
+                StepAction::Record(s) => {
+                    steps.insert(w.key.clone(), s);
+                }
+                StepAction::Unchanged => {}
+            }
+        }
+        notified
+    }
+
     #[test]
     fn notifies_after_52_and_81_only() {
-        let buckets = NoticeBuckets::new();
-        let notified: Vec<bool> = [4.0, 52.0, 58.0, 81.0]
-            .into_iter()
-            .map(|pct| {
-                let windows = session_at(pct);
-                let moved = moved_windows(&buckets, "s1", &windows, 10);
-                for (w, b) in &moved {
-                    buckets.insert(("s1".into(), w.key.clone()), *b);
-                }
-                !moved.is_empty()
-            })
-            .collect();
+        let mut steps = std::collections::HashMap::new();
+        let notified: Vec<bool> =
+            [4.0, 52.0, 58.0, 81.0].into_iter().map(|pct| tick(&mut steps, pct)).collect();
         assert_eq!(notified, [false, true, false, true]);
         assert_eq!(bucket(52.0, 10), 5);
         assert_eq!(bucket(81.0, 10), 8);
@@ -287,21 +331,29 @@ mod tests {
 
     #[test]
     fn sessions_are_independent_and_resets_rearm() {
-        let buckets = NoticeBuckets::new();
-        let first = session_at(52.0);
-        let m = moved_windows(&buckets, "s1", &first, 10);
-        buckets.insert(("s1".into(), "session".into()), m[0].1);
-        assert!(moved_windows(&buckets, "s1", &session_at(55.0), 10).is_empty());
-        assert_eq!(moved_windows(&buckets, "s2", &session_at(55.0), 10).len(), 1);
-        assert!(moved_windows(&buckets, "s1", &session_at(3.0), 10).is_empty());
-        assert_eq!(moved_windows(&buckets, "s1", &session_at(12.0), 10).len(), 1);
+        let mut s1 = std::collections::HashMap::new();
+        let mut s2 = std::collections::HashMap::new();
+        assert!(tick(&mut s1, 52.0));
+        assert!(!tick(&mut s1, 55.0));
+        assert!(tick(&mut s2, 55.0));
+        assert!(!tick(&mut s1, 3.0));
+        assert!(tick(&mut s1, 12.0));
     }
 
     #[test]
     fn usd_windows_never_tick() {
-        let buckets = NoticeBuckets::new();
+        let steps = std::collections::HashMap::new();
         let w = crate::soft_limit::usd_window(crate::soft_limit::KEY_SESSION_USD, 5.0, None);
-        assert!(moved_windows(&buckets, "s1", &[w], 10).is_empty());
+        assert!(window_actions(&steps, &[w], 10).is_empty());
+    }
+
+    #[test]
+    fn step_action_covers_climb_hold_and_reset() {
+        assert_eq!(step_action(None, 0), StepAction::Record(0));
+        assert_eq!(step_action(None, 5), StepAction::Notify(5));
+        assert_eq!(step_action(Some(5), 5), StepAction::Unchanged);
+        assert_eq!(step_action(Some(5), 8), StepAction::Notify(8));
+        assert_eq!(step_action(Some(8), 1), StepAction::Record(1));
     }
 
     #[test]
@@ -331,63 +383,6 @@ mod tests {
             "Account usage notice: 5h window at 60 % (soft limit 98 %), resets 01:30 UTC in 1h12. \
              Weekly (all models) at 15 %, resets Mon 09:00 UTC in 2d8h. Weekly Fable at 30 %."
         );
-    }
-
-    #[test]
-    fn injects_into_anthropic_messages() {
-        let mut body = serde_json::json!({
-            "model": "claude",
-            "messages": [
-                { "role": "user", "content": "hi" },
-                { "role": "assistant", "content": [{ "type": "text", "text": "yo" }] },
-                { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }] }
-            ]
-        });
-        assert!(inject(&mut body, "N"));
-        let last = &body["messages"][2]["content"];
-        assert_eq!(last.as_array().unwrap().len(), 2);
-        assert_eq!(
-            last[1],
-            serde_json::json!({ "type": "text", "text": "<system-reminder>\nN\n</system-reminder>" })
-        );
-        assert_eq!(body["messages"][0]["content"], "hi");
-
-        let mut plain = serde_json::json!({ "messages": [{ "role": "user", "content": "hi" }] });
-        assert!(inject(&mut plain, "N"));
-        assert_eq!(
-            plain["messages"][0]["content"],
-            "hi\n\n<system-reminder>\nN\n</system-reminder>"
-        );
-    }
-
-    #[test]
-    fn injects_into_openai_responses() {
-        let mut body = serde_json::json!({
-            "model": "gpt",
-            "input": [
-                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] },
-                { "type": "function_call_output", "call_id": "c", "output": "ok" }
-            ]
-        });
-        assert!(inject(&mut body, "N"));
-        assert_eq!(
-            body["input"][0]["content"][1],
-            serde_json::json!({ "type": "input_text", "text": "<system-reminder>\nN\n</system-reminder>" })
-        );
-        let mut plain = serde_json::json!({ "input": "hi" });
-        assert!(inject(&mut plain, "N"));
-        assert_eq!(plain["input"], "hi\n\n<system-reminder>\nN\n</system-reminder>");
-    }
-
-    #[test]
-    fn unknown_shapes_are_left_alone() {
-        let original = serde_json::json!({ "prompt": "hi", "input": 3 });
-        let mut body = original.clone();
-        assert!(!inject(&mut body, "N"));
-        assert_eq!(body, original);
-        let mut no_user =
-            serde_json::json!({ "messages": [{ "role": "assistant", "content": "x" }] });
-        assert!(!inject(&mut no_user, "N"));
     }
 
     #[test]

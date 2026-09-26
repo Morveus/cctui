@@ -15,7 +15,6 @@
 	import { Button, Drawer, IconButton, NavItem, Text, resizeHandle } from '@dorsk/tsumikit';
 	import AdapterIcon from '$lib/components/atoms/AdapterIcon.svelte';
 	import UsageNoticesEditor from '$lib/components/molecules/UsageNoticesEditor.svelte';
-	import AnthropicProviderEditor from '$lib/components/organisms/AnthropicProviderEditor.svelte';
 	import FireworksProviderEditor from '$lib/components/organisms/FireworksProviderEditor.svelte';
 	import { editorWindowKeys } from '$lib/components/molecules/usage-windows';
 	import { pagesFor, type PageId } from './pages.logic';
@@ -219,9 +218,7 @@
 				loading={catalogLoading}
 				failed={catalogFailed}
 			>
-				{#if edit.page === 'ui' && edit.isAnthropic}
-					<AnthropicProviderEditor bind:settings={edit.providerSettings} />
-				{:else if edit.page === 'gateway'}
+				{#if edit.page === 'gateway'}
 					{#if edit.isFireworks}
 						<FireworksProviderEditor
 							section="gateway"

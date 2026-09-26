@@ -4,7 +4,7 @@
 	// conversation" path for archived sessions and the supported "switch
 	// model" substitute for claude (no in-place switch).
 	import { compact } from '$lib/format';
-	import { Button, Field, Modal, Select, Text } from '@dorsk/tsumikit';
+	import { Button, Field, Modal, Select, Text, Textarea } from '@dorsk/tsumikit';
 	import ModelPicker from '$lib/components/molecules/ModelPicker.svelte';
 	import type { ModelOption } from '$lib/harnessModels';
 	import { m } from '$lib/paraglide/messages';
@@ -19,6 +19,7 @@
 		extractLabel = null,
 		model = $bindable(),
 		effort = $bindable(),
+		prompt = $bindable(''),
 		oncancel,
 		onsubmit
 	}: {
@@ -34,6 +35,7 @@
 		extractLabel?: string | null;
 		model: string;
 		effort: string;
+		prompt?: string;
 		oncancel: () => void;
 		onsubmit: () => void;
 	} = $props();
@@ -62,6 +64,9 @@
 				<Select bind:value={effort}>
 					{#each efforts as e (e)}<option value={e}>{e || m.fork_default()}</option>{/each}
 				</Select>
+			</Field>
+			<Field label={m.fork_prompt()} for="fork-prompt">
+				<Textarea id="fork-prompt" rows={3} autoresize bind:value={prompt} placeholder={m.fork_prompt_placeholder()} />
 			</Field>
 		</div>
 	{/snippet}

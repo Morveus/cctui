@@ -46,7 +46,9 @@
 </script>
 
 <Select {id} {compact} {variant} {width} chevron={compact ? false : undefined} bind:value={selected} aria-label={ariaLabel} onchange={() => pick(selected)}>
-	{#each listed as opt (opt.v)}<option value={opt.v}>{opt.label}</option>{/each}
+	{#each listed as opt (opt.v)}<option value={opt.v} disabled={opt.disabled} title={opt.hint}
+			>{opt.hint ? `${opt.label} — ${opt.hint}` : opt.label}</option
+		>{/each}
 	<option value={OTHER_MODEL}>{m.model_picker_other()}</option>
 </Select>
 {#if custom}

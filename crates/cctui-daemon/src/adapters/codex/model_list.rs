@@ -46,7 +46,14 @@ pub fn parse_model(v: &Value) -> Option<CodexModel> {
     Some(CodexModel {
         display_name: v.get("displayName").and_then(Value::as_str).unwrap_or(&id).to_owned(),
         description: v.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(),
-        hidden: v.get("hidden").and_then(Value::as_bool).unwrap_or(false),
+        hidden: v.get("hidden").and_then(Value::as_bool).unwrap_or(false)
+            || v.get("visibility").and_then(Value::as_str) == Some("hide"),
+        minimal_client_version: v
+            .get("minimalClientVersion")
+            .or_else(|| v.get("minimal_client_version"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
         is_default: v.get("isDefault").and_then(Value::as_bool).unwrap_or(false),
         default_effort: v
             .get("defaultReasoningEffort")

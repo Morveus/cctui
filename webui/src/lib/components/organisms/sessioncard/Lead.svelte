@@ -1,8 +1,7 @@
 <script lang="ts">
-	import AccountBadge from '$lib/components/molecules/AccountBadge.svelte';
 	import LabelBadge from '$lib/components/molecules/LabelBadge.svelte';
-	import MachineBadge from '$lib/components/molecules/MachineBadge.svelte';
 	import SessionDot from '$lib/components/molecules/SessionDot.svelte';
+	import SessionGlyphs from '$lib/components/molecules/SessionGlyphs.svelte';
 	import { m } from '$lib/paraglide/messages';
 	import { settings } from '$lib/settings.svelte';
 	import { Badge, Text, Timestamp } from '@dorsk/tsumikit';
@@ -10,7 +9,7 @@
 	import Gutter from './Gutter.svelte';
 	import type { SessionActions, SessionView } from './view';
 
-	// gutter · dot · machine · account · title · labels · ⚙N cadence — the lead
+	// gutter · star/dot/machine/account glyphs · title · labels · ⚙N cadence — the lead
 	// group both the compact row and the detailed card header open with.
 	let {
 		view,
@@ -31,21 +30,25 @@
 </script>
 
 <Gutter
-	session={s}
 	child={view.child}
 	selectable={actions.selectable}
 	selected={actions.selected}
 	subagentToggles={actions.subagentToggles}
-	onTogglePin={actions.onTogglePin}
 />
-<SessionDot session={s} livenessClass={view.livenessClass} now={view.now} />
 {#if view.child}
-	<Badge tone="info" size="xs">{m.sessions_subagent_badge()}</Badge>
-{:else if view.showMachine}
-	<MachineBadge name={s.machine_name} id={s.machine_id} hue={s.machine_hue} mono dense />
-{/if}
-{#if !view.child}
-	<AccountBadge name={s.account_name} warn={accountTrafficWarning(s)} showName={settings.accountNames} />
+	<SessionDot session={s} livenessClass={view.livenessClass} now={view.now} />
+	<span class="sub-badge"><Badge tone="info" size="xs">{m.sessions_subagent_badge()}</Badge></span>
+{:else}
+	<SessionGlyphs
+		session={s}
+		livenessClass={view.livenessClass}
+		now={view.now}
+		stack={row ? 'auto' : 'never'}
+		showMachine={view.showMachine}
+		accountWarn={accountTrafficWarning(s)}
+		showAccountName={settings.accountNames}
+		onTogglePin={actions.selectable ? undefined : actions.onTogglePin}
+	/>
 {/if}
 <span class="title" class:capped={row}>
 	<Text
@@ -57,7 +60,7 @@
 	>
 </span>
 {#if s.labels.length > 0 || actions.labelEditable}
-	<LabelBadge
+	<span class="labels" class:empty={s.labels.length === 0}><LabelBadge
 		labels={s.labels}
 		editable={actions.labelEditable}
 		allLabels={actions.allLabels}
@@ -66,7 +69,7 @@
 		onDetach={(lid) => actions.onDetachLabel?.(s.id, lid)}
 		onUpdate={actions.onUpdateLabel}
 		onDelete={actions.onDeleteLabel}
-	/>
+	/></span>
 {/if}
 {#if act.show && !view.stale}
 	<span
@@ -96,6 +99,18 @@
 {/if}
 
 <style>
+	.labels,
+	.sub-badge {
+		display: contents;
+	}
+	/* Em, not rem: at a large text scale the row runs out of room well before
+	   its pixel width says so. */
+	@container sess-row (max-width: 20em) {
+		.labels.empty,
+		.sub-badge {
+			display: none;
+		}
+	}
 	.title {
 		display: inline-flex;
 		flex: 0 1 auto;

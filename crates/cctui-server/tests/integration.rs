@@ -355,21 +355,21 @@ async fn account_redirect_flow() {
             a["id"].as_str().unwrap().to_string()
         }
     };
-    let hirobot = mk_account(format!("hirobot-{}", uuid_like())).await;
-    let pafin = mk_account(format!("pafin-{}", uuid_like())).await;
+    let alpha = mk_account(format!("alpha-{}", uuid_like())).await;
+    let beta = mk_account(format!("beta-{}", uuid_like())).await;
 
     // The target has no anthropic provider yet: the rule must be refused.
     let resp = client
-        .put(format!("{base}/api/v1/accounts/{hirobot}/redirect"))
+        .put(format!("{base}/api/v1/accounts/{alpha}/redirect"))
         .bearer_auth(&user_key)
-        .json(&json!({"to_account": pafin, "family": "anthropic"}))
+        .json(&json!({"to_account": beta, "family": "anthropic"}))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
 
     let resp = client
-        .post(format!("{base}/api/v1/accounts/{pafin}/providers"))
+        .post(format!("{base}/api/v1/accounts/{beta}/providers"))
         .bearer_auth(&user_key)
         .json(&json!({
             "provider": "anthropic-compatible",
@@ -382,23 +382,23 @@ async fn account_redirect_flow() {
     assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
 
     let resp = client
-        .put(format!("{base}/api/v1/accounts/{hirobot}/redirect"))
+        .put(format!("{base}/api/v1/accounts/{alpha}/redirect"))
         .bearer_auth(&user_key)
-        .json(&json!({"to_account": pafin, "family": "anthropic"}))
+        .json(&json!({"to_account": beta, "family": "anthropic"}))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
 
     for bad in [
-        json!({"to_account": hirobot, "family": "anthropic"}),
-        json!({"to_account": pafin, "to_model": "opus", "family": "anthropic"}),
+        json!({"to_account": alpha, "family": "anthropic"}),
+        json!({"to_account": beta, "to_model": "opus", "family": "anthropic"}),
         json!({"family": "anthropic"}),
-        json!({"to_account": pafin, "family": "carrier-pigeon"}),
-        json!({"match_model": "fable", "to_account": pafin, "family": "anthropic"}),
+        json!({"to_account": beta, "family": "carrier-pigeon"}),
+        json!({"match_model": "fable", "to_account": beta, "family": "anthropic"}),
     ] {
         let resp = client
-            .put(format!("{base}/api/v1/accounts/{hirobot}/redirect"))
+            .put(format!("{base}/api/v1/accounts/{alpha}/redirect"))
             .bearer_auth(&user_key)
             .json(&bad)
             .send()
@@ -409,7 +409,7 @@ async fn account_redirect_flow() {
 
     // A model flip stays on the account: no target provider involved.
     let resp = client
-        .put(format!("{base}/api/v1/accounts/{hirobot}/redirect"))
+        .put(format!("{base}/api/v1/accounts/{alpha}/redirect"))
         .bearer_auth(&user_key)
         .json(&json!({"to_model": "opus", "match_model": "fable", "family": "anthropic"}))
         .send()
@@ -419,9 +419,9 @@ async fn account_redirect_flow() {
 
     // Re-arming the account rule overwrites (unique per source+family+match).
     let resp = client
-        .put(format!("{base}/api/v1/accounts/{hirobot}/redirect"))
+        .put(format!("{base}/api/v1/accounts/{alpha}/redirect"))
         .bearer_auth(&user_key)
-        .json(&json!({"to_account": pafin, "family": "anthropic", "reason": "re-armed"}))
+        .json(&json!({"to_account": beta, "family": "anthropic", "reason": "re-armed"}))
         .send()
         .await
         .unwrap();
@@ -437,7 +437,7 @@ async fn account_redirect_flow() {
         .await
         .unwrap();
     let mine: Vec<&serde_json::Value> =
-        rules.as_array().unwrap().iter().filter(|r| r["from_account"] == json!(hirobot)).collect();
+        rules.as_array().unwrap().iter().filter(|r| r["from_account"] == json!(alpha)).collect();
     assert_eq!(mine.len(), 2, "one account rule + one model rule: {rules}");
 
     for r in mine {
@@ -458,10 +458,7 @@ async fn account_redirect_flow() {
         .json()
         .await
         .unwrap();
-    assert!(
-        rules.as_array().unwrap().iter().all(|r| r["from_account"] != json!(hirobot)),
-        "{rules}"
-    );
+    assert!(rules.as_array().unwrap().iter().all(|r| r["from_account"] != json!(alpha)), "{rules}");
 }
 
 /// Pools through the admin token, which has no user identity of its own: create

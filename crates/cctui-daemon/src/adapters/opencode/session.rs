@@ -334,12 +334,17 @@ impl OpenCodeSession {
         }
 
         let mut reattached = false;
+        let reexec = crate::selfupdate::reexec_prep();
         loop {
             if !self.in_flight {
                 reattached = false;
             }
             tokio::select! {
                 () = self.shutdown.cancelled() => break,
+                () = reexec.cancelled() => {
+                    self.on_reexec(&stream, &mut child).await;
+                    return Ok(());
+                }
                 status = child.wait() => {
                     tracing::info!(?status, "opencode serve exited");
                     if self.in_flight {
@@ -378,6 +383,22 @@ impl OpenCodeSession {
         self.abort_owned(&client).await;
         shutdown_serve(&mut child).await;
         Ok(())
+    }
+
+    /// The execve does not kill `opencode serve`: it leads its own process
+    /// group, so an unhandled re-exec leaves it running — and spending — with
+    /// no daemon reading its output. No `abort_owned` here; the server it would
+    /// be told about is about to be `SIGTERMed` anyway, and the round trip does
+    /// not fit in the re-exec grace.
+    async fn on_reexec(
+        &mut self,
+        stream: &tokio::task::JoinHandle<()>,
+        child: &mut tokio::process::Child,
+    ) {
+        tracing::info!("opencode: daemon re-exec, taking `opencode serve` down");
+        stream.abort();
+        self.fail_buffered_commands().await;
+        shutdown_serve(child).await;
     }
 
     async fn fail_buffered_commands(&mut self) {
@@ -1447,6 +1468,32 @@ mod tests {
     fn the_stall_detail_names_the_inactivity_window() {
         let detail = stalled_detail();
         assert!(detail.contains(&STREAM_INACTIVITY.as_secs().to_string()), "{detail}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_reexec_leaves_no_opencode_serve_behind() {
+        let (mut session, _rx, _client) = test_session(None);
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 300 & echo $$; wait")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pgid = i32::try_from(child.id().unwrap()).unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let _ = lines.next_line().await.unwrap();
+        assert!(group_alive(pgid));
+
+        let stream = tokio::spawn(std::future::pending::<()>());
+        session.on_reexec(&stream, &mut child).await;
+
+        assert!(!group_alive(pgid), "the re-exec must not orphan a live serve tree");
+        assert!(
+            stream.await.unwrap_err().is_cancelled(),
+            "the SSE pump must not outlive the re-exec"
+        );
     }
 
     #[cfg(unix)]

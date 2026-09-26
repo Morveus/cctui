@@ -1,6 +1,7 @@
 // Harness model + effort option lists. The server has no model allowlist;
 // these strings pass through verbatim, and every picker accepts a free-text id.
 import type { CodexModelCatalog } from '@bindings/CodexModelCatalog';
+import { m as msg } from '$lib/paraglide/messages';
 
 // Select sentinel for the free-text "Other model…" entry; never a real id.
 export const OTHER_MODEL = '\u0000other';
@@ -8,6 +9,25 @@ export const OTHER_MODEL = '\u0000other';
 export interface ModelOption {
 	v: string;
 	label: string;
+	hint?: string;
+	disabled?: boolean;
+}
+
+// Numeric semver compare, prerelease/build metadata ignored. Unparseable input
+// compares equal so an odd version never disables a model.
+export function compareVersions(a: string, b: string): number {
+	const parts = (v: string) =>
+		v
+			.split(/[-+]/, 1)[0]
+			.split('.')
+			.map((n) => Number.parseInt(n, 10));
+	const [x, y] = [parts(a), parts(b)];
+	if (x.some(Number.isNaN) || y.some(Number.isNaN)) return 0;
+	for (let i = 0; i < Math.max(x.length, y.length); i++) {
+		const d = (x[i] ?? 0) - (y[i] ?? 0);
+		if (d) return d < 0 ? -1 : 1;
+	}
+	return 0;
 }
 
 // Offline fallback for codex, used only when no catalog is known. No model slug
@@ -23,10 +43,24 @@ export function codexModelsFor(catalog: CodexModelCatalog | undefined): ModelOpt
 	const models = catalog?.models ?? [];
 	if (!models.length) return codexModels;
 	const options: ModelOption[] = [{ v: '', label: 'Default' }];
-	for (const m of models) {
-		if (m.hidden) continue;
-		const label = m.upgrade ? `${m.display_name} (superseded)` : m.display_name;
-		options.push({ v: m.id, label });
+	const current = catalog?.client_version ?? '';
+	for (const model of models) {
+		if (model.hidden) continue;
+		const label = model.upgrade ? `${model.display_name} (superseded)` : model.display_name;
+		const min = model.minimal_client_version ?? '';
+		if (!min) {
+			options.push({ v: model.id, label });
+			continue;
+		}
+		const gated = !!current && compareVersions(min, current) > 0;
+		options.push({
+			v: model.id,
+			label,
+			hint: gated
+				? msg.codex_model_gated({ version: min, current })
+				: msg.codex_model_needs_version({ version: min }),
+			disabled: gated
+		});
 	}
 	return options;
 }

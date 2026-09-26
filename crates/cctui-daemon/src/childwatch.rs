@@ -236,9 +236,16 @@ impl Drop for WatchHandle {
     }
 }
 
+/// How long a `spawn_key` bind seen before its watch is kept for the watch
+/// to claim. The spawn's HTTP reply can land after the child already started.
+const UNCLAIMED_BIND_TTL: Duration = Duration::from_mins(5);
+
 #[derive(Default)]
 pub struct ChildWatch {
     watches: Mutex<HashMap<String, Watch>>,
+    /// `spawn_key → (local_id, seen)` binds that arrived before `register`.
+    /// Locked only while `watches` is held.
+    unclaimed: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 static GLOBAL: OnceLock<Arc<ChildWatch>> = OnceLock::new();
@@ -262,10 +269,19 @@ impl ChildWatch {
         self.insert(key, WatchState { local_id: Some(key.to_owned()), ..WatchState::default() })
     }
 
-    fn insert(self: &Arc<Self>, key: &str, state: WatchState) -> WatchHandle {
+    fn insert(self: &Arc<Self>, key: &str, mut state: WatchState) -> WatchHandle {
         let notify = Arc::new(Notify::new());
+        let mut watches = self.watches.lock().unwrap();
+        let mut unclaimed = self.unclaimed.lock().unwrap();
+        if let Some((local_id, _)) = unclaimed.remove(key)
+            && state.local_id.is_none()
+        {
+            state.local_id = Some(local_id);
+        }
+        drop(unclaimed);
         let watch = Watch { state, registered_at: Instant::now(), notify: notify.clone() };
-        self.watches.lock().unwrap().insert(key.to_owned(), watch);
+        watches.insert(key.to_owned(), watch);
+        drop(watches);
         WatchHandle { key: key.to_owned(), watch: self.clone(), notify }
     }
 
@@ -295,17 +311,31 @@ impl ChildWatch {
         })
     }
 
-    /// Feed one adapter event. Cheap no-op while nothing is being watched.
+    fn on_started(
+        &self,
+        watches: &mut HashMap<String, Watch>,
+        local_id: &str,
+        extra: &serde_json::Value,
+    ) {
+        let Some(spawn_key) = bind(watches, local_id, extra) else { return };
+        let Ok(mut unclaimed) = self.unclaimed.lock() else { return };
+        let now = Instant::now();
+        unclaimed.retain(|_, (_, seen)| now.duration_since(*seen) < UNCLAIMED_BIND_TTL);
+        unclaimed.insert(spawn_key, (local_id.to_owned(), now));
+    }
+
+    /// Feed one adapter event. Cheap while nothing is being watched: only a
+    /// `SessionStarted` is kept, for a watch registered just after it.
     #[allow(clippy::cognitive_complexity, clippy::match_same_arms)]
     pub fn observe(&self, event: &AdapterEvent) {
         let Ok(mut guard) = self.watches.lock() else { return };
-        if guard.is_empty() {
+        if guard.is_empty() && !matches!(event, AdapterEvent::SessionStarted { .. }) {
             return;
         }
         let watches = &mut *guard;
         match event {
             AdapterEvent::SessionStarted { local_id, meta } => {
-                bind(watches, local_id, &meta.extra);
+                self.on_started(watches, local_id, &meta.extra);
             }
             AdapterEvent::Message { local_id, payload, .. } => {
                 if let Some(w) = find_mut(watches, local_id) {
@@ -507,21 +537,25 @@ fn clear_blocked(w: &mut Watch, kind: BlockKind) {
 
 /// Bind `local_id` to its watch by exact key, else by the echoed `spawn_key` —
 /// both pre-minted, so a bind can never land on a session the tool did not spawn.
-fn bind(watches: &mut HashMap<String, Watch>, local_id: &str, extra: &serde_json::Value) {
+/// Returns the `spawn_key` when no watch holds it yet, for `register` to claim.
+fn bind(
+    watches: &mut HashMap<String, Watch>,
+    local_id: &str,
+    extra: &serde_json::Value,
+) -> Option<String> {
     if let Some(w) = watches.get_mut(local_id) {
         w.state.local_id = Some(local_id.to_owned());
         w.notify.notify_waiters();
-        return;
+        return None;
     }
-    let Some(spawn_key) =
-        extra.get("spawn_key").and_then(serde_json::Value::as_str).filter(|k| !k.is_empty())
-    else {
-        return;
-    };
-    if let Some(w) = watches.get_mut(spawn_key).filter(|w| w.state.local_id.is_none()) {
+    let spawn_key =
+        extra.get("spawn_key").and_then(serde_json::Value::as_str).filter(|k| !k.is_empty())?;
+    let Some(w) = watches.get_mut(spawn_key) else { return Some(spawn_key.to_owned()) };
+    if w.state.local_id.is_none() {
         w.state.local_id = Some(local_id.to_owned());
         w.notify.notify_waiters();
     }
+    None
 }
 
 fn find_mut<'a>(watches: &'a mut HashMap<String, Watch>, local_id: &str) -> Option<&'a mut Watch> {
@@ -1030,6 +1064,35 @@ mod tests {
         watch.observe(&msg("ses_real", "assistant", "VERDICT: approve"));
         watch.observe(&ended("ses_real"));
         assert_eq!(finished(&h).unwrap().final_text.as_deref(), Some("VERDICT: approve"));
+    }
+
+    #[test]
+    fn a_spawn_key_bind_seen_before_register_is_claimed() {
+        let watch = Arc::new(ChildWatch::default());
+        watch.observe(&started_with_spawn_key("ses_fast", "child-key"));
+        let h = watch.register("child-key");
+        assert_eq!(h.snapshot().unwrap().local_id.as_deref(), Some("ses_fast"));
+        watch.observe(&msg("ses_fast", "assistant", "No findings."));
+        watch.observe(&ended("ses_fast"));
+        assert_eq!(finished(&h).unwrap().final_text.as_deref(), Some("No findings."));
+    }
+
+    #[test]
+    fn an_unclaimed_bind_is_claimed_once_and_expires() {
+        let watch = Arc::new(ChildWatch::default());
+        watch.observe(&started_with_spawn_key("ses_other", "other-key"));
+        let h = watch.register("child-key");
+        assert!(h.snapshot().unwrap().local_id.is_none());
+
+        watch.unclaimed.lock().unwrap().insert(
+            "stale-key".into(),
+            ("ses_stale".into(), Instant::now().checked_sub(UNCLAIMED_BIND_TTL).unwrap()),
+        );
+        watch.observe(&started_with_spawn_key("ses_new", "new-key"));
+        let keys: Vec<String> = watch.unclaimed.lock().unwrap().keys().cloned().collect();
+        assert!(!keys.contains(&"stale-key".to_owned()), "expired binds are pruned");
+        assert!(keys.contains(&"new-key".to_owned()));
+        assert!(keys.contains(&"other-key".to_owned()));
     }
 
     #[test]

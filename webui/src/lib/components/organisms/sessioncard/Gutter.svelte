@@ -1,25 +1,20 @@
 <script lang="ts">
-	import type { SessionListItem } from '@bindings/SessionListItem';
 	import SubagentBadge from '$lib/components/molecules/SubagentBadge.svelte';
 	import { m } from '$lib/paraglide/messages';
 	import type { SubagentToggle } from './view';
 
-	// Fixed leading slot shared by the checkbox, the subagent toggles, the ↳
-	// child marker and the star, so titles align across rows.
+	// Leading slot shared by the checkbox, the subagent toggles and the ↳ child
+	// marker.
 	let {
-		session,
 		child,
 		selectable,
 		selected,
-		subagentToggles,
-		onTogglePin
+		subagentToggles
 	}: {
-		session: SessionListItem;
 		child: boolean;
 		selectable: boolean;
 		selected: boolean;
 		subagentToggles: SubagentToggle[];
-		onTogglePin?: (s: SessionListItem) => void;
 	} = $props();
 </script>
 
@@ -38,28 +33,6 @@
 		{/each}
 		{#if child}
 			<span class="indent" title={m.sessions_subagent_badge()} aria-hidden="true">↳</span>
-		{:else if onTogglePin}
-			<span
-				class="star"
-				class:on={session.pinned}
-				role="button"
-				tabindex="0"
-				title={session.pinned ? m.sessions_unpin_title() : m.sessions_pin_title()}
-				aria-pressed={session.pinned}
-				aria-label={session.pinned ? m.sessions_unpin_aria() : m.sessions_pin_aria()}
-				onpointerdown={(e) => e.stopPropagation()}
-				onclick={(e) => {
-					e.stopPropagation();
-					onTogglePin?.(session);
-				}}
-				onkeydown={(e) => {
-					if (e.key === 'Enter' || e.key === ' ') {
-						e.preventDefault();
-						e.stopPropagation();
-						onTogglePin?.(session);
-					}
-				}}>{session.pinned ? '★' : '☆'}</span
-			>
 		{/if}
 	</span>
 {/if}
@@ -90,24 +63,15 @@
 		align-items: center;
 		gap: var(--sp-1);
 	}
-	.indent,
-	.star {
+	.gutter-group:empty {
+		display: none;
+	}
+	.indent {
 		flex: none;
 		width: 14px;
 		text-align: center;
 		line-height: 1;
 		font-size: var(--fs-md);
 		color: var(--text-faint);
-	}
-	.star {
-		background: none;
-		border: none;
-		cursor: pointer;
-		user-select: none;
-		padding: 0;
-	}
-	.star.on,
-	.star:hover {
-		color: var(--warn);
 	}
 </style>

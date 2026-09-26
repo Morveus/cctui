@@ -11,7 +11,7 @@
 //!   block into a config.toml that continues with `[model_providers.cctui]` and,
 //!   last, the MCP tables; a header here would capture every bare key after it.
 //! - **Typed literals.** Codex parses a `-c` right-hand side as TOML, so a
-//!   quoted boolean (`web_search="true"`) fails app-server startup outright.
+//!   quoted boolean (`hide_agent_reasoning="true"`) fails app-server startup outright.
 //!   [`Curated`] carries each key's TOML type so booleans and integers are
 //!   emitted bare.
 
@@ -49,7 +49,7 @@ const fn k(name: &'static str, ty: TomlType) -> Curated {
 /// codex settings catalog, which a server test holds to exact agreement.
 ///
 /// `service_tier` is deliberately ABSENT. It is a per-session choice supplied
-/// per thread via `with_thread_config()`, and emitting it here would pin it
+/// per thread via the daemon's `ThreadConfig`, and emitting it here would pin it
 /// process-wide for every session the app-server serves.
 pub const CURATED: &[Curated] = &[
     k("check_for_update_on_startup", TomlType::Bool),
@@ -62,9 +62,7 @@ pub const CURATED: &[Curated] = &[
     k("personality", TomlType::Str),
     k("plan_mode_reasoning_effort", TomlType::Str),
     k("show_raw_agent_reasoning", TomlType::Bool),
-    k("tools.view_image", TomlType::Bool),
-    k("tools.web_search", TomlType::Bool),
-    k("web_search", TomlType::Bool),
+    k("web_search", TomlType::Str),
 ];
 
 /// The curated entry for a key, or `None` when the key is not renderable.
@@ -93,6 +91,16 @@ fn literal(ty: TomlType, v: &Value) -> Option<String> {
     }
 }
 
+/// `web_search` was a boolean before codex made it a mode enum; accounts may
+/// still store the boolean.
+fn legacy(name: &str, v: &Value) -> Value {
+    match (name, v.as_bool()) {
+        ("web_search", Some(true)) => Value::from("live"),
+        ("web_search", Some(false)) => Value::from("disabled"),
+        _ => v.clone(),
+    }
+}
+
 /// Render the curated subset of a per-account settings blob as TOML lines.
 ///
 /// Everything not in [`CURATED`] is dropped silently: the blob is deep-merged
@@ -110,8 +118,8 @@ pub fn render_lines(settings: &Value) -> Vec<String> {
     let mut out: Vec<String> = CURATED
         .iter()
         .filter_map(|c| {
-            let v = obj.get(c.name)?;
-            Some(format!("{} = {}", c.name, literal(c.ty, v)?))
+            let v = legacy(c.name, obj.get(c.name)?);
+            Some(format!("{} = {}", c.name, literal(c.ty, &v)?))
         })
         .collect();
     out.sort();
@@ -152,15 +160,22 @@ mod tests {
     #[test]
     fn renders_each_type_as_a_real_toml_literal() {
         let block = render_block(&json!({
-            "web_search": true,
+            "hide_agent_reasoning": true,
             "model_context_window": 272_000,
             "model_verbosity": "low",
         }))
         .expect("something rendered");
         assert_eq!(
             block,
-            "model_context_window = 272000\nmodel_verbosity = \"low\"\nweb_search = true"
+            "hide_agent_reasoning = true\nmodel_context_window = 272000\nmodel_verbosity = \"low\""
         );
+    }
+
+    #[test]
+    fn legacy_boolean_web_search_renders_as_a_mode() {
+        assert_eq!(render_lines(&json!({"web_search": true})), vec!["web_search = \"live\""]);
+        assert_eq!(render_lines(&json!({"web_search": false})), vec!["web_search = \"disabled\""]);
+        assert_eq!(render_lines(&json!({"web_search": "cached"})), vec!["web_search = \"cached\""]);
     }
 
     /// The whole point of the typed emitter: a boolean must NOT come out quoted.
@@ -186,7 +201,7 @@ mod tests {
     #[test]
     fn drops_wrong_typed_and_unsafe_values() {
         // Right key, wrong JSON type: dropped, not coerced.
-        assert!(render_lines(&json!({"web_search": "true"})).is_empty());
+        assert!(render_lines(&json!({"hide_agent_reasoning": "true"})).is_empty());
         assert!(render_lines(&json!({"model_context_window": "big"})).is_empty());
         assert!(render_lines(&json!({"model_verbosity": true})).is_empty());
         // Quote / newline / backslash injection into a string value.
@@ -222,8 +237,8 @@ mod tests {
         }
         // And it parses as TOML on its own, which is what codex will do to it.
         let parsed: toml::Table = toml::from_str(&block).expect("block is valid TOML");
-        assert_eq!(parsed["web_search"].as_bool(), Some(true));
-        assert_eq!(parsed["tools"]["web_search"].as_bool(), Some(true));
+        assert_eq!(parsed["hide_agent_reasoning"].as_bool(), Some(true));
+        assert_eq!(parsed["history"]["persistence"].as_str(), Some("x"));
     }
 
     /// The two injection paths must not diverge: the daemon's `-c` pairs are
@@ -231,7 +246,7 @@ mod tests {
     #[test]
     fn overrides_round_trip_the_rendered_block() {
         let settings = json!({
-            "web_search": true,
+            "hide_agent_reasoning": true,
             "model_context_window": 272_000,
             "history.persistence": "none",
         });
@@ -239,9 +254,9 @@ mod tests {
         assert_eq!(
             overrides_from_block(&block),
             vec![
+                ("hide_agent_reasoning".to_owned(), "true".to_owned()),
                 ("history.persistence".to_owned(), "\"none\"".to_owned()),
                 ("model_context_window".to_owned(), "272000".to_owned()),
-                ("web_search".to_owned(), "true".to_owned()),
             ]
         );
     }

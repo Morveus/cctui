@@ -160,6 +160,27 @@ export const attachmentStore = {
 	}
 };
 
+/** Restore/persist sequencing for one composer. A restore superseded by a
+ *  later restore or by `discard` resolves to null, so a record read before a
+ *  send cannot put the sent files back. */
+export function attachmentDraftSync(store = attachmentStore) {
+	let generation = 0;
+	return {
+		async restore(draftKey: string): Promise<RestoredAttachments | null> {
+			const g = ++generation;
+			const restored = await store.get(draftKey);
+			return g === generation ? restored : null;
+		},
+		persist(draftKey: string, files: File[]): Promise<void> {
+			return store.set(draftKey, files);
+		},
+		discard(draftKey: string): Promise<void> {
+			generation++;
+			return store.clear(draftKey);
+		}
+	};
+}
+
 export interface SweepSession {
 	id: string;
 	status: string;

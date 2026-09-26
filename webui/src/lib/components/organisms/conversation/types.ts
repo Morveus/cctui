@@ -170,6 +170,14 @@ export interface Line {
 	// Set on a user line whose send failed: the error reason, shown
 	// red with a Retry control.
 	failed?: string;
+	// This prompt is still sitting in Claude's queue. Cleared by `queuedAt`.
+	queued?: boolean;
+	// When the prompt was enqueued, on a line that has since been delivered.
+	queuedAt?: number;
+	// Queued and dropped before delivery.
+	cancelled?: boolean;
+	// Delivered from the schedule queue: the time it was scheduled for.
+	scheduledAt?: number;
 	// Parsed AskUserQuestion payload — rendered as interactive cards.
 	ask?: AskQuestion[];
 	// Parsed ExitPlanMode plan markdown — rendered as a Plan card.
@@ -188,9 +196,8 @@ export interface Line {
 	// Consecutive markers collapse into one row; every marker's text is kept
 	// here so nothing is lost to the grouping.
 	markerTexts?: string[];
-	// Harness attachments this user turn carried, counted rather than rendered
-	// as a bubble each.
-	attachmentCount?: number;
+	/** A cache keep-alive tick and its reply, folded into one marker row. */
+	keepalive?: boolean;
 	// `system/stop_hook_summary` for the turn this assistant line closes.
 	stopHook?: string;
 	// `file-history-snapshot|delta` provenance for this tool call.

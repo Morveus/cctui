@@ -87,62 +87,6 @@ pub const fn tees_response(langfuse: bool, fireworks: bool) -> bool {
     langfuse || fireworks
 }
 
-/// Per-provider request shaping for the `anthropic` family, applied by the
-/// gateway on the way upstream. Unlike Fireworks there are no defaults: an
-/// unset blob leaves every request untouched so the proxy keeps its zero-copy
-/// streaming path.
-pub struct AnthropicSettings {
-    /// Overrides `thinking.display` on adaptive-thinking requests.
-    ///
-    /// Claude Code hardcodes `"omitted"`, which strips the reasoning text
-    /// upstream of every client — the block arrives as a bare replay signature
-    /// (CCT-828). `"summarized"` is the only value that returns readable text;
-    /// the API accepts nothing else. `None` disables the rewrite entirely.
-    pub thinking_display: Option<String>,
-}
-
-impl AnthropicSettings {
-    /// Read the stored blob. Anything outside the API's
-    /// `'summarized' | 'omitted'` enum is discarded rather than forwarded, so a
-    /// bad settings value cannot turn every request into an upstream 400.
-    pub fn resolve(stored: Option<&serde_json::Value>) -> Self {
-        let thinking_display = stored
-            .filter(|v| v.is_object())
-            .and_then(|v| v.get("thinking_display"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|s| matches!(*s, "summarized" | "omitted"))
-            .map(str::to_owned);
-        Self { thinking_display }
-    }
-
-    /// Whether this account needs the request body buffered and re-serialized.
-    /// False keeps the gateway a pure passthrough.
-    #[must_use]
-    pub const fn rewrites_body(&self) -> bool {
-        self.thinking_display.is_some()
-    }
-
-    /// Override `thinking.display`.
-    ///
-    /// This overwrites rather than filling a gap (the Fireworks convention):
-    /// Claude Code always sends the field, so "only if absent" would never
-    /// fire. Scoped to `type: "adaptive"` — a request with thinking disabled,
-    /// or the classic `type: "enabled"` budget form where `display` is not a
-    /// valid key, is left alone.
-    pub fn apply_body(&self, body: &mut serde_json::Value) {
-        let Some(display) = self.thinking_display.as_ref() else { return };
-        let Some(thinking) = body.get_mut("thinking").and_then(serde_json::Value::as_object_mut)
-        else {
-            return;
-        };
-        if thinking.get("type").and_then(serde_json::Value::as_str) != Some("adaptive") {
-            return;
-        }
-        thinking.insert("display".to_owned(), serde_json::Value::String(display.clone()));
-    }
-}
-
 /// Per-provider request-shaping settings for the `fireworks` family, resolved
 /// over [`fireworks_default_settings`]. Applied by the gateway on the way
 /// upstream so no worker needs to know them (and none can bypass them).

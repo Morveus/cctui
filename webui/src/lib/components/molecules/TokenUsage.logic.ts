@@ -12,6 +12,7 @@ export interface TokenUsageLayout {
 	showCache: boolean;
 	showCost: boolean;
 	showCold: boolean;
+	showBust: boolean;
 }
 
 export function tokenUsageLayout(
@@ -28,8 +29,14 @@ export function tokenUsageLayout(
 		sumMode: total > 0 ? (showSum ? 'always' : 'compact-only') : 'never',
 		showCache: cacheTotal > 0,
 		showCost: cost > 0,
-		showCold: cold
+		showCold: cold,
+		showBust: Boolean(usage.cache_bust)
 	};
+}
+
+/** Reason code → the i18n key naming it. Unrecognised codes read as unknown. */
+export function bustReasonKey(reason: string): 'ttl_expired' | 'gateway_rewrote_body' | 'unknown' {
+	return reason === 'ttl_expired' || reason === 'gateway_rewrote_body' ? reason : 'unknown';
 }
 
 export function tokenUsageTitle(
@@ -43,7 +50,8 @@ export function tokenUsageTitle(
 		`↓${fmt.num(Number(usage.tokens_out))}`,
 		layout.showCache ? `⚡${fmt.num(layout.cacheTotal)}` : '',
 		layout.showCost ? fmt.usd(layout.cost) : '',
-		layout.showCold ? '❄️' : ''
+		layout.showCold ? '❄️' : '',
+		layout.showBust ? '💥' : ''
 	];
 	return parts.filter(Boolean).join(' ');
 }

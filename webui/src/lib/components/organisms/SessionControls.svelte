@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { Label } from '@bindings/Label';
 	import type { Section } from '../../../routes/sessions/sessions.logic';
-	import { Button, Field, FilterSearchBar, Heading, Icon, type Schema } from '@dorsk/tsumikit';
+	import { Button, Field, FilterSearchBar, Heading, Icon, Popover, type Schema } from '@dorsk/tsumikit';
 	import { m } from '$lib/paraglide/messages';
 	import { sessionSearchPlaceholder } from '$lib/searchSchema';
 	import SectionFilter from '../molecules/SectionFilter.svelte';
@@ -58,34 +58,37 @@
 
 	const searchId = $props.id();
 
-	// Button centres its content; a full-width flyout row reads left-aligned like
+	// Button centres its content; a full-width menu row reads left-aligned like
 	// the picker rows beside it. No `align` prop on Button yet (OptionButton has one).
 	const MENU_ROW = 'justify-content:flex-start';
 
 	// Overflow menu: the toolbar grew too many buttons and squeezed the
-	// search bar. A ⋯ flyout collapses the secondary controls. On desktop it holds
+	// search bar. A ⋯ Popover collapses the secondary controls — the native
+	// popover gives light dismiss, Escape and focus return. On desktop it holds
 	// the two DimensionPickers (color-by · group-by) so the search bar reclaims
-	// width; on narrow widths a container query also folds the label/view/select
-	// controls in, leaving only the section filter inline. Width-driven (container
-	// query) not viewport-driven, mirroring DrawerHeader.
-	let moreOpen = $state(false);
+	// width; below the fold the label/view/select controls move in too, leaving
+	// only the section filter inline.
+	//
+	// The fold is measured, not queried: the panel renders in the top layer, so a
+	// `@container` rule on the bar cannot reliably style its contents. The bar's
+	// own width still drives it (not the viewport, mirroring DrawerHeader) at the
+	// same threshold as the row reorg below.
+	const FOLD_W = 640;
+	let barEl = $state<HTMLElement | null>(null);
+	let narrow = $state(false);
 
-	function closeMoreFromOutside(e: PointerEvent) {
-		if (!moreOpen) return;
-		const t = e.target as HTMLElement | null;
-		if (t?.closest('.secondary') || t?.closest('.more')) return;
-		moreOpen = false;
-	}
-	function onWinKey(e: KeyboardEvent) {
-		if (e.key === 'Escape' && moreOpen) moreOpen = false;
-	}
+	$effect(() => {
+		if (!barEl || typeof ResizeObserver === 'undefined') return;
+		const el = barEl;
+		const ro = new ResizeObserver(() => (narrow = el.clientWidth <= FOLD_W));
+		ro.observe(el);
+		return () => ro.disconnect();
+	});
 </script>
 
-<svelte:window onkeydown={onWinKey} onpointerdown={closeMoreFromOutside} />
-
-<!-- Controls that stay inline on desktop but fold into the ⋯ flyout on narrow
+<!-- Controls that stay inline on desktop but fold into the ⋯ menu on narrow
      widths: label filter, view picker, multi-select toggle. Rendered
-     via a snippet so the inline copy and the flyout copy share one source. -->
+     via a snippet so the inline copy and the menu copy share one source. -->
 {#snippet listChecks()}
 	<Icon label={m.sessions_select_multiple()} size={18}>
 		<path d="m3 17 2 2 4-4" />
@@ -124,7 +127,7 @@
 	{/if}
 {/snippet}
 
-<div class="bar row">
+<div class="bar row" bind:this={barEl}>
 	<span class="title-wrap">
 		<Heading level={1} size="xl">{m.sessions_title()}</Heading>
 	</span>
@@ -141,34 +144,35 @@
 		</Field>
 	</div>
 	<span class="ctl-item"><SectionFilter bind:sections /></span>
-	<!-- Inline copy of the foldable controls: visible on desktop, hidden by the
-	     container query below (where the flyout copy takes over). display:contents
-	     so each control stays a direct flex item of the bar. -->
-	<div class="inline-fold">{@render foldControls(false)}</div>
-	<!-- ⋯ overflow flyout, anchored to its own trigger. The wrapper is the
-	     positioning context (not the wrapping/container-scoped bar), so the menu
-	     drops directly under the ⋯ button at every width instead of detaching to
-	     the bar's far edge. -->
-	<div class="more-wrap">
-		<Button
-			class="more"
-			data-journey="options"
-			square
-			aria-label={m.drawer_more_actions()}
+	<!-- Above the fold the foldable controls render inline as bar-level flex items
+	     (display:contents); below it they move into the ⋯ menu instead. -->
+	{#if !narrow}
+		<div class="inline-fold">{@render foldControls(false)}</div>
+	{/if}
+	<span class="ctl-item">
+		<Popover
+			label={m.drawer_more_actions()}
 			title={m.drawer_more_actions()}
-			aria-expanded={moreOpen}
-			onclick={() => (moreOpen = !moreOpen)}
+			data-journey="options"
+			placement="bottom-end"
+			role="menu"
+			haspopup="menu"
+			variant="default"
+			box="lg"
+			panelStyle="width:15rem;box-shadow:var(--shadow-lg)"
 		>
-			<Icon name="more" size={18} />
-		</Button>
-		<!-- The two DimensionPickers live here at all widths; narrow widths also
-		     receive the foldable controls (menu-only copy). -->
-		<div class="secondary" class:open={moreOpen} data-journey="display-options">
-			<div class="menu-fold">{@render foldControls(true)}</div>
-			<DimensionPicker menu kind="group" value={groupBy} onchange={onGroupBy} />
-			<DimensionPicker menu kind="color" value={colorBy} onchange={onColorBy} />
-		</div>
-	</div>
+			{#snippet trigger()}
+				<Icon name="more" size={18} />
+			{/snippet}
+			<!-- The two DimensionPickers live here at all widths; below the fold the
+			     foldable controls join them. -->
+			<div class="menu" data-journey="display-options">
+				{#if narrow}{@render foldControls(true)}{/if}
+				<DimensionPicker menu kind="group" value={groupBy} onchange={onGroupBy} />
+				<DimensionPicker menu kind="color" value={colorBy} onchange={onColorBy} />
+			</div>
+		</Popover>
+	</span>
 	{#if settings.macrosEnabled}
 		<span class="new-wrap">
 			<MacrosMenu />
@@ -202,59 +206,20 @@
 		   the UI scale grows the title/buttons. */
 		flex-wrap: wrap;
 		background: var(--bg);
-		/* Fold the secondary controls based on the bar's own width, not the viewport
-		  , mirroring DrawerHeader. The bar is already position:sticky, so
-		   it also serves as the positioning context for the absolute flyout. */
+		/* Drive the row reorg from the bar's own width, not the viewport, mirroring
+		   DrawerHeader. */
 		container: sess-bar / inline-size;
 	}
 	/* Inline copy of the foldable controls flows as bar-level flex items. */
 	.inline-fold {
 		display: contents;
 	}
-	/* The ⋯ trigger + its flyout share one positioning context so the menu drops
-	   under the button, not the wrapping bar's far edge. */
-	.more-wrap {
-		position: relative;
-		flex: none;
+	/* Labeled rows stacked like a real menu; the panel supplies the surface. */
+	.menu {
 		display: flex;
-	}
-	/* ⋯ flyout: an absolute dropdown anchored to the ⋯ button, holding the
-	   DimensionPickers at all widths (plus the foldable controls on narrow ones).
-	   Hidden until opened. */
-	.secondary {
-		display: none;
-		position: absolute;
-		top: calc(100% + var(--sp-1));
-		right: 0;
-		/* Fixed, content-comfortable width so the labeled rows read as a real menu
-		   (mirrors the drawer's ⋯ flyout), never exceeding the viewport. */
-		width: 15rem;
-		max-width: calc(100vw - 1.5rem);
-		z-index: 30;
 		flex-direction: column;
 		align-items: stretch;
 		gap: 2px;
-		padding: var(--sp-1);
-		background: var(--bg-elevated-2);
-		border: 1px solid var(--border-strong);
-		border-radius: var(--r-md);
-		box-shadow: var(--shadow-lg, 0 8px 24px rgba(0, 0, 0, 0.5));
-	}
-	.secondary.open {
-		display: flex;
-	}
-	/* The foldable controls sit in the flyout ONLY on narrow widths; on desktop
-	   they render inline (via .inline-fold) so the menu holds just the dimensions. */
-	.menu-fold {
-		display: none;
-	}
-	@container sess-bar (max-width: 640px) {
-		.inline-fold {
-			display: none;
-		}
-		.menu-fold {
-			display: contents;
-		}
 	}
 	/* Search fills the gap between the title and the right-hand controls. Our
 	   own wrapper is the flex item and is sized directly, so the FilterSearchBar
@@ -296,8 +261,7 @@
 	@container sess-bar (max-width: 640px) {
 		/* Default everyone to row 2… */
 		.search-box,
-		.ctl-item,
-		.more-wrap {
+		.ctl-item {
 			order: 2;
 		}
 		/* Row 1: title (grows to push New flush right) then the New button. */

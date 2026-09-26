@@ -88,6 +88,11 @@ pub enum DaemonFrameUp {
         /// it cannot parse that reply and must never receive one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_jobs: Option<Vec<String>>,
+        /// Harness versions and auto-update outcomes. Optional: the server
+        /// sends [`DaemonFrameDown::HarnessUpdatePolicy`] only to a daemon that
+        /// reports it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        harness: Option<crate::harness::HarnessReport>,
     },
     /// Reply to a [`DaemonFrameDown::StageFiles`] request (mid-chat
     /// attachments). `request_id` correlates with the originating
@@ -269,6 +274,9 @@ pub enum DaemonFrameDown {
     /// Postgres outlives them both. A daemon with no hook configured reports
     /// `failed` immediately rather than silently dropping the frame.
     RunUpdateHook { run_id: uuid::Uuid, version: String, release_url: String },
+    /// Effective harness auto-update policy for this machine. Only ever sent
+    /// to a daemon whose heartbeat carried a `harness` report.
+    HarnessUpdatePolicy { policy: crate::harness::HarnessUpdatePolicy },
 }
 
 /// Effective secret-scrub config synced to the daemon.
@@ -421,11 +429,15 @@ pub enum AgentEvent {
         #[serde(default)]
         meta: bool,
         /// `thinking` | `redacted_thinking` | `attachment` | `system_marker` |
-        /// `turn_annotation`;
+        /// `turn_annotation` | `queue_op`;
         /// `None` is ordinary visible prose. Free string so an unknown adapter
         /// kind still decodes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        /// Queue verb for a `queue_op`: `queued` | `dequeued` | `removed` |
+        /// `cleared`. `None` for every other kind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation: Option<String>,
         ts: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
@@ -831,6 +843,7 @@ mod tests {
             content: "hello".into(),
             meta: false,
             kind: None,
+            operation: None,
             ts: 1_234_567_890,
             message_id: None,
             usage: None,
@@ -854,6 +867,7 @@ mod tests {
             content: "hi".into(),
             meta: false,
             kind: None,
+            operation: None,
             ts: 10,
             message_id: None,
             usage: None,
@@ -878,6 +892,7 @@ mod tests {
             content: "Here is my analysis.".into(),
             meta: false,
             kind: None,
+            operation: None,
             ts: 100, // ties the answer's ts
             message_id: None,
             usage: None,
@@ -895,6 +910,7 @@ mod tests {
             content: "▷ User: option A".into(),
             meta: false,
             kind: None,
+            operation: None,
             ts: 100,
             message_id: None,
             usage: None,
@@ -977,6 +993,7 @@ mod tests {
                 content: "hello".into(),
                 meta: false,
                 kind: None,
+                operation: None,
                 ts: 1,
                 message_id: None,
                 usage: None,
@@ -1024,6 +1041,7 @@ mod tests {
                 content: "hi".into(),
                 meta: false,
                 kind: None,
+                operation: None,
                 ts: 1,
                 message_id: None,
                 usage: None,
@@ -1065,6 +1083,7 @@ mod tests {
                 ..Default::default()
             }),
             claude_jobs: Some(vec!["deadbeef".into()]),
+            harness: Some(crate::harness::HarnessReport::default()),
         };
         let json = serde_json::to_string(&hb).unwrap();
         assert!(json.contains(r#""forward":900"#), "{json}");
@@ -1078,7 +1097,15 @@ mod tests {
         match back {
             // A daemon that predates either field says nothing about both; the
             // server must not read that silence as "no hook".
-            DaemonFrameUp::Heartbeat { bandwidth, update_hook, resources, claude_jobs, .. } => {
+            DaemonFrameUp::Heartbeat {
+                bandwidth,
+                update_hook,
+                resources,
+                claude_jobs,
+                harness,
+                ..
+            } => {
+                assert!(harness.is_none());
                 assert!(bandwidth.is_none());
                 assert!(update_hook.is_none());
                 assert!(resources.is_none());
@@ -1101,6 +1128,19 @@ mod tests {
         match back {
             DaemonFrameDown::RunUpdateHook { version, .. } => assert_eq!(version, "0.7.319"),
             _ => panic!("expected RunUpdateHook"),
+        }
+    }
+
+    #[test]
+    fn harness_update_policy_roundtrips() {
+        let f = DaemonFrameDown::HarnessUpdatePolicy {
+            policy: crate::harness::HarnessUpdatePolicy { enabled: true, ..Default::default() },
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains(r#""type":"harness_update_policy""#), "{json}");
+        match serde_json::from_str::<DaemonFrameDown>(&json).unwrap() {
+            DaemonFrameDown::HarnessUpdatePolicy { policy } => assert!(policy.enabled),
+            _ => panic!("expected HarnessUpdatePolicy"),
         }
     }
 

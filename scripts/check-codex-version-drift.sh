@@ -68,4 +68,4 @@ if at_least "$floor" "$upstream"; then
 fi
 
 echo "::notice::Codex floor $floor is behind upstream latest $upstream."
-echo "Raise CODEX_MIN_VERSION, ARG CODEX_VERSION and regenerate the retained schema when workers must not run anything older."
+echo "Raise CODEX_MIN_VERSION, ARG CODEX_VERSION, regenerate the retained schema, re-vendor codex-config.schema.json and re-verify codex-catalog.toml (scripts/check-codex-schema-drift.sh) when workers must not run anything older."

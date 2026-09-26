@@ -106,7 +106,7 @@ pub fn reconcile_5h(recent: f64, week: f64, upstream_week: Option<f64>) -> f64 {
 mod tests {
     use super::{parse_billing_usage, reconcile_5h, reconcile_7d};
 
-    /// Verbatim shape of a real `billingUsage` response (accounts/pafin-inc,
+    /// Verbatim shape of a real `billingUsage` response (accounts/beta-inc,
     /// 2026-07-28, grouped by `api_key_id` + `api_key_name` + `model_name`): two keys on
     /// one shared account, only one of which is cctui's.
     const SHARED_ACCOUNT: &[u8] = br#"{
@@ -119,7 +119,7 @@ mod tests {
           "costNanoUsd": 0,
           "group": {
             "api_key_id": "key_BCeQCxy72",
-            "api_key_name": "grid-hirobot",
+            "api_key_name": "grid-alpha",
             "model_name": "accounts/fireworks/models/kimi-k3"
           },
           "modelName": "accounts/fireworks/models/kimi-k3",
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn only_our_own_api_key_is_counted_on_a_shared_account() {
-        let got = parse_billing_usage(SHARED_ACCOUNT, "grid-hirobot");
+        let got = parse_billing_usage(SHARED_ACCOUNT, "grid-alpha");
         assert_eq!(got.len(), 1);
         let (model, usage) = &got[0];
         assert_eq!(model, "accounts/fireworks/models/kimi-k3");

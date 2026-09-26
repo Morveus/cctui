@@ -2,8 +2,10 @@
 import type { AdapterId } from "./AdapterId";
 import type { Attention } from "./Attention";
 import type { Bucket } from "./Bucket";
+import type { KeepaliveState } from "./KeepaliveState";
 import type { Label } from "./Label";
 import type { Liveness } from "./Liveness";
+import type { RemoveInitiator } from "./RemoveInitiator";
 import type { SessionEndReason } from "./SessionEndReason";
 import type { SessionStatus } from "./SessionStatus";
 import type { TodoEntry } from "./TodoEntry";
@@ -74,6 +76,11 @@ model?: string | null,
  * Reasoning/effort level (e.g. `"low"`, `"high"`), when set.
  */
 effort?: string | null, 
+/**
+ * Permission posture the session runs under (e.g. `"yolo"`,
+ * `"plan"`), when known.
+ */
+permission_mode?: string | null, 
 /**
  * Whether cctui-side auto-approve is on for this session.
  * In-memory server state, reflected so clients can show the toggle.
@@ -218,4 +225,22 @@ end_reason?: SessionEndReason | null,
 /**
  * Adapter/server diagnostic for the end (exit status, stderr tail).
  */
-end_detail?: string | null, ended_at?: string | null, };
+end_detail?: string | null, ended_at?: string | null, 
+/**
+ * When the idle-TTL sweep will archive this session (and remove its
+ * worker). `None` when pinned, archived, a draft, or the sweep is off.
+ */
+auto_archive_at?: string | null, 
+/**
+ * Who archived the session; `None` while live or when unrecorded.
+ */
+archived_by?: RemoveInitiator | null, 
+/**
+ * Cache keep-alive schedule while enabled (`sessions.keepalive_json`);
+ * `None` when off.
+ */
+keepalive?: KeepaliveState | null, 
+/**
+ * When the reaper last claimed a keep-alive tick for this session.
+ */
+last_keepalive_at?: string | null, };

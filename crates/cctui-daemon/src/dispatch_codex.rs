@@ -175,8 +175,7 @@ impl CodexDispatch {
 
     /// The `codex exec` argument vector (everything after the `codex` program).
     ///
-    /// Mirrors `deploy/codex-run.sh` (skip-git-repo-check, stdin closed at spawn)
-    /// plus `--json` for a parseable event stream and `-o` for a robust last-
+    /// `--skip-git-repo-check` with stdin closed at spawn, plus `--json` for a parseable event stream and `-o` for a robust last-
     /// message capture. Model/effort are passed EXPLICITLY (not left to
     /// config.toml) because a codex dispatch selects them per-request in the
     /// payload; approvals/sandbox/provider still come from the hardened

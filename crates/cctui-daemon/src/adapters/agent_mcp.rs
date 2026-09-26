@@ -187,6 +187,16 @@ mod tests {
         assert_eq!(mcp.session_key(), "spawn-key-1");
     }
 
+    /// A session launched without an explicit capability is granted the machine
+    /// default, so it gets the relay — `CctuiAgent` and the read-only `CctuiUsage`.
+    #[test]
+    fn the_default_grant_mounts_the_relay() {
+        let mcp =
+            AgentMcp::for_capability("spawn-key-1", Some(&SpawnCapability::machine_default()))
+                .expect("the default grant offers the tool");
+        assert_eq!(mcp.session_key(), "spawn-key-1");
+    }
+
     #[test]
     fn codex_overrides_register_the_relay_as_an_mcp_server() {
         let overrides = fixture().codex_config_overrides();

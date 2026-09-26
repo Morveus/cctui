@@ -830,11 +830,13 @@ pub async fn dispatch(
     // `payload.spawn_capability` declares what the dispatched worker may spawn
     // through `CctuiAgent`. It is read here, server-side, and never forwarded —
     // the worker must not be able to read or restate its own capability.
-    if let Some(obj) = forwarded_payload.as_object_mut()
-        && let Some(raw) = obj.remove("spawn_capability")
-        && let Ok(cap) = serde_json::from_value::<cctui_proto::api::SpawnCapability>(raw)
-        && !cap.is_empty()
     {
+        let declared = forwarded_payload
+            .as_object_mut()
+            .and_then(|obj| obj.remove("spawn_capability"))
+            .and_then(|raw| serde_json::from_value::<cctui_proto::api::SpawnCapability>(raw).ok())
+            .filter(|cap| !cap.is_empty());
+        let cap = declared.unwrap_or_else(cctui_proto::api::SpawnCapability::machine_default);
         if let Err(e) =
             crate::store::spawn_capabilities::upsert(&state.pool, &session_id, &cap).await
         {
@@ -1091,8 +1093,8 @@ mod tests {
         // same rule a name that denotes both an account and a pool follows.
         let pool = uuid::Uuid::new_v4();
         assert_eq!(
-            default_binding(Some("hirobot".into()), Some(pool)),
-            Some(DefaultBinding::Account("hirobot".into()))
+            default_binding(Some("alpha".into()), Some(pool)),
+            Some(DefaultBinding::Account("alpha".into()))
         );
     }
 

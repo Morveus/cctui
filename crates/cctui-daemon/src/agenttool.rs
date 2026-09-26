@@ -60,6 +60,11 @@ enum CallKind {
     Usage {
         model: Option<String>,
     },
+    /// The relay announcing that it answered `initialize`.
+    RelayReady,
+    /// The session's `SessionStart` hook holding the first turn until the relay
+    /// is ready.
+    RelayWait,
 }
 
 #[derive(Debug)]
@@ -124,6 +129,8 @@ fn parse_call(line: &str) -> Result<Call, String> {
         Some("follow_agent") => CallKind::Follow(
             string_arg(&args, "session_id").ok_or("follow_agent needs the child session_id")?,
         ),
+        Some("relay_ready") => CallKind::RelayReady,
+        Some("relay_wait") => CallKind::RelayWait,
         Some("spawn_agent") => {
             let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or("").to_owned();
             if prompt.trim().is_empty() {
@@ -215,7 +222,7 @@ fn dispatch_note(kind: &CallKind, timeout: Duration) -> String {
             "\n\n[reattached to child {child} after the daemon restarted · nothing was re-sent to it · follow window {}s]",
             timeout.as_secs(),
         ),
-        CallKind::Usage { .. } => String::new(),
+        CallKind::Usage { .. } | CallKind::RelayReady | CallKind::RelayWait => String::new(),
     }
 }
 
@@ -454,8 +461,21 @@ async fn run_call(
     call: Call,
     out: &mut (impl AsyncWriteExt + Unpin),
 ) -> Value {
-    if let CallKind::Usage { model } = &call.kind {
-        return run_usage(server, machine_key, &call.session_id, model.as_deref()).await;
+    match &call.kind {
+        CallKind::Usage { model } => {
+            return run_usage(server, machine_key, &call.session_id, model.as_deref()).await;
+        }
+        CallKind::RelayReady => {
+            crate::mcpready::announce(&call.session_id);
+            return json!({ "ok": true, "result": "ready" });
+        }
+        // Never `ok: false`: the hook releases the first turn either way.
+        CallKind::RelayWait => {
+            let ready = crate::mcpready::wait_until_ready(&call.session_id, call.timeout).await;
+            let result = if ready { "ready" } else { "timeout" };
+            return json!({ "ok": true, "result": result });
+        }
+        CallKind::Spawn(_) | CallKind::Message(_) | CallKind::Follow(_) => {}
     }
     let note = dispatch_note(&call.kind, call.timeout);
     let watch = crate::childwatch::global();
@@ -467,9 +487,6 @@ async fn run_call(
                     return annotate(json!({ "ok": false, "error": err.to_string() }), &note);
                 }
             };
-            // Register BEFORE the spawn frame can produce events; the server
-            // has already dispatched the spawn at this point, but the child
-            // takes seconds to boot, so this stays ahead of its first event.
             let handle = watch.register(&child.session_id);
             tracing::info!(
                 parent = %call.session_id,
@@ -500,8 +517,8 @@ async fn run_call(
             );
             (handle, child.clone())
         }
-        CallKind::Usage { .. } => {
-            unreachable!("a usage call returns above; it has no child to spawn or follow")
+        CallKind::Usage { .. } | CallKind::RelayReady | CallKind::RelayWait => {
+            unreachable!("these return above; they have no child to spawn or follow")
         }
     };
     // Tell the relay which child this call is now following, BEFORE the first
@@ -705,6 +722,16 @@ mod tests {
         assert_eq!(req.cwd.as_deref(), Some("/workspace"));
         assert_eq!(req.permission_mode, Some(cctui_proto::adapter::PermissionMode::Auto));
         assert_eq!(req.name.as_deref(), Some("reviewer"));
+    }
+
+    #[test]
+    fn the_relay_readiness_ops_parse_without_any_args() {
+        let ready = json!({ "kind": "relay_ready", "session_id": "s1" }).to_string();
+        assert!(matches!(parse_call(&ready).unwrap().kind, CallKind::RelayReady));
+        let wait = json!({ "kind": "relay_wait", "session_id": "s1", "timeout_secs": 8 });
+        let call = parse_call(&wait.to_string()).unwrap();
+        assert!(matches!(call.kind, CallKind::RelayWait));
+        assert_eq!(call.timeout, Duration::from_secs(8));
     }
 
     #[test]

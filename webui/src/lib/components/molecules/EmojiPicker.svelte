@@ -123,13 +123,12 @@
 	.tab.on,
 	.cell.on {
 		border-color: var(--accent);
-		background: var(--surface-2, transparent);
 	}
 	.tab:hover,
 	.cell:hover,
 	.tab:focus-visible,
 	.cell:focus-visible {
-		background: var(--surface-2, rgba(128, 128, 128, 0.15));
+		background: var(--bg-elevated-2);
 		outline: none;
 	}
 	.grid {

@@ -442,6 +442,7 @@ impl Supervisor {
                                 .lock()
                                 .map_or(None, |mut s| s.sample()),
                             claude_jobs: claude_jobs_root(running).map(|root| jobs_on_disk(&root)),
+                            harness: Some(crate::harness_update::report()),
                         };
                         let payload = serde_json::to_string(&hb)?;
                         self.counters.add(Subsystem::Heartbeat, payload.len() as u64);
@@ -595,6 +596,9 @@ impl Supervisor {
             }
             DaemonFrameDown::RunUpdateHook { run_id, version, release_url } => {
                 self.spawn_update_hook(run_id, version, release_url);
+            }
+            DaemonFrameDown::HarnessUpdatePolicy { policy } => {
+                crate::harness_update::set_policy(policy);
             }
             _ => {}
         }
@@ -1183,7 +1187,11 @@ async fn purge_leaked_jobs(
         if !still_there {
             continue;
         }
-        let command = AdapterCommand::Remove { local_id, command_id: None };
+        let command = AdapterCommand::Remove {
+            local_id,
+            command_id: None,
+            initiator: cctui_proto::adapter::RemoveInitiator::Automatic,
+        };
         tokio::select! {
             () = shutdown.cancelled() => {
                 tracing::info!(sent, total, "adapter stopped; leaked job purge interrupted");
@@ -1465,6 +1473,7 @@ mod tests {
             command: Box::new(cctui_proto::adapter::AdapterCommand::Remove {
                 local_id: "deadbeef-0000-0000-0000-000000000000".to_owned(),
                 command_id: Some(command_id),
+                initiator: cctui_proto::adapter::RemoveInitiator::User,
             }),
         };
         let handled = supervisor.handle_frame(
@@ -1543,8 +1552,13 @@ mod tests {
                 .expect("purge must queue the leaked removals")
                 .expect("command channel open");
             match cmd {
-                cctui_proto::adapter::AdapterCommand::Remove { local_id, command_id } => {
+                cctui_proto::adapter::AdapterCommand::Remove {
+                    local_id,
+                    command_id,
+                    initiator,
+                } => {
                     assert!(command_id.is_none());
+                    assert_eq!(initiator, cctui_proto::adapter::RemoveInitiator::Automatic);
                     removed.push(local_id);
                 }
                 // The marks fan-out precedes the purge.
@@ -1591,8 +1605,9 @@ mod tests {
                 .expect("purge must queue the leaked removals")
                 .expect("command channel open");
             match cmd {
-                AdapterCommand::Remove { local_id, command_id } => {
+                AdapterCommand::Remove { local_id, command_id, initiator } => {
                     assert!(command_id.is_none());
+                    assert_eq!(initiator, cctui_proto::adapter::RemoveInitiator::Automatic);
                     removed.push(local_id);
                 }
                 other => panic!("expected Remove, got {other:?}"),
@@ -1971,6 +1986,7 @@ mod tests {
             update_hook: None,
             resources: None,
             claude_jobs: None,
+            harness: None,
         };
         let super::Prepared::Frame(text) = super::prepare_send(&hb).unwrap() else {
             panic!("heartbeat must not chunk")

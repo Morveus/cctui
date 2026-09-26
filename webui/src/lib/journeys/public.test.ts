@@ -205,7 +205,6 @@ describe('public journey set', () => {
 			'actions',
 			'kinds',
 			'line-actions',
-			'mobile-filters',
 			'filters',
 			'filter-menu',
 			'reply'
@@ -213,9 +212,7 @@ describe('public journey set', () => {
 	});
 
 	it('teaches the drawer without depending on a session that may end mid-tour', () => {
-		const ids = pub('follow-session').steps.map((s) => s.id);
 		expect(requiredParams(pub('follow-session'))).toEqual([]);
-		expect(ids.indexOf('mobile-filters')).toBeLessThan(ids.indexOf('filters'));
 		const open = pub('follow-session').steps[0];
 		expect(open.expect).not.toContainEqual({ visible: 'conversation/line[assistant]' });
 	});

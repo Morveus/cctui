@@ -91,13 +91,12 @@ export function parseViewOpts(raw: string): ViewOpts {
 	} catch {
 		saved = {};
 	}
-	const bool = (k: string) => (typeof saved[k] === 'boolean' ? (saved[k] as boolean) : true);
 	const width = saved.paneWidth;
 	return {
 		msgFilter: normalizeFilter(saved.msgFilter ?? saved.typeFilter),
-		prettyJson: bool('prettyJson'),
-		prettyDiff: bool('prettyDiff'),
-		prettyTables: bool('prettyTables'),
+		prettyJson: true,
+		prettyDiff: true,
+		prettyTables: true,
 		paneWidth: typeof width === 'number' && Number.isFinite(width) ? width : null
 	};
 }

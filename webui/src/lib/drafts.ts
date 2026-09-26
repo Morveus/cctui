@@ -183,6 +183,7 @@ export const LAST_SPAWN_NAME = 'cctui_last_spawn_name';
  * fresh dialog open defaults its label picker to this set; an empty submit
  * clears it. */
 export const LAST_SPAWN_LABELS = 'cctui_last_spawn_labels';
+export const FOLLOWUP_ARCHIVE_SOURCE = 'cctui_followup_archive_source';
 
 /** Next proposed session name: bump a trailing `-<n>` suffix, else append
  * `-2` (`toto` → `toto-2`, `toto-5` → `toto-6`). Zero-padding is kept

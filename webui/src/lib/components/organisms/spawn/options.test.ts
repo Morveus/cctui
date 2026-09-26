@@ -176,10 +176,10 @@ describe('accountPickOptions', () => {
 		({ id, name: id, emoji: null, providers: providers.map(provider) }) as unknown as OAuthAccount;
 	const build = (over: Partial<Parameters<typeof accountPickOptions>[0]> = {}) =>
 		accountPickOptions({
-			accounts: [acct('hirobot'), acct('pafin')],
+			accounts: [acct('alpha'), acct('beta')],
 			pools: [{ id: 'p1', name: 'work' }] as never,
 			harness: 'claude-code',
-			usedPct: (id) => (id === 'hirobot' ? 100 : null),
+			usedPct: (id) => (id === 'alpha' ? 100 : null),
 			...over
 		});
 
@@ -196,8 +196,8 @@ describe('accountPickOptions', () => {
 	it('keeps the value space unchanged, with Auto as the empty value', () => {
 		expect(build().map((o) => o.value)).toEqual([
 			`${POOL_PREFIX}p1`,
-			'hirobot',
-			'pafin',
+			'alpha',
+			'beta',
 			'',
 			NO_ACCOUNT
 		]);
@@ -205,8 +205,8 @@ describe('accountPickOptions', () => {
 
 	it('keeps the usage hint on accounts and drops the per-row pool hint', () => {
 		const opts = build();
-		expect(opts.find((o) => o.value === 'hirobot')?.hint).toBe('100%');
-		expect(opts.find((o) => o.value === 'pafin')?.hint).toBeUndefined();
+		expect(opts.find((o) => o.value === 'alpha')?.hint).toBe('100%');
+		expect(opts.find((o) => o.value === 'beta')?.hint).toBeUndefined();
 		expect(opts[0].hint).toBeUndefined();
 	});
 

@@ -237,6 +237,7 @@ pub async fn limit_reset(
         // to fetch; doing it here just leaves the cache warm and pushes once.
         if let Ok((p, usage)) = crate::routes::gateway::fetch_usage_with_provider(&state, id).await
         {
+            crate::routes::gateway::record_usage_samples(&state, id, usage.as_ref());
             crate::routes::accounts::store_and_broadcast_usage(&state, id, p, usage).await;
         }
     }

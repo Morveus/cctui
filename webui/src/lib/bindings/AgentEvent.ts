@@ -5,11 +5,16 @@ import type { JsonValue } from "./serde_json/JsonValue";
 export type AgentEvent = { "type": "text", content: string, meta: boolean, 
 /**
  * `thinking` | `redacted_thinking` | `attachment` | `system_marker` |
- * `turn_annotation`;
+ * `turn_annotation` | `queue_op`;
  * `None` is ordinary visible prose. Free string so an unknown adapter
  * kind still decodes.
  */
-kind?: string | null, ts: number, message_id?: string | null, usage?: TokenUsage | null, seq?: number | null, 
+kind?: string | null, 
+/**
+ * Queue verb for a `queue_op`: `queued` | `dequeued` | `removed` |
+ * `cleared`. `None` for every other kind.
+ */
+operation?: string | null, ts: number, message_id?: string | null, usage?: TokenUsage | null, seq?: number | null, 
 /**
  * Identity of the human turn this text belongs to. `None` for
  * assistant text, for turns cctui did not originate, and for rows

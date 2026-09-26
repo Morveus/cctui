@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { TokenUsage } from '@bindings/TokenUsage';
-import { tokenUsageLayout, tokenUsageTitle } from './TokenUsage.logic';
+import { bustReasonKey, tokenUsageLayout, tokenUsageTitle } from './TokenUsage.logic';
 
 const usage = (over: Partial<TokenUsage> = {}): TokenUsage =>
 	({
@@ -13,6 +13,9 @@ const usage = (over: Partial<TokenUsage> = {}): TokenUsage =>
 		...over
 	}) as unknown as TokenUsage;
 
+const busted = (reason = 'gateway_rewrote_body'): TokenUsage =>
+	usage({ cache_bust: { lost_tokens: 172_523, lost_usd: 2.98, reason } });
+
 describe('tokenUsageLayout', () => {
 	it('sums in + out + cache for Σ and shows every segment by default', () => {
 		const l = tokenUsageLayout(usage());
@@ -23,6 +26,12 @@ describe('tokenUsageLayout', () => {
 		expect(l.showCache).toBe(true);
 		expect(l.showCost).toBe(true);
 		expect(l.showCold).toBe(false);
+		expect(l.showBust).toBe(false);
+	});
+
+	it('flags a bust only when the server sent one', () => {
+		expect(tokenUsageLayout(busted()).showBust).toBe(true);
+		expect(tokenUsageLayout(usage()).showBust).toBe(false);
 	});
 
 	it('lets `sum` override Σ without touching the breakdown', () => {
@@ -68,6 +77,24 @@ describe('tokenUsageTitle', () => {
 		const empty = usage({ tokens_in: 0, tokens_out: 0, cache_read_tokens: 0, cache_creation_tokens: 0 });
 		expect(tokenUsageTitle(empty, tokenUsageLayout(empty), fmt)).toBe('↑0 ↓0 $1.25');
 	});
+
+	it('appends 💥 after the cold marker on a bust turn', () => {
+		const b = busted();
+		expect(tokenUsageTitle(b, tokenUsageLayout(b, { cold: true }), fmt)).toBe(
+			'Σ6500 ↑1000 ↓200 ⚡5300 $1.25 ❄️ 💥'
+		);
+		expect(tokenUsageTitle(usage(), tokenUsageLayout(usage()), fmt)).not.toContain('💥');
+	});
+});
+
+describe('bustReasonKey', () => {
+	it('passes the known reasons through and folds anything else to unknown', () => {
+		expect(bustReasonKey('ttl_expired')).toBe('ttl_expired');
+		expect(bustReasonKey('gateway_rewrote_body')).toBe('gateway_rewrote_body');
+		expect(bustReasonKey('unknown')).toBe('unknown');
+		expect(bustReasonKey('something_new')).toBe('unknown');
+		expect(bustReasonKey('')).toBe('unknown');
+	});
 });
 
 // The degradation itself is CSS (a container query cannot be evaluated in a
@@ -84,6 +111,10 @@ describe('cramped-container degradation', () => {
 		const block = containerBlock(svelte, name);
 		expect(block).toMatch(/\.detail \{\s*display: none;/);
 		expect(block).toMatch(/\.sum-compact-only \{\s*display: contents;/);
+	});
+
+	it('keeps only Σ inside a cramped drawer-head', () => {
+		expect(containerBlock(svelte, 'drawer-head')).toMatch(/\.cost \{\s*display: none;/);
 	});
 
 	it('drops the $ cost as the last step, keeping only Σ', () => {

@@ -13,6 +13,7 @@
       "!**/.sqlx/**",
       "!**/.superpowers/**",
       "!**/adapters/codex/schema/**",
+      "!crates/cctui-server/src/settings_catalog/codex-config.schema.json",
       "!webui/messages/**",
       "!docs/journeys/**",
       "!webui/src/lib/paraglide/**"

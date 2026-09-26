@@ -93,6 +93,11 @@
 			display: inline;
 		}
 	}
+	@container sess-row (max-width: 20em) {
+		.model {
+			display: none;
+		}
+	}
 	@container sess-row (max-width: 30rem) {
 		.fam {
 			display: none;

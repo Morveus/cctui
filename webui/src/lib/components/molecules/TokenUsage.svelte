@@ -3,7 +3,7 @@
 	import { compact as compactNum, usd } from '$lib/format';
 	import { Cluster, Text, Tooltip } from '@dorsk/tsumikit';
 	import { m } from '$lib/paraglide/messages';
-	import { tokenUsageLayout, tokenUsageTitle } from './TokenUsage.logic';
+	import { bustReasonKey, tokenUsageLayout, tokenUsageTitle } from './TokenUsage.logic';
 
 	// Canonical token-usage readout — the SINGLE token block, shared by the session
 	// list/card, the chat header, and each assistant/result line in the conversation.
@@ -57,6 +57,24 @@
 	const outHint = m.sessions_token_out_hint();
 	const cacheHint = m.sessions_token_cache_hint();
 	const coldHint = m.sessions_token_cold_hint();
+
+	const bustReason = $derived.by(() => {
+		switch (bustReasonKey(usage.cache_bust?.reason ?? '')) {
+			case 'ttl_expired':
+				return m.sessions_token_bust_reason_ttl_expired();
+			case 'gateway_rewrote_body':
+				return m.sessions_token_bust_reason_gateway_rewrote_body();
+			default:
+				return m.sessions_token_bust_reason_unknown();
+		}
+	});
+	const bustHint = $derived(
+		m.sessions_token_bust_hint({
+			tokens: compactNum(Number(usage.cache_bust?.lost_tokens ?? 0)),
+			cost: usd(Number(usage.cache_bust?.lost_usd ?? 0)),
+			reason: bustReason
+		})
+	);
 </script>
 
 <!-- Cluster owns the layout (row, single gap, optional wrap); each segment is its
@@ -115,6 +133,14 @@
 						>{/snippet}
 				</Tooltip></span
 			>{/if}
+		{#if layout.showBust}<Tooltip text={bustHint}>
+				{#snippet trigger()}<Text
+						variant="code"
+						{size}
+						tone="danger"
+						style="font-size: 0.85em; cursor: help">💥</Text
+					>{/snippet}
+			</Tooltip>{/if}
 	</Cluster>
 </div>
 
@@ -169,6 +195,9 @@
 	}
 	@container drawer-head (max-width: 40rem) {
 		.detail {
+			display: none;
+		}
+		.cost {
 			display: none;
 		}
 		.sum-compact-only {

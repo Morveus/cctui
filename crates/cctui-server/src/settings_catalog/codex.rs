@@ -2,8 +2,9 @@
 //!
 //! The openai-family half of [`super`], sharing its [`Catalog`] /
 //! [`SettingKey`] / [`Preset`] types so the endpoint, the validation and the
-//! webui editor are family-agnostic. There is no vendored Codex JSON Schema
-//! yet, so every entry is `source = "docs"`, hand-maintained against
+//! webui editor are family-agnostic. `codex-config.schema.json` is codex's own
+//! `config.schema.json` vendored at the `CODEX_MIN_VERSION` release; keys it
+//! covers are `source = "schema"`, the rest are hand-maintained against
 //! <https://learn.chatgpt.com/docs/config-file/config-reference>.
 //!
 //! Curation rule: a key is exposable only if
@@ -20,6 +21,7 @@ use std::sync::LazyLock;
 use super::{Catalog, build_from};
 
 const RAW_CATALOG: &str = include_str!("codex-catalog.toml");
+const RAW_SCHEMA: &str = include_str!("codex-config.schema.json");
 
 /// The `service_tier` value pinning a session to the standard (non-Fast) tier.
 /// Codex's own default is `priority` for every gpt-5.x model, so an unset tier is
@@ -33,7 +35,8 @@ pub const SERVICE_TIER_FAST: &str = "fast";
 /// The `settings_json` key carrying the account-level tier default.
 pub const SERVICE_TIER_KEY: &str = "service_tier";
 
-static CATALOG: LazyLock<Catalog> = LazyLock::new(|| build_from("Codex", RAW_CATALOG, None));
+static CATALOG: LazyLock<Catalog> =
+    LazyLock::new(|| build_from("Codex", RAW_CATALOG, Some(RAW_SCHEMA)));
 
 /// The process-wide Codex settings catalog singleton.
 #[must_use]

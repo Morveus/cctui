@@ -10,6 +10,7 @@
 	import SettingSection from '$lib/components/molecules/SettingSection.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { m } from '$lib/paraglide/messages';
+	import { clampFollowupWhenCold } from '$lib/followup';
 	import { GROUP_DIMENSIONS, nextSort } from '../../../../routes/sessions/sessions.logic';
 
 	const sl = $derived(settings.state.sessionList);
@@ -25,6 +26,11 @@
 	const sideOptions: SegmentOption[] = [
 		{ value: 'left', label: m.settings_spawn_dock_side_left() },
 		{ value: 'right', label: m.settings_spawn_dock_side_right() }
+	];
+	const followupColdOptions: SegmentOption[] = [
+		{ value: 'off', label: m.settings_followup_when_cold_off() },
+		{ value: 'offer', label: m.settings_followup_when_cold_offer() },
+		{ value: 'default', label: m.settings_followup_when_cold_default() }
 	];
 </script>
 
@@ -170,6 +176,27 @@
 			<Switch
 				bind:checked={() => settings.pinFirstMessage, (v) => settings.setPinFirstMessage(v)}
 				label={m.settings_pin_first_message_label()}
+			/>
+		</SettingRow>
+		<SettingRow
+			label={m.settings_followup_when_cold_label()}
+			help={m.settings_followup_when_cold_help()}
+			selfLabelled
+		>
+			<SegmentedControl
+				options={followupColdOptions}
+				label={m.settings_followup_when_cold_label()}
+				control
+				bind:value={
+					() => settings.followupWhenCold,
+					(v) => settings.setFollowupWhenCold(clampFollowupWhenCold(v))
+				}
+			/>
+		</SettingRow>
+		<SettingRow label={m.settings_prefer_followup_label()} help={m.settings_prefer_followup_help()}>
+			<Switch
+				bind:checked={() => settings.preferFollowupOverFork, (v) => settings.setPreferFollowupOverFork(v)}
+				label={m.settings_prefer_followup_label()}
 			/>
 		</SettingRow>
 		<SettingRow label={m.settings_role_tinted_background_label()} help={m.settings_role_tinted_background_help()}>

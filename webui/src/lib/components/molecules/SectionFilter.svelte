@@ -93,7 +93,7 @@
 		border: 1px solid var(--border-strong);
 		border-radius: var(--r-md);
 		background: var(--bg-elevated);
-		box-shadow: var(--shadow-lg, 0 8px 24px rgba(0, 0, 0, 0.4));
+		box-shadow: var(--shadow-lg);
 	}
 	.opt {
 		display: flex;

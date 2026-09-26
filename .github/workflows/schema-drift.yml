@@ -6,7 +6,11 @@ name: schema-drift
 # machine-readable half is stale and should be re-vendored + the hand-maintained
 # delta (catalog.toml) reviewed for newly added / removed keys.
 #
-# This job never edits the repo; it only flags drift so a human re-vendors on purpose.
+# The `codex` job does the same for codex's config.schema.json, pinned to the
+# CODEX_MIN_VERSION release, and checks that every codex-catalog.toml key still
+# exists upstream with the type cctui renders it as.
+#
+# Neither job edits the repo; it only flags drift so a human re-vendors on purpose.
 
 on:
   schedule:
@@ -16,6 +20,11 @@ on:
   push:
     paths:
       - "crates/cctui-server/src/settings_catalog/claude-code-settings.schema.json"
+      - "crates/cctui-server/src/settings_catalog/codex-config.schema.json"
+      - "crates/cctui-server/src/settings_catalog/codex-catalog.toml"
+      - "crates/cctui-proto/src/codex_config.rs"
+      - "crates/cctui-daemon/src/adapters/codex/contract.rs"
+      - "scripts/check-codex-schema-drift.sh"
       - ".github/workflows/schema-drift.yml"
 
 permissions:
@@ -65,5 +74,65 @@ jobs:
             comm -13 /tmp/vendored.keys /tmp/upstream.keys || true
             echo "removed upstream (still vendored):"
             comm -23 /tmp/vendored.keys /tmp/upstream.keys || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  codex:
+    name: codex catalog keys vs upstream config schema
+    runs-on: ubuntu-latest
+    env:
+      VENDORED: crates/cctui-server/src/settings_catalog/codex-config.schema.json
+      SCHEMA_PATH: codex-rs/core/config.schema.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve the floor and upstream latest versions
+        run: |
+          set -euo pipefail
+          floor="$(sed -n 's/.*CODEX_MIN_VERSION: &str = "\([^"]*\)".*/\1/p' crates/cctui-daemon/src/adapters/codex/contract.rs | head -n1)"
+          latest="$(curl -fsSL https://api.github.com/repos/openai/codex/releases/latest \
+            | sed -n 's/.*"tag_name": *"rust-v\([0-9.]*\)".*/\1/p' | head -n1)"
+          echo "FLOOR=$floor" >> "$GITHUB_ENV"
+          echo "LATEST=$latest" >> "$GITHUB_ENV"
+          curl -fsSL "https://raw.githubusercontent.com/openai/codex/rust-v$floor/$SCHEMA_PATH" -o /tmp/floor-schema.json
+          curl -fsSL "https://raw.githubusercontent.com/openai/codex/rust-v$latest/$SCHEMA_PATH" -o /tmp/latest-schema.json
+
+      - name: Vendored schema is the floor release's
+        run: |
+          set -euo pipefail
+          jq -S . "$VENDORED" > /tmp/vendored.norm.json
+          jq -S . /tmp/floor-schema.json > /tmp/floor.norm.json
+          if ! diff -u /tmp/vendored.norm.json /tmp/floor.norm.json; then
+            echo "::error::$VENDORED is not codex $FLOOR's $SCHEMA_PATH."
+            echo "Re-vendor it: curl -fsSL https://raw.githubusercontent.com/openai/codex/rust-v$FLOOR/$SCHEMA_PATH -o $VENDORED"
+            exit 1
+          fi
+
+      - name: Catalogued keys exist at the floor with the expected type
+        run: SCHEMA_LABEL="codex $FLOOR" scripts/check-codex-schema-drift.sh "$VENDORED"
+
+      - name: Catalogued keys vs upstream latest
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ "$LATEST" = "$FLOOR" ]; then
+            echo "Floor $FLOOR is upstream latest; nothing more to check."
+          elif ! SCHEMA_LABEL="codex $LATEST" scripts/check-codex-schema-drift.sh /tmp/latest-schema.json; then
+            echo "::warning::Raising CODEX_MIN_VERSION from $FLOOR to $LATEST would break catalogued keys; fix codex-catalog.toml and CURATED with the bump."
+          fi
+
+      - name: Report new / removed top-level properties since the floor
+        if: always()
+        run: |
+          set -euo pipefail
+          jq -r '.properties | keys[]' "$VENDORED" | sort > /tmp/floor.keys
+          jq -r '.properties | keys[]' /tmp/latest-schema.json | sort > /tmp/latest.keys
+          {
+            echo "### Codex config property drift ($FLOOR → $LATEST)"
+            echo '```'
+            echo "added upstream (not vendored):"
+            comm -13 /tmp/floor.keys /tmp/latest.keys || true
+            echo "removed upstream (still vendored):"
+            comm -23 /tmp/floor.keys /tmp/latest.keys || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

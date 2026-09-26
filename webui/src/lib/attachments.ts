@@ -55,17 +55,34 @@ export function attachFiles(
 
 const PASTE_NAME = /\bpaste-(\d+)\.txt\b/g;
 
-/** Next free `paste-N.txt` index: max N over attachment names and `[paste-N.txt]`
- *  tokens in `text`, plus one. Derived, not counted, so it survives a remount
- *  whose draft still references earlier pastes. */
-export function nextPasteIndex(files: File[], text: string): number {
+/** Next free `paste-N.txt` index: max N over attachment names, `[paste-N.txt]`
+ *  tokens in `text` and `used` (the names the session already staged), plus one.
+ *  Derived, not counted, so it survives a remount whose draft still references
+ *  earlier pastes. Without `used` every fresh draft would restart at
+ *  `paste-1.txt` and collide with an earlier message's upload. */
+export function nextPasteIndex(files: File[], text: string, used: Iterable<string> = []): number {
 	let max = 0;
 	const scan = (s: string) => {
 		for (const m of s.matchAll(PASTE_NAME)) max = Math.max(max, Number(m[1]));
 	};
 	for (const f of files) scan(f.name);
+	for (const name of used) scan(name);
 	scan(text);
 	return max + 1;
+}
+
+/** Point each `[name]` token at the name staging actually gave the file.
+ *  `paths` is the staged absolute path per entry of `files`, in order; a clash
+ *  is renamed server-side (`paste-1.txt` → `paste-1-1.txt`) and a token left
+ *  on the old name resolves to some other message's upload. */
+export function rewriteFileTokens(text: string, files: File[], paths: string[]): string {
+	let out = text;
+	files.forEach((f, i) => {
+		const staged = paths[i]?.split('/').pop();
+		if (!staged || staged === f.name) return;
+		out = out.split(`[${f.name}]`).join(`[${staged}]`);
+	});
+	return out;
 }
 
 /** Append a `[name]` reference for each attached file to the draft text,

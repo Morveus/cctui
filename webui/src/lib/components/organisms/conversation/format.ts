@@ -49,9 +49,14 @@ export function looksMeta(text: string): boolean {
 
 // The harness wraps a peer agent's message in this tag but prefixes its own
 // "Another Claude session sent a message:" line, so the tag is never at the
-// start of the turn — this must scan, not test the prefix like `looksMeta`.
-const PEER_TAG_RE =
-	/<(cross-session-message|agent-message)\b([^>]*)>([\s\S]*?)<\/\1>/;
+// start of the turn — the preamble is what identifies the shape.
+export const PEER_PREAMBLES = [
+	'Another Claude session sent a message:',
+	'Another session sent a message:',
+	'Received a message from agent'
+];
+// Line-anchored so a human quoting or relaying a wrapper stays a human turn.
+const PEER_TAG_RE = /^<(cross-session-message|agent-message)\b([^>]*)>([\s\S]*?)<\/\1>/m;
 const PEER_ATTR_RE = /([a-z-]+)="([^"]*)"/g;
 
 export interface PeerMessage {
@@ -60,9 +65,16 @@ export interface PeerMessage {
 	body: string;
 }
 
+function isPeerPreamble(line: string): boolean {
+	const t = line.trim();
+	return PEER_PREAMBLES.some((p) => t.startsWith(p));
+}
+
 export function parsePeerMessage(text: string): PeerMessage | null {
 	const tag = PEER_TAG_RE.exec(text);
 	if (!tag) return null;
+	const before = text.slice(0, tag.index);
+	if (before.split('\n').some((l) => l.trim() && !isPeerPreamble(l))) return null;
 	const attrs = new Map<string, string>();
 	for (const a of tag[2].matchAll(PEER_ATTR_RE)) attrs.set(a[1], a[2]);
 	const name = attrs.get('from-name')?.trim();
@@ -221,6 +233,11 @@ export function latestTodoLineKey(lines: Line[]): string | undefined {
 // shapes via `userMsgKey`. Markers (reset/turn_end/heartbeat) key on ts so
 // distinct ones aren't over-collapsed.
 export function eventSig(e: AgentEvent): string {
+	// A queue op shares its text with the prompt it brackets (and its sibling
+	// close op), so it needs a signature of its own or the pair collapses.
+	if (e.type === 'text' && e.kind === 'queue_op') {
+		return `q:${e.operation ?? 'queued'}:${e.seq ?? e.ts}:${e.content.trim()}`;
+	}
 	if ('turn_id' in e && e.turn_id) return `t:${e.turn_id}`;
 	const u = userMsgKey(e);
 	if (u !== null) return `u:${u}`;

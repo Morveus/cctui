@@ -58,18 +58,23 @@
 	);
 	const archiveLabel = $derived(m.sessions_archive_section({ section: label }));
 	const heading = $derived(title ?? label);
+	let width = $state(Infinity);
+	// Mirrors the `ssh` container query: a bare number once the row is tight.
+	const countLabel = $derived(width < 416 ? String(count) : m.sessions_group_count({ count }));
 </script>
 
-<SectionHeader
-	variant="group"
-	level={3}
-	size="sm"
-	title={heading}
-	{hue}
-	count={m.sessions_group_count({ count })}
-	{lead}
-	actions={headerActions}
-/>
+<div class="ssh" bind:clientWidth={width}>
+	<SectionHeader
+		variant="group"
+		level={3}
+		size="sm"
+		title={heading}
+		{hue}
+		count={countLabel}
+		{lead}
+		actions={headerActions}
+	/>
+</div>
 
 {#snippet headerActions()}
 	<Menu label={m.sessions_sort_menu_label()} items={sortItems} bare placement="bottom-end">
@@ -79,7 +84,10 @@
 				size="xs"
 				tone="faint"
 				style="white-space:nowrap; display:inline-flex; align-items:center; gap: var(--sp-1)"
-				>{m.sessions_sort_menu({ sort: fieldLabel(sort) })}<Icon name={dirIcon} label={dirLabel} /></Text
+				><span class="sort-words">{m.sessions_sort_menu({ sort: fieldLabel(sort) })}</span><Icon
+					name={dirIcon}
+					label={dirLabel}
+				/></Text
 			>
 		{/snippet}
 	</Menu>
@@ -106,3 +114,14 @@
 		/>
 	{/if}
 {/snippet}
+
+<style>
+	.ssh {
+		container: ssh / inline-size;
+	}
+	@container ssh (max-width: 26rem) {
+		.sort-words {
+			display: none;
+		}
+	}
+</style>

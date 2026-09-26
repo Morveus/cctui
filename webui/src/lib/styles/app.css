@@ -70,14 +70,6 @@
   transform: none;
 }
 
-/* The kit's `group` section header pins its row to a single line. On a phone at
-   a larger text size the trailing actions then leave the viewport entirely —
-   let them fall to a second line instead. */
-[data-tsu='SectionHeader'].section-header.sh-group > .sh-row,
-[data-tsu='SectionHeader'].section-header.sh-group .sh-actions {
-  flex-wrap: wrap;
-}
-
 /* ---------- misc ---------- */
 .placeholder {
   text-align: center;
@@ -206,6 +198,12 @@
   color: var(--link);
   text-decoration: underline dotted;
   text-underline-offset: 2px;
+  word-break: break-all;
+}
+.md-file-error {
+  color: var(--danger);
+  font-size: var(--fs-sm);
+  margin-left: var(--sp-2);
   word-break: break-all;
 }
 .md-fileviewer {

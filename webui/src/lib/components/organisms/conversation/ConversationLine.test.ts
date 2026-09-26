@@ -74,3 +74,38 @@ describe('role badge and tint', () => {
 		expect(el.querySelector('.peer-from')).toBeNull();
 	});
 });
+
+describe('CCT-1083 queue state on the message itself', () => {
+	it('tints a waiting queued bubble and labels it', async () => {
+		const el = await render(line({ queued: true }));
+		expect(el.classList.contains('queued')).toBe(true);
+		expect(el.classList.contains('cancelled')).toBe(false);
+		expect(el.textContent).toContain('queued');
+	});
+
+	it('shows neither tint nor chip once delivered', async () => {
+		const el = await render(line({ queued: true, queuedAt: 1_699_999_000_000 }));
+		expect(el.classList.contains('queued')).toBe(false);
+		expect(el.querySelector('.meta-end')).toBeNull();
+		expect(el.textContent).not.toContain('queued');
+	});
+
+	it('strikes through a prompt removed from the queue', async () => {
+		const el = await render(line({ queued: true, cancelled: true }));
+		expect(el.classList.contains('cancelled')).toBe(true);
+		expect(el.textContent).toContain('removed from queue');
+	});
+
+	it('gives queued and cancelled bubbles their own rules, distinct from pending', () => {
+		expect(lineSource).toMatch(/\.line\.user\.queued\s+\.bubble\s*\{/);
+		expect(lineSource).toMatch(/\.line\.user\.cancelled\s+\.bubble\s*\{/);
+		expect(lineSource).toMatch(/--role-queued/);
+		expect(lineSource).not.toMatch(/\.line\.user\.queued\s+\.bubble\s*\{[^}]*--warn/);
+	});
+
+	it('leaves an ordinary user line with no queue class or label', async () => {
+		const el = await render(line());
+		expect(el.classList.contains('queued')).toBe(false);
+		expect(el.querySelector('.meta-end')).toBeNull();
+	});
+});

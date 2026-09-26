@@ -10,6 +10,7 @@ pub mod compress;
 pub mod diagnose;
 pub mod git;
 pub mod github;
+pub mod harness;
 pub mod identity;
 pub mod ids;
 pub mod media;

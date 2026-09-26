@@ -6,7 +6,8 @@ import {
 	makeClipboardFiles,
 	mergeFiles,
 	mergeFilesRenamed,
-	nextPasteIndex
+	nextPasteIndex,
+	rewriteFileTokens
 } from './attachments';
 
 const f = (name: string) => new File(['x'], name, { type: 'text/plain' });
@@ -85,6 +86,34 @@ describe('nextPasteIndex', () => {
 
 	it('ignores non-paste names', () => {
 		expect(nextPasteIndex([f('clipboard-7.png'), f('mypaste-2.txt')], '')).toBe(1);
+	});
+
+	it('skips names the session already staged', () => {
+		expect(nextPasteIndex([], '', ['paste-1.txt'])).toBe(2);
+		expect(nextPasteIndex([], '', ['paste-1.txt', 'paste-1-1.txt', 'shot.png'])).toBe(2);
+		expect(nextPasteIndex([f('paste-4.txt')], '', ['paste-2.txt'])).toBe(5);
+	});
+});
+
+describe('rewriteFileTokens', () => {
+	it('points a token at the name staging returned', () => {
+		const text = 'look\n\n[paste-1.txt]\n\nplease';
+		const out = rewriteFileTokens(text, [f('paste-1.txt')], [
+			'/tmp/cctui-uploads/s/paste-1-1.txt'
+		]);
+		expect(out).toBe('look\n\n[paste-1-1.txt]\n\nplease');
+	});
+
+	it('rewrites every occurrence and leaves unrenamed files alone', () => {
+		const files = [f('paste-1.txt'), f('shot.png')];
+		const paths = ['/tmp/cctui-uploads/s/paste-1-2.txt', '/tmp/cctui-uploads/s/shot.png'];
+		expect(rewriteFileTokens('[paste-1.txt] a [shot.png] b [paste-1.txt]', files, paths)).toBe(
+			'[paste-1-2.txt] a [shot.png] b [paste-1-2.txt]'
+		);
+	});
+
+	it('leaves the text untouched when nothing was staged', () => {
+		expect(rewriteFileTokens('[paste-1.txt]', [], [])).toBe('[paste-1.txt]');
 	});
 });
 

@@ -139,7 +139,7 @@ describe('migration from the tri-state shape', () => {
 });
 
 describe('parseViewOpts', () => {
-	it('round-trips what the drawer persists', () => {
+	it('round-trips what the drawer persists, with formatting always on', () => {
 		const view: ViewOpts = {
 			msgFilter: { ...defaultFilter(), thinking: false, marker: true },
 			prettyJson: false,
@@ -147,7 +147,11 @@ describe('parseViewOpts', () => {
 			prettyTables: false,
 			paneWidth: 640
 		};
-		expect(parseViewOpts(JSON.stringify(view))).toEqual(view);
+		expect(parseViewOpts(JSON.stringify(view))).toEqual({
+			...view,
+			prettyJson: true,
+			prettyTables: true
+		});
 	});
 
 	it('defaults on empty, missing or corrupt storage', () => {
@@ -175,7 +179,7 @@ describe('parseViewOpts', () => {
 		expect(view.msgFilter.result).toBe(false);
 		expect(view.msgFilter.mcp).toBe(false);
 		expect(view.msgFilter.assistant).toBe(true);
-		expect(view.prettyJson).toBe(false);
+		expect(view.prettyJson).toBe(true);
 		expect(view.paneWidth).toBe(900);
 		expect(Object.keys(view).sort()).toEqual([
 			'msgFilter',

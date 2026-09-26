@@ -13,6 +13,10 @@ pub struct Config {
     pub server_url: String,
     pub machine_key: String,
     pub machine_id: Option<uuid::Uuid>,
+    /// Extra roots the linked-file viewer may read from, for the cases the
+    /// session's cwd and job dir cannot infer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_file_roots: Vec<String>,
 }
 
 impl Config {
@@ -49,7 +53,7 @@ impl Config {
             .or_else(|_| std::env::var("CCTUI_URL"))
             .ok()
             .filter(|s| !s.is_empty())?;
-        Some(Self { server_url, machine_key, machine_id: None })
+        Some(Self { server_url, machine_key, machine_id: None, read_file_roots: Vec::new() })
     }
 
     /// Resolve config for `run`: prefer the env-provided shared key (dispatch

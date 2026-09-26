@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import {
 	ALL_SCOPES,
 	filterByName,
-	initial,
 	keyIcon,
 	scopeCells,
 	splitRevoked,
@@ -54,10 +53,5 @@ describe('row glyphs', () => {
 	it('marks machine keys with a screen and everything else with a person', () => {
 		expect(keyIcon('machine')).toBe('tv');
 		expect(keyIcon('user')).toBe('user');
-	});
-
-	it('upper-cases the first character and falls back to a question mark', () => {
-		expect(initial('dorsk')).toBe('D');
-		expect(initial('   ')).toBe('?');
 	});
 });

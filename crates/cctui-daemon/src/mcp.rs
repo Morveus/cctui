@@ -234,14 +234,17 @@ fn handle_request(session_id: &str, sock: &Path, req: &Value, outbox: &Outbox) -
     let method = req.get("method").and_then(Value::as_str)?;
     let id = req.get("id");
     match method {
-        "initialize" => Some(reply(
-            id,
-            &json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "cctui", "version": env!("CARGO_PKG_VERSION") },
-            }),
-        )),
+        "initialize" => {
+            announce_ready(session_id, sock);
+            Some(reply(
+                id,
+                &json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "cctui", "version": env!("CARGO_PKG_VERSION") },
+                }),
+            ))
+        }
         "tools/list" => Some(reply(id, &json!({ "tools": [tool_schema(), usage_tool_schema()] }))),
         "tools/call" => {
             let params = req.get("params");
@@ -457,6 +460,45 @@ fn call_daemon(
         });
     }
     unreachable!("the loop returns on its last iteration")
+}
+
+/// One fire-and-forget line on the daemon socket, ignoring any reply. Used for
+/// signalling that must never delay or fail the caller.
+fn notify_daemon(sock: &Path, frame: &Value) {
+    let Ok(stream) = UnixStream::connect(sock) else { return };
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let mut writer = &stream;
+    let _ = writeln!(writer, "{frame}").and_then(|()| writer.flush());
+}
+
+/// Tell the daemon this session's relay is up, so the `SessionStart` hook
+/// holding the first turn can release it. Off-thread: `initialize` must be
+/// answered immediately even if the daemon socket is slow or absent.
+fn announce_ready(session_id: &str, sock: &Path) {
+    let frame = json!({ "kind": "relay_ready", "session_id": session_id, "proto": SOCKET_PROTO });
+    let sock = sock.to_owned();
+    std::thread::spawn(move || notify_daemon(&sock, &frame));
+}
+
+/// Block until this session's relay has announced itself, or `timeout` elapses.
+///
+/// Infallible on purpose: the hook that calls this releases the first turn
+/// either way, so a daemon that is unreachable costs the launch nothing.
+pub fn wait_ready(session_id: &str, sock: &Path, timeout: Duration) {
+    let request = json!({
+        "kind": "relay_wait",
+        "session_id": session_id,
+        "timeout_secs": timeout.as_secs().max(1),
+        "proto": SOCKET_PROTO,
+    });
+    let Ok(stream) = UnixStream::connect(sock) else { return };
+    let _ = stream.set_read_timeout(Some(timeout + Duration::from_secs(5)));
+    let mut writer = &stream;
+    if writeln!(writer, "{request}").and_then(|()| writer.flush()).is_err() {
+        return;
+    }
+    let mut line = String::new();
+    let _ = BufReader::new(&stream).read_line(&mut line);
 }
 
 /// Serve MCP on stdio until the client closes it.

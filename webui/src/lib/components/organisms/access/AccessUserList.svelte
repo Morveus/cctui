@@ -1,11 +1,11 @@
 <script lang="ts">
 	import type { UserRow } from '@bindings/UserRow';
-	import { Input, Button, Dot, Spinner, Text } from '@dorsk/tsumikit';
+	import { Avatar, Input, Button, Dot, Spinner, Text } from '@dorsk/tsumikit';
 	import PageHead from '$lib/components/molecules/PageHead.svelte';
 	import EnrollMachineCard from '$lib/components/organisms/EnrollMachineCard.svelte';
 	import { hashHue } from '$lib/format';
 	import { m } from '$lib/paraglide/messages';
-	import { filterByName, initial, splitRevoked } from './access.logic';
+	import { filterByName, splitRevoked } from './access.logic';
 
 	let {
 		users,
@@ -40,11 +40,10 @@
 		data-journey-key={u.name}
 		class:on={u.id === selectedId}
 		class:dim={revoked}
-		style:--h={hashHue(u.name)}
 		aria-current={u.id === selectedId ? 'true' : undefined}
 		onclick={() => onselect(u.id)}
 	>
-		<span class="av" aria-hidden="true">{initial(u.name)}</span>
+		<Avatar name={u.name} hue={hashHue(u.name)} size={26} decorative />
 		<span class="id">
 			<span class="nm">{u.name}</span>
 			<span class="mt">{meta(u)}</span>
@@ -149,18 +148,6 @@
 	.row:focus-visible {
 		outline: 2px solid var(--accent);
 		outline-offset: -2px;
-	}
-	.av {
-		flex: none;
-		display: grid;
-		place-items: center;
-		width: 26px;
-		height: 26px;
-		border-radius: 50%;
-		background: hsl(var(--h) var(--mach-bg-sl));
-		color: hsl(var(--h) var(--mach-fg-sl));
-		font-size: var(--fs-xs);
-		font-weight: var(--fw-bold);
 	}
 	.id {
 		flex: 1;

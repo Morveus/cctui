@@ -12,6 +12,7 @@ import { fontScale, nearestLevel } from "./fontscale.svelte";
 import { notify } from "./notify.svelte";
 import type { SettingsPayload } from "@bindings/SettingsPayload";
 import { clampDockWidth } from "./dock";
+import { clampFollowupWhenCold, type FollowupWhenCold } from "./followup";
 import {
   latestDirFor,
   latestEntryFor,
@@ -198,6 +199,11 @@ export interface DisplaySettings {
   // Sticky strip at the top of a conversation showing its first user message
   // (the brief). Off hides the strip entirely.
   pinFirstMessage: boolean;
+  // On a cold-cache session the composer offers a follow-up session (`offer`),
+  // routes Enter to it (`default`), or stays silent (`off`).
+  followupWhenCold?: FollowupWhenCold;
+  // Follow-up takes the fork's spot in the drawer header.
+  preferFollowupOverFork?: boolean;
   // Tint each conversation bubble's background with its role colour (assistant,
   // tool, user…) on top of the existing left rail, so a fast scroll reads
   // the flow by colour block rather than by badge. Off by default.
@@ -534,6 +540,8 @@ export function mergeDefaults(
       ...(p.display ?? {}),
       archiveDoneButton: p.display?.archiveDoneButton !== false,
       pinFirstMessage: p.display?.pinFirstMessage !== false,
+      followupWhenCold: clampFollowupWhenCold(p.display?.followupWhenCold),
+      preferFollowupOverFork: p.display?.preferFollowupOverFork === true,
       roleTintedBackground: p.display?.roleTintedBackground === true,
       nav: clampNavPosition(p.display?.nav),
     },
@@ -1037,6 +1045,22 @@ class Settings {
 
   setPinFirstMessage(on: boolean) {
     this.setDisplay({ pinFirstMessage: on });
+  }
+
+  get followupWhenCold(): FollowupWhenCold {
+    return clampFollowupWhenCold(this.state.display.followupWhenCold);
+  }
+
+  setFollowupWhenCold(v: FollowupWhenCold) {
+    this.setDisplay({ followupWhenCold: v });
+  }
+
+  get preferFollowupOverFork(): boolean {
+    return this.state.display.preferFollowupOverFork === true;
+  }
+
+  setPreferFollowupOverFork(on: boolean) {
+    this.setDisplay({ preferFollowupOverFork: on });
   }
 
   get roleTintedBackground(): boolean {

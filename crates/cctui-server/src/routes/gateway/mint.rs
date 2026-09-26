@@ -931,19 +931,19 @@ mod db_tests {
         }
         let (owner, grantee, stranger) = (users[0], users[1], users[2]);
 
-        let hirobot = mk_account(&pool, owner, &format!("hirobot-{suffix}")).await;
-        let pafin = mk_account(&pool, owner, &format!("pafin-{suffix}")).await;
-        let hirobot_anthropic = mk_provider(&pool, owner, hirobot, "anthropic").await;
-        let pafin_anthropic = mk_provider(&pool, owner, pafin, "anthropic").await;
-        mk_share(&pool, hirobot, grantee).await;
-        mk_share(&pool, pafin, grantee).await;
+        let alpha = mk_account(&pool, owner, &format!("alpha-{suffix}")).await;
+        let beta = mk_account(&pool, owner, &format!("beta-{suffix}")).await;
+        let alpha_anthropic = mk_provider(&pool, owner, alpha, "anthropic").await;
+        let beta_anthropic = mk_provider(&pool, owner, beta, "anthropic").await;
+        mk_share(&pool, alpha, grantee).await;
+        mk_share(&pool, beta, grantee).await;
 
         crate::store::account_redirects::upsert(
             &pool,
             crate::store::account_redirects::NewRedirect {
                 user_id: owner,
-                from_account: hirobot,
-                to_account: Some(pafin),
+                from_account: alpha,
+                to_account: Some(beta),
                 family: "anthropic",
                 match_model: None,
                 to_model: None,
@@ -954,16 +954,16 @@ mod db_tests {
         .await
         .unwrap();
 
-        let mut rows = provider_rows(&pool, hirobot).await;
-        apply_account_redirects(&pool, grantee, hirobot, &mut rows).await;
+        let mut rows = provider_rows(&pool, alpha).await;
+        apply_account_redirects(&pool, grantee, alpha, &mut rows).await;
         assert_eq!(
             rows.iter().find(|r| r.family() == Family::Anthropic).unwrap().id,
-            pafin_anthropic,
+            beta_anthropic,
             "owner's rule must redirect a grantee's launch"
         );
 
         sqlx::query("DELETE FROM account_redirects WHERE from_account = $1")
-            .bind(hirobot)
+            .bind(alpha)
             .execute(&pool)
             .await
             .unwrap();
@@ -971,8 +971,8 @@ mod db_tests {
             &pool,
             crate::store::account_redirects::NewRedirect {
                 user_id: stranger,
-                from_account: hirobot,
-                to_account: Some(pafin),
+                from_account: alpha,
+                to_account: Some(beta),
                 family: "anthropic",
                 match_model: None,
                 to_model: None,
@@ -982,11 +982,11 @@ mod db_tests {
         )
         .await
         .unwrap();
-        let mut rows = provider_rows(&pool, hirobot).await;
-        apply_account_redirects(&pool, grantee, hirobot, &mut rows).await;
+        let mut rows = provider_rows(&pool, alpha).await;
+        apply_account_redirects(&pool, grantee, alpha, &mut rows).await;
         assert_eq!(
             rows.iter().find(|r| r.family() == Family::Anthropic).unwrap().id,
-            hirobot_anthropic,
+            alpha_anthropic,
             "a stranger's rule must not move anyone else's launch"
         );
 
@@ -1019,20 +1019,20 @@ mod db_tests {
         .await
         .unwrap();
 
-        let hirobot = mk_account(&pool, user, &format!("hirobot-{suffix}")).await;
-        let pafin = mk_account(&pool, user, &format!("pafin-{suffix}")).await;
+        let alpha = mk_account(&pool, user, &format!("alpha-{suffix}")).await;
+        let beta = mk_account(&pool, user, &format!("beta-{suffix}")).await;
         let foreign = mk_account(&pool, stranger, &format!("foreign-{suffix}")).await;
-        let hirobot_anthropic = mk_provider(&pool, user, hirobot, "anthropic").await;
-        let hirobot_openai = mk_provider(&pool, user, hirobot, "openai").await;
-        let pafin_anthropic = mk_provider(&pool, user, pafin, "anthropic").await;
+        let alpha_anthropic = mk_provider(&pool, user, alpha, "anthropic").await;
+        let alpha_openai = mk_provider(&pool, user, alpha, "openai").await;
+        let beta_anthropic = mk_provider(&pool, user, beta, "anthropic").await;
         mk_provider(&pool, stranger, foreign, "openai").await;
 
         crate::store::account_redirects::upsert(
             &pool,
             crate::store::account_redirects::NewRedirect {
                 user_id: user,
-                from_account: hirobot,
-                to_account: Some(pafin),
+                from_account: alpha,
+                to_account: Some(beta),
                 family: "anthropic",
                 match_model: None,
                 to_model: None,
@@ -1043,19 +1043,19 @@ mod db_tests {
         .await
         .unwrap();
 
-        let mut rows = provider_rows(&pool, hirobot).await;
-        apply_account_redirects(&pool, user, hirobot, &mut rows).await;
+        let mut rows = provider_rows(&pool, alpha).await;
+        apply_account_redirects(&pool, user, alpha, &mut rows).await;
         let anthropic = rows.iter().find(|r| r.family() == Family::Anthropic).unwrap();
         let openai = rows.iter().find(|r| r.family() == Family::Openai).unwrap();
-        assert_eq!(anthropic.id, pafin_anthropic, "anthropic row must become pafin's");
-        assert_eq!(openai.id, hirobot_openai, "openai row must stay on hirobot");
+        assert_eq!(anthropic.id, beta_anthropic, "anthropic row must become beta's");
+        assert_eq!(openai.id, alpha_openai, "openai row must stay on alpha");
 
         // An inaccessible target (no ownership, no share) never applies.
         crate::store::account_redirects::upsert(
             &pool,
             crate::store::account_redirects::NewRedirect {
                 user_id: user,
-                from_account: hirobot,
+                from_account: alpha,
                 to_account: Some(foreign),
                 family: "openai",
                 match_model: None,
@@ -1066,11 +1066,11 @@ mod db_tests {
         )
         .await
         .unwrap();
-        let mut rows = provider_rows(&pool, hirobot).await;
-        apply_account_redirects(&pool, user, hirobot, &mut rows).await;
+        let mut rows = provider_rows(&pool, alpha).await;
+        apply_account_redirects(&pool, user, alpha, &mut rows).await;
         assert_eq!(
             rows.iter().find(|r| r.family() == Family::Openai).unwrap().id,
-            hirobot_openai,
+            alpha_openai,
             "a redirect must never widen access"
         );
 
@@ -1079,15 +1079,15 @@ mod db_tests {
             "UPDATE account_redirects SET expires_at = now() - interval '1 minute' \
                      WHERE from_account = $1",
         )
-        .bind(hirobot)
+        .bind(alpha)
         .execute(&pool)
         .await
         .unwrap();
-        let mut rows = provider_rows(&pool, hirobot).await;
-        apply_account_redirects(&pool, user, hirobot, &mut rows).await;
+        let mut rows = provider_rows(&pool, alpha).await;
+        apply_account_redirects(&pool, user, alpha, &mut rows).await;
         assert_eq!(
             rows.iter().find(|r| r.family() == Family::Anthropic).unwrap().id,
-            hirobot_anthropic,
+            alpha_anthropic,
             "expired rules must not redirect"
         );
 

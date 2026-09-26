@@ -27,7 +27,7 @@ echo "== 1. AGENTS.md + CLAUDE.md pack (the new _base shape) =="
 setup
 printf 'BASE INSTRUCTIONS\n' > "$CONTEXT_DIR/AGENTS.md"
 printf '@AGENTS.md\n'        > "$CONTEXT_DIR/CLAUDE.md"
-_dirs="projects projects"; TASK_REPO=paulette
+_dirs="projects projects"; TASK_REPO=ownrepo
 run
 check "AGENTS.md staged"  "BASE INSTRUCTIONS" "$(cat "$T/workspace/AGENTS.md")"
 check "CLAUDE.md imports" "@AGENTS.md"        "$(cat "$T/workspace/CLAUDE.md")"
@@ -44,9 +44,9 @@ echo "== 3. projects/<repo> overlay appended =="
 setup
 printf 'BASE\n' > "$CONTEXT_DIR/AGENTS.md"
 printf '@AGENTS.md\n' > "$CONTEXT_DIR/CLAUDE.md"
-mkdir -p "$CONTEXT_DIR/projects/cryptact"
-printf 'REPO OVERLAY\n' > "$CONTEXT_DIR/projects/cryptact/CLAUDE.md"
-_dirs="projects projects"; TASK_REPO=cryptact
+mkdir -p "$CONTEXT_DIR/projects/workrepo"
+printf 'REPO OVERLAY\n' > "$CONTEXT_DIR/projects/workrepo/CLAUDE.md"
+_dirs="projects projects"; TASK_REPO=workrepo
 run
 check "overlay appended" "BASE
 
@@ -55,15 +55,15 @@ REPO OVERLAY" "$(cat "$T/workspace/AGENTS.md")"
 echo "== 4. overlay for a DIFFERENT repo is not appended =="
 setup
 printf 'BASE\n' > "$CONTEXT_DIR/AGENTS.md"
-mkdir -p "$CONTEXT_DIR/projects/cryptact"
-printf 'REPO OVERLAY\n' > "$CONTEXT_DIR/projects/cryptact/CLAUDE.md"
-_dirs="projects projects"; TASK_REPO=paulette
+mkdir -p "$CONTEXT_DIR/projects/workrepo"
+printf 'REPO OVERLAY\n' > "$CONTEXT_DIR/projects/workrepo/CLAUDE.md"
+_dirs="projects projects"; TASK_REPO=ownrepo
 run
 check "no cross-repo leak" "BASE" "$(cat "$T/workspace/AGENTS.md")"
 
 echo "== 5. pack with no instructions writes nothing =="
 setup
-_dirs=""; TASK_REPO=paulette
+_dirs=""; TASK_REPO=ownrepo
 run
 check "no AGENTS.md" "absent" "$([ -e "$T/workspace/AGENTS.md" ] && echo present || echo absent)"
 check "no CLAUDE.md" "absent" "$([ -e "$T/workspace/CLAUDE.md" ] && echo present || echo absent)"
@@ -71,11 +71,11 @@ check "no CLAUDE.md" "absent" "$([ -e "$T/workspace/CLAUDE.md" ] && echo present
 echo "== 6. nothing is written inside the checkout =="
 setup
 printf 'BASE\n' > "$CONTEXT_DIR/AGENTS.md"
-mkdir -p "$T/workspace/paulette"
-printf 'REPO OWN\n' > "$T/workspace/paulette/AGENTS.md"
-_dirs=""; TASK_REPO=paulette
+mkdir -p "$T/workspace/ownrepo"
+printf 'REPO OWN\n' > "$T/workspace/ownrepo/AGENTS.md"
+_dirs=""; TASK_REPO=ownrepo
 run
-check "repo AGENTS.md untouched" "REPO OWN" "$(cat "$T/workspace/paulette/AGENTS.md")"
+check "repo AGENTS.md untouched" "REPO OWN" "$(cat "$T/workspace/ownrepo/AGENTS.md")"
 
 echo
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES"

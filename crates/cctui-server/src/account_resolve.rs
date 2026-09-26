@@ -393,42 +393,42 @@ mod tests {
 
     #[test]
     fn election_skips_the_exhausted_member() {
-        let candidates = [candidate("hirobot", 100.0), candidate("pafin", 9.0)];
+        let candidates = [candidate("alpha", 100.0), candidate("beta", 9.0)];
         assert_eq!(
             elect("work", STRATEGY_HEADROOM, &candidates, None, chrono::Utc::now()).unwrap().name,
-            "pafin"
+            "beta"
         );
     }
 
     #[test]
     fn ordered_election_skips_an_exhausted_first_member() {
-        let candidates = [candidate("hirobot", 100.0), candidate("pafin", 9.0)];
+        let candidates = [candidate("alpha", 100.0), candidate("beta", 9.0)];
         assert_eq!(
             elect("work", STRATEGY_ORDERED, &candidates, None, chrono::Utc::now()).unwrap().name,
-            "pafin"
+            "beta"
         );
     }
 
     #[test]
     fn every_member_out_is_rejected_and_names_them() {
-        let candidates = [candidate("hirobot", 100.0), candidate("pafin", 100.0)];
+        let candidates = [candidate("alpha", 100.0), candidate("beta", 100.0)];
         let err = elect("work", STRATEGY_HEADROOM, &candidates, None, chrono::Utc::now())
             .expect_err("all members exhausted");
         let ResolveError::Rejected(msg) = err else { panic!("expected a rejection") };
-        assert!(msg.contains("hirobot"), "{msg}");
-        assert!(msg.contains("pafin"), "{msg}");
+        assert!(msg.contains("alpha"), "{msg}");
+        assert!(msg.contains("beta"), "{msg}");
     }
 
     #[test]
     fn an_unreadable_member_still_elects() {
         // A flaky usage endpoint must not wedge a dispatch queue.
-        let mut unknown = candidate("pafin", 0.0);
+        let mut unknown = candidate("beta", 0.0);
         unknown.usage_known = false;
         unknown.windows.clear();
-        let candidates = [candidate("hirobot", 100.0), unknown];
+        let candidates = [candidate("alpha", 100.0), unknown];
         assert_eq!(
             elect("work", STRATEGY_HEADROOM, &candidates, None, chrono::Utc::now()).unwrap().name,
-            "pafin"
+            "beta"
         );
     }
 }

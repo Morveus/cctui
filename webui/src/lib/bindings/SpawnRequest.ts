@@ -123,4 +123,15 @@ attachment_names?: Array<string>,
  * so a launch that returns no session id (machine spawns, draft launches)
  * still lands labelled. Stored with a draft and carried to its launch.
  */
-label_ids?: Array<string>, };
+label_ids?: Array<string>, 
+/**
+ * How this session relates to `parent_session_id`: `followup` marks a
+ * session whose first prompt embeds the parent's transcript brief. It
+ * nests under the parent like a fork. `None` → a root session.
+ */
+relation?: string | null, 
+/**
+ * The session this one continues (see `relation`). Set on the child's
+ * `parent_id` when the worker registers.
+ */
+parent_session_id?: string | null, };

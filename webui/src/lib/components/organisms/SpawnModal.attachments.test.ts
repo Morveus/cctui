@@ -88,9 +88,9 @@ function must<T>(el: T | null | undefined, what: string): T {
 const prompt = () =>
   must(document.querySelector<HTMLTextAreaElement>("#sp-prompt"), "prompt");
 const chips = () =>
-  [...document.querySelectorAll(".files .fname")].map((e) =>
-    e.textContent?.trim(),
-  );
+  [
+    ...document.querySelectorAll('[data-tsu="AttachmentList"] li.chip [title]'),
+  ].map((e) => e.getAttribute("title"));
 
 async function pick(files: File[]) {
   const input = must(

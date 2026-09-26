@@ -922,9 +922,8 @@ phase_codex_config() {
     _cfg="$_cfgdir/config.toml"
     mkdir -p "$_cfgdir"
 
-    # Model + reasoning effort, pinned per-pod so one-off `codex exec` (and the
-    # codex-run shim) need no --model/-c flags — config.toml owns them. Model
-    # names are BARE (no `-codex` suffix); default is the gpt-5.6-sol frontier.
+    # Model + reasoning effort, pinned per-pod so one-off `codex exec` needs no
+    # --model/-c flags — config.toml owns them. Model names are BARE (no `-codex` suffix); default is the gpt-5.6-sol frontier.
     # Overridden only by TASK_CODEX_MODEL — NEVER by TASK_MODEL, which is the
     # primary (Claude) agent's model (e.g. `opus`); feeding that to codex writes
     # an OpenAI-invalid model the gateway rejects.
@@ -970,7 +969,7 @@ phase_codex_config() {
         # (Landlock+seccomp+guard-proxy), and codex's inner bubblewrap sandbox is
         # blocked by our seccomp filter — so a codex sandbox makes every read
         # fail. This is the config.toml equivalent of the yolo CLI flag; it lets
-        # `codex exec` / the codex-run shim run with no approval/sandbox flags.
+        # `codex exec` run with no approval/sandbox flags.
         # (`--skip-git-repo-check` has NO config equivalent and stays on the CLI.)
         printf 'approval_policy = "never"\n'
         printf 'sandbox_mode = "danger-full-access"\n'
@@ -1400,7 +1399,7 @@ WORKER_LIVENESS_POLL_SECS="${WORKER_LIVENESS_POLL_SECS:-10}"
 # The server folds TWO different things into `inactive` (routes/sessions.rs): a
 # real SessionEnded deregistration, and a heartbeat merely older than its 5m
 # STATUS_WINDOW. Only the first is death. The heartbeat is bumped by adapter
-# events alone, so one long blocking tool call — a `codex-run` over 5m — silences
+# events alone, so one long blocking tool call — a `codex exec` over 5m — silences
 # it and reads identical to a crash. Tell the two apart by the heartbeat's own
 # age, and give a merely-quiet session this much slack before giving up on it.
 WORKER_LIVENESS_STALE_SECS="${WORKER_LIVENESS_STALE_SECS:-1800}"

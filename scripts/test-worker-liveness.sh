@@ -55,7 +55,7 @@ roster inactive 400;    expect quiet      "quiet: past the server window, inside
 roster inactive 1700;   expect quiet      "quiet: still inside our slack"
 roster inactive 1900;   expect ended      "gone: heartbeat past WORKER_LIVENESS_STALE_SECS"
 
-# The regression this guards: a codex-run blocking well past the server's 5m
+# The regression this guards: a tool call blocking well past the server's 5m
 # window must NOT read as death.
 roster inactive 500;    expect quiet      "8m blocking tool call survives"
 

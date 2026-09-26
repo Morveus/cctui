@@ -584,14 +584,14 @@ mod tests {
     fn a_refused_session_moves_to_the_member_with_room_and_records_the_pool() {
         let p = pool(crate::store::account_pools::STRATEGY_HEADROOM, true);
         let spare = Uuid::new_v4();
-        let candidates = [member("hirobot", 100.0, true), member("pafin", 9.0, true)];
+        let candidates = [member("alpha", 100.0, true), member("beta", 9.0, true)];
         let providers = [Uuid::new_v4(), spare];
         let target =
-            elect_replacement(&p, &candidates, &providers, None, Utc::now(), "sess-1", "hirobot")
+            elect_replacement(&p, &candidates, &providers, None, Utc::now(), "sess-1", "alpha")
                 .expect("a member with room");
-        assert_eq!(target.account_name, "pafin");
+        assert_eq!(target.account_name, "beta");
         assert_eq!(target.provider_id, spare);
-        assert_eq!(target.from_account_name, "hirobot");
+        assert_eq!(target.from_account_name, "alpha");
         // `rebind_session` writes exactly these two into `session_account_rebinds`,
         // so the move is attributable to the pool afterwards.
         assert_eq!(target.pool_id, Some(p.id));
@@ -601,10 +601,10 @@ mod tests {
     #[test]
     fn an_unmeasurable_member_is_not_a_failover_target() {
         let p = pool(crate::store::account_pools::STRATEGY_HEADROOM, true);
-        let candidates = [member("pafin", 0.0, false)];
+        let candidates = [member("beta", 0.0, false)];
         let providers = [Uuid::new_v4()];
         assert!(
-            elect_replacement(&p, &candidates, &providers, None, Utc::now(), "sess-1", "hirobot")
+            elect_replacement(&p, &candidates, &providers, None, Utc::now(), "sess-1", "alpha")
                 .is_none()
         );
     }
@@ -612,10 +612,10 @@ mod tests {
     #[test]
     fn every_remaining_member_out_leaves_the_session_put() {
         let p = pool(crate::store::account_pools::STRATEGY_HEADROOM, true);
-        let candidates = [member("hirobot", 100.0, true), member("pafin", 100.0, true)];
+        let candidates = [member("alpha", 100.0, true), member("beta", 100.0, true)];
         let providers = [Uuid::new_v4(), Uuid::new_v4()];
         assert!(
-            elect_replacement(&p, &candidates, &providers, None, Utc::now(), "sess-1", "hirobot")
+            elect_replacement(&p, &candidates, &providers, None, Utc::now(), "sess-1", "alpha")
                 .is_none()
         );
     }

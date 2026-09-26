@@ -25,6 +25,11 @@ describe('parseUserUploadRefs', () => {
 		});
 	});
 
+	it('takes only the staged name when a stale token names another upload', () => {
+		const text = `What is using so much for the GPU?\n\n[paste-1.txt]\n\nI think we could free some?\n\nAttached file:\n- /tmp/cctui-uploads/${sid}/paste-1-1.txt`;
+		expect(parseUserUploadRefs(text)).toEqual({ sessionId: sid, names: ['paste-1-1.txt'] });
+	});
+
 	it('ignores prose brackets and markdown links', () => {
 		expect(parseUserUploadRefs('[not a file] and [docs](https://x.y/a.md)').names).toEqual([]);
 		expect(parseUserUploadRefs(undefined).names).toEqual([]);

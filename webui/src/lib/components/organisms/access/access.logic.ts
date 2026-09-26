@@ -35,8 +35,3 @@ export function filterByName<T extends { name: string }>(rows: readonly T[], que
 }
 
 export const keyIcon = (kind: string): 'tv' | 'user' => (kind === 'machine' ? 'tv' : 'user');
-
-export function initial(name: string): string {
-	const first = [...(name ?? '').trim()][0];
-	return (first ?? '?').toUpperCase();
-}

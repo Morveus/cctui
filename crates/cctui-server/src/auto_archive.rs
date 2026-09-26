@@ -14,6 +14,8 @@
 use std::collections::HashMap;
 
 use cctui_proto::classifier::Bucket;
+use cctui_proto::models::SessionStatus;
+use chrono::{DateTime, Utc};
 
 use crate::live_sessions::live_sessions_predicate;
 use crate::routes::sessions::ArchiveOutcome;
@@ -152,7 +154,14 @@ pub async fn sweep(state: &AppState) {
             continue;
         }
         // Never forced: a session the human pinned since the spawn stays.
-        match crate::routes::sessions::archive_one(state, &id, false).await {
+        match crate::routes::sessions::archive_one(
+            state,
+            &id,
+            false,
+            cctui_proto::adapter::RemoveInitiator::Automatic,
+        )
+        .await
+        {
             Ok(ArchiveOutcome::Archived) => {
                 tracing::info!(session_id = %id, "auto-archived a finished macro session");
             }
@@ -164,9 +173,45 @@ pub async fn sweep(state: &AppState) {
     }
 }
 
+/// When the idle-TTL sweep (`auto_archive_stale`) will archive a session:
+/// `ttl_secs` after its last heartbeat, unless pinned, already archived, a
+/// draft, or the sweep is disabled (`0`).
+pub fn stale_archive_due(
+    status: SessionStatus,
+    pinned: bool,
+    last_heartbeat: Option<DateTime<Utc>>,
+    ttl_secs: u64,
+) -> Option<DateTime<Utc>> {
+    if ttl_secs == 0 || pinned || matches!(status, SessionStatus::Archived | SessionStatus::Draft) {
+        return None;
+    }
+    last_heartbeat?.checked_add_signed(chrono::Duration::seconds(i64::try_from(ttl_secs).ok()?))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::should_archive;
+    use super::{should_archive, stale_archive_due};
+    use cctui_proto::models::SessionStatus;
+
+    #[test]
+    fn stale_archive_is_due_one_ttl_after_the_last_heartbeat() {
+        let hb = chrono::DateTime::parse_from_rfc3339("2026-09-24T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let due = stale_archive_due(SessionStatus::Inactive, false, Some(hb), 24 * 3600);
+        assert_eq!(due, Some(hb + chrono::Duration::hours(24)));
+        assert!(stale_archive_due(SessionStatus::Active, false, Some(hb), 3600).is_some());
+    }
+
+    #[test]
+    fn stale_archive_never_due_for_protected_sessions() {
+        let hb = Some(chrono::Utc::now());
+        assert_eq!(stale_archive_due(SessionStatus::Inactive, true, hb, 3600), None);
+        assert_eq!(stale_archive_due(SessionStatus::Archived, false, hb, 3600), None);
+        assert_eq!(stale_archive_due(SessionStatus::Draft, false, hb, 3600), None);
+        assert_eq!(stale_archive_due(SessionStatus::Inactive, false, hb, 0), None);
+        assert_eq!(stale_archive_due(SessionStatus::Inactive, false, None, 3600), None);
+    }
 
     #[test]
     fn archives_a_clean_done_turn() {

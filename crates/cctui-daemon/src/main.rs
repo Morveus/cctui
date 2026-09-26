@@ -89,6 +89,21 @@ enum Cmd {
         #[arg(long)]
         sock: PathBuf,
     },
+    /// Internal: the Claude Code `SessionStart` hook that holds the first turn
+    /// until the session's MCP relay has connected, so a prompt calling
+    /// `CctuiAgent` on turn 1 does not race it. Always exits 0 — a relay that
+    /// never connects costs the session a bounded wait, never its launch.
+    McpWait {
+        /// Session whose relay is awaited.
+        #[arg(long)]
+        session: String,
+        /// Daemon socket serving the agent tool.
+        #[arg(long)]
+        sock: PathBuf,
+        /// Seconds to wait before releasing the turn anyway.
+        #[arg(long, default_value_t = 8)]
+        timeout: u64,
+    },
     /// Internal: the Claude Code `Stop` hook for whip mode (🐎). Reads
     /// the hook JSON on stdin; exits 2 with guidance on stderr when the final
     /// message reads as a graceful early exit / hand-back, else exits 0.
@@ -226,6 +241,7 @@ async fn run_daemon(path: &std::path::Path, no_auto_update: bool) -> anyhow::Res
     } else {
         tracing::info!("auto-update disabled");
     }
+    cctui_daemon::harness_update::spawn_loop(shutdown.clone());
     supervisor.run(shutdown).await;
     Ok(())
 }
@@ -292,6 +308,9 @@ async fn main() -> anyhow::Result<()> {
                 server_url,
                 machine_key: resp.machine_key,
                 machine_id: Some(resp.machine_id),
+                read_file_roots: Config::load_from(&path)
+                    .map(|old| old.read_file_roots)
+                    .unwrap_or_default(),
             };
             cfg.save_to(&path)?;
             println!("enrolled as {} → {}", resp.machine_id, path.display());
@@ -343,6 +362,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Status => print_status(&path),
         Cmd::AskHook { event, sock, deny } => cctui_daemon::askhook::run(&event, &sock, deny),
         Cmd::McpAgent { session, sock } => cctui_daemon::mcp::run(&session, &sock),
+        Cmd::McpWait { session, sock, timeout } => {
+            cctui_daemon::mcp::wait_ready(&session, &sock, std::time::Duration::from_secs(timeout));
+            Ok(())
+        }
         Cmd::WhipStopHook { phrases } => {
             std::process::exit(cctui_daemon::whipstop::run(phrases.as_deref()))
         }

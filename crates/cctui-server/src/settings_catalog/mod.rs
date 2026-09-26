@@ -488,7 +488,7 @@ fn build() -> Catalog {
 }
 
 /// Parse one catalog TOML, enriching `source = "schema"` keys from `schema` when a
-/// vendored JSON Schema backs this family (the Codex catalog has none yet).
+/// vendored JSON Schema backs this family.
 fn build_from(label: &'static str, raw_toml: &str, raw_schema: Option<&str>) -> Catalog {
     let raw: RawCatalog = toml::from_str(raw_toml).expect("catalog.toml parses");
     let schema: Value = raw_schema

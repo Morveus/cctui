@@ -1,10 +1,10 @@
 use super::{
-    AnthropicSettings, Family, FireworksSettings, anthropic_upstream, clear_account_reauth,
-    clear_soft_limit_block, clear_soft_limit_block_for_token, current_access_token,
-    durable_block_key, fireworks_upstream, flag_account_reauth, mark_soft_limit_block,
-    note_orphan_401, note_token_used, openai_upstream, orphan_is_blocked, record_fireworks_usage,
-    resolve_account, session_and_account_name_for_token, session_budget_limits,
-    session_id_for_token, session_spend_usd, tees_response, usage_for_soft_limit,
+    Family, FireworksSettings, anthropic_upstream, clear_account_reauth, clear_soft_limit_block,
+    clear_soft_limit_block_for_token, current_access_token, durable_block_key, fireworks_upstream,
+    flag_account_reauth, mark_soft_limit_block, note_orphan_401, note_token_used, openai_upstream,
+    orphan_is_blocked, record_fireworks_usage, resolve_account, session_and_account_name_for_token,
+    session_budget_limits, session_id_for_token, session_spend_usd, tees_response,
+    usage_for_soft_limit,
 };
 
 use axum::body::Body;
@@ -160,6 +160,32 @@ pub fn skip_request_header(lower_name: &str) -> bool {
 
 pub fn skip_response_header(lower_name: &str) -> bool {
     matches!(lower_name, "connection" | "transfer-encoding" | "content-length")
+}
+
+/// The exact bytes to forward upstream, and whether they differ from what the
+/// client sent.
+///
+/// Re-serializing a parsed body re-emits every JSON object with its keys sorted
+/// (workspace `serde_json` has no `preserve_order`), which reorders
+/// `tool_use.input` and changes every token after the first tool call — the
+/// whole prompt cache is lost. So only a provider that must be reshaped gets a
+/// re-serialized body, and Anthropic never does: its bytes are forwarded
+/// verbatim no matter which features are on.
+fn upstream_payload(
+    original: &axum::body::Bytes,
+    parsed: Option<&serde_json::Value>,
+    fireworks: Option<&FireworksSettings>,
+    affinity_session: Option<&str>,
+) -> (axum::body::Bytes, bool) {
+    let (Some(fw), Some(json)) = (fireworks, parsed) else {
+        return (original.clone(), false);
+    };
+    let mut reshaped = json.clone();
+    fw.apply_body(&mut reshaped, affinity_session);
+    if reshaped == *json {
+        return (original.clone(), false);
+    }
+    (axum::body::Bytes::from(reshaped.to_string()), true)
 }
 
 // Linear proxy pipeline (auth, account-resolve, refresh, forward, stream);
@@ -367,18 +393,12 @@ pub async fn passthrough(
         headers.insert("x-session-affinity", hv);
     }
 
-    // Anthropic: same idea, but opt-in per account — only a set `thinking_display`
-    // costs the body a buffer + re-serialize.
-    let anthropic = (Family::from_provider(&acct.provider) == Family::Anthropic)
-        .then(|| AnthropicSettings::resolve(acct.provider_settings.as_ref()))
-        .filter(AnthropicSettings::rewrites_body);
-
     // Langfuse tracing sink: only when configured AND this call is
     // sampled do we reconstruct the bodies — otherwise the gateway stays a pure
     // zero-copy passthrough (request streamed, response streamed). When tracing,
     // we buffer the request body (it is the prompt, already fully in flight) so it
-    // can be both forwarded upstream and used as the generation input.
-    let usage_notice = super::usage_notices::pending(&state, &acct, &session_token).await;
+    // can be both forwarded upstream and used as the generation input; the trace
+    // reads a parsed copy and the original bytes still go upstream.
     let langfuse = state.langfuse.clone().filter(|lf| lf.should_sample());
     let trace_session_id =
         if langfuse.is_some() { session_id_for_token(&state, &session_token).await } else { None };
@@ -392,75 +412,61 @@ pub async fn passthrough(
     // falls through to the original bytes, so non-`/v1/messages` calls are
     // untouched either way.
     let mut request_model: Option<String> = None;
-    let (upstream_body, traced_request) = if langfuse.is_some()
-        || fireworks.is_some()
-        || anthropic.is_some()
-        || usage_notice.is_some()
-        || model_gate.is_some()
-    {
-        let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
-            .await
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
-        let mut parsed = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
-        request_model = parsed
-            .as_ref()
-            .and_then(|r| r.get("model"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        // The deferred half of the soft limit: a `weekly_model:` cap gates only
-        // the model it names, so a spent weekly Fable budget must let an Opus
-        // request through. Decided before the body is reshaped, so a refusal
-        // never consumes a usage notice. Same `window_applies` the account
-        // election uses, so the two can never disagree.
-        if let Some(windows) = model_gate
-            && let crate::soft_limit::Decision::Block { retry_after_secs, reason, key } =
-                crate::soft_limit::evaluate_soft_limit(
-                    &windows,
-                    &effective_limits,
+    let mut rewrote_body = false;
+    let (upstream_body, traced_request) =
+        if langfuse.is_some() || fireworks.is_some() || model_gate.is_some() {
+            let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                .await
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+            request_model = parsed
+                .as_ref()
+                .and_then(|r| r.get("model"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            // The deferred half of the soft limit: a `weekly_model:` cap gates only
+            // the model it names, so a spent weekly Fable budget must let an Opus
+            // request through. Same `window_applies` the account election uses, so
+            // the two can never disagree.
+            if let Some(windows) = model_gate
+                && let crate::soft_limit::Decision::Block { retry_after_secs, reason, key } =
+                    crate::soft_limit::evaluate_soft_limit(
+                        &windows,
+                        &effective_limits,
+                        request_model.as_deref(),
+                        Utc::now(),
+                    )
+            {
+                tracing::info!(
+                    account = %acct.id,
+                    model = request_model.as_deref().unwrap_or("unknown"),
+                    retry_after_secs,
+                    "soft limit hit: {reason}"
+                );
+                return soft_limit_refusal(
+                    &state,
+                    &session_token,
+                    &acct,
+                    is_anthropic,
                     request_model.as_deref(),
-                    Utc::now(),
+                    retry_after_secs,
+                    reason,
+                    durable_block_key(&acct.soft_limits, &effective_limits, &key),
                 )
-        {
-            tracing::info!(
-                account = %acct.id,
-                model = request_model.as_deref().unwrap_or("unknown"),
-                retry_after_secs,
-                "soft limit hit: {reason}"
-            );
-            return soft_limit_refusal(
-                &state,
-                &session_token,
-                &acct,
-                is_anthropic,
-                request_model.as_deref(),
-                retry_after_secs,
-                reason,
-                durable_block_key(&acct.soft_limits, &effective_limits, &key),
-            )
-            .await;
-        }
-        let body = match parsed.as_mut() {
-            Some(json) if fireworks.is_some() || anthropic.is_some() || usage_notice.is_some() => {
-                if let Some(fw) = fireworks.as_ref() {
-                    fw.apply_body(json, affinity_session.as_deref());
-                }
-                if let Some(an) = anthropic.as_ref() {
-                    an.apply_body(json);
-                }
-                if let Some(notice) = usage_notice
-                    && notice.inject(json)
-                {
-                    notice.commit(&state);
-                }
-                reqwest::Body::from(json.to_string())
+                .await;
             }
-            _ => reqwest::Body::from(bytes),
+            let (payload, changed) = upstream_payload(
+                &bytes,
+                parsed.as_ref(),
+                fireworks.as_ref(),
+                affinity_session.as_deref(),
+            );
+            rewrote_body = changed;
+            (reqwest::Body::from(payload), parsed.filter(|_| langfuse.is_some()))
+        } else {
+            let body_stream = req.into_body().into_data_stream();
+            (reqwest::Body::wrap_stream(body_stream), None)
         };
-        (body, parsed.filter(|_| langfuse.is_some()))
-    } else {
-        let body_stream = req.into_body().into_data_stream();
-        (reqwest::Body::wrap_stream(body_stream), None)
-    };
 
     let upstream = state
         .http_client
@@ -533,6 +539,11 @@ pub async fn passthrough(
             None => clear_soft_limit_block_for_token(&state, &session_token).await,
         }
     }
+    // Usage ticker. Out of band on purpose: it reaches the agent as its own
+    // turn, so nothing here can reshape the request that was just forwarded.
+    if status.is_success() {
+        super::usage_notices::deliver_if_due(&state, &acct, &session_token).await;
+    }
     // A successful upstream call means the account's credentials are good again —
     // clear any reauth flag. Gated in-memory, so this is free unless the
     // account was actually flagged.
@@ -593,6 +604,7 @@ pub async fn passthrough(
     // Fireworks speaks the OpenAI wire protocol, so it reconstructs as openai.
     let is_openai = Family::from_provider(&acct.provider) != Family::Anthropic;
     let pool = state.pool.clone();
+    let bust_pool = state.pool.clone();
     // TPM accounting rides the same per-response usage the metering path captures
     // (Fireworks): the running window total the next request gates against.
     let rate_windows = acct.rate_limits.tpm.is_some().then(|| state.gateway_rate_windows.clone());
@@ -617,7 +629,7 @@ pub async fn passthrough(
                     + u64::try_from(u.output).unwrap_or(0);
                 super::note_tokens(windows, rate_provider, total);
             }
-            record_fireworks_usage(pool, session_id, request_model, captured).await;
+            record_fireworks_usage(pool, session_id, request_model, captured, rewrote_body).await;
         }
         if let Some(langfuse) = langfuse {
             let (output, usage) = if is_openai {
@@ -625,11 +637,21 @@ pub async fn passthrough(
             } else {
                 crate::langfuse::reconstruct_anthropic(&buf)
             };
+            let (level, status_message) = crate::cache_bust::trace_annotation(
+                &bust_pool,
+                ctx.session_id.as_deref(),
+                ctx.model.as_deref(),
+                usage.as_ref(),
+                rewrote_body,
+            )
+            .await;
             langfuse.trace(crate::langfuse::TracePayload {
                 ctx,
                 request: traced_request,
                 output,
                 usage,
+                level,
+                status_message,
             });
         }
     });
@@ -649,11 +671,57 @@ pub async fn passthrough(
 
 #[cfg(test)]
 mod tests {
-    use super::skip_request_header;
+    use super::{FireworksSettings, skip_request_header, upstream_payload};
 
     #[test]
     fn actor_authorization_dummy_is_stripped_before_forwarding() {
         assert!(skip_request_header("x-openai-actor-authorization"));
         assert!(!skip_request_header("chatgpt-account-id"));
+    }
+
+    /// A body whose `tool_use.input` keys are not alphabetical, carried through
+    /// the buffered anthropic path with tracing on. Re-serializing would sort
+    /// them and invalidate the cached prefix from the first tool call onward.
+    const fn unsorted_body() -> axum::body::Bytes {
+        axum::body::Bytes::from_static(
+            br#"{"model":"claude-opus-5","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/a","old_string":"x","new_string":"y"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}],"thinking":{"type":"adaptive","display":"omitted"}}"#,
+        )
+    }
+
+    #[test]
+    fn anthropic_forwards_the_client_bytes_verbatim() {
+        let original = unsorted_body();
+        let parsed = serde_json::from_slice::<serde_json::Value>(&original).unwrap();
+        let (payload, rewritten) = upstream_payload(&original, Some(&parsed), None, None);
+        assert!(!rewritten);
+        assert_eq!(payload, original);
+        // The trace may read the parsed copy; it is never what is forwarded.
+        assert_ne!(
+            axum::body::Bytes::from(parsed.to_string()),
+            original,
+            "test body must actually be key-order-sensitive"
+        );
+    }
+
+    #[test]
+    fn fireworks_may_reshape_and_reports_it() {
+        let original = axum::body::Bytes::from_static(br#"{"model":"kimi","messages":[]}"#);
+        let parsed = serde_json::from_slice::<serde_json::Value>(&original).unwrap();
+        let fw = FireworksSettings::resolve(None);
+        let (payload, rewritten) =
+            upstream_payload(&original, Some(&parsed), Some(&fw), Some("s1"));
+        assert!(rewritten);
+        let out = serde_json::from_slice::<serde_json::Value>(&payload).unwrap();
+        assert_eq!(out["context_length_exceeded_behavior"], "error");
+        assert_eq!(out["user"], "s1");
+    }
+
+    #[test]
+    fn a_non_json_body_is_forwarded_untouched() {
+        let original = axum::body::Bytes::from_static(b"not json");
+        let fw = FireworksSettings::resolve(None);
+        let (payload, rewritten) = upstream_payload(&original, None, Some(&fw), None);
+        assert!(!rewritten);
+        assert_eq!(payload, original);
     }
 }

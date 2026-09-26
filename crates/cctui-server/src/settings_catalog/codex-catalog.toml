@@ -1,7 +1,10 @@
-# Codex config.toml settings catalog — hand-maintained, no vendored schema yet.
+# Codex config.toml settings catalog — policy tags and labels over the vendored
+# `codex-config.schema.json` (codex-rs/core/config.schema.json at the tag below).
 #
 # Reference: https://learn.chatgpt.com/docs/config-file/config-reference
 # Verified against codex-cli 0.153.4.
+# The version above must equal contract::CODEX_MIN_VERSION, and the vendored
+# schema must be that release's; scripts/check-codex-schema-drift.sh enforces both.
 #
 # Policy tags:
 #   safe    — good per-account default, low blast radius
@@ -24,7 +27,7 @@ name = "service_tier"
 group = "Speed & cost"
 label = "Fast mode"
 tag = "care"
-source = "docs"
+source = "schema"
 type = "string"
 enum = "default, fast"
 default = "default"
@@ -37,7 +40,7 @@ name = "model_reasoning_summary"
 group = "Reasoning"
 label = "Reasoning summary"
 tag = "safe"
-source = "docs"
+source = "schema"
 type = "string"
 enum = "auto, concise, detailed, none"
 notes = "how much of the model's reasoning is summarised back into the transcript"
@@ -47,7 +50,7 @@ name = "model_verbosity"
 group = "Reasoning"
 label = "Verbosity"
 tag = "safe"
-source = "docs"
+source = "schema"
 type = "string"
 enum = "low, medium, high"
 notes = "GPT-5 text verbosity"
@@ -57,7 +60,7 @@ name = "plan_mode_reasoning_effort"
 group = "Reasoning"
 label = "Plan-mode effort"
 tag = "safe"
-source = "docs"
+source = "schema"
 type = "string"
 enum = "minimal, low, medium, high"
 notes = "reasoning effort while planning; the session's own effort still applies to the work"
@@ -67,7 +70,7 @@ name = "personality"
 group = "Reasoning"
 label = "Personality"
 tag = "safe"
-source = "docs"
+source = "schema"
 type = "string"
 notes = "named response personality; unset = the codex default"
 
@@ -78,7 +81,7 @@ name = "history.persistence"
 group = "Privacy"
 label = "History persistence"
 tag = "care"
-source = "docs"
+source = "schema"
 type = "string"
 enum = "save-all, none"
 default = "save-all"
@@ -92,73 +95,73 @@ notes = "`none` stops codex writing the local ~/.codex history file; cctui's own
 [[keys]]
 name = "model"
 tag = "managed"
-source = "docs"
+source = "schema"
 notes = "per-session; account-level lives in default_model / the alias map"
 
 [[keys]]
 name = "model_reasoning_effort"
 tag = "managed"
-source = "docs"
+source = "schema"
 notes = "per-session; account-level lives in default_effort"
 
 [[keys]]
 name = "approval_policy"
 tag = "managed"
-source = "docs"
+source = "schema"
 notes = "encodes PermissionMode — cctui owns it"
 
 [[keys]]
 name = "sandbox_mode"
 tag = "managed"
-source = "docs"
+source = "schema"
 notes = "encodes PermissionMode — cctui owns it"
 
 [[keys]]
 name = "sandbox_workspace_write"
 tag = "managed"
-source = "docs"
+source = "schema"
 notes = "sandbox escape hatches; rides sandbox_mode"
 
 [[keys]]
 name = "model_provider"
 tag = "managed"
-source = "docs"
+source = "schema"
 notes = "gateway routing — overriding this bypasses metering and soft limits"
 
 [[keys]]
 name = "model_providers"
 tag = "managed"
-source = "docs"
+source = "schema"
 notes = "gateway routing — the `cctui` provider block is written per session"
 
 [[keys]]
 name = "openai_base_url"
 tag = "managed"
-source = "docs"
+source = "schema"
 notes = "gateway routing"
 
 [[keys]]
 name = "chatgpt_base_url"
 tag = "managed"
-source = "docs"
+source = "schema"
 notes = "gateway routing"
 
 [[keys]]
 name = "forced_login_method"
 tag = "managed"
-source = "docs"
+source = "schema"
 notes = "account identity — cctui mints the credential"
 
 [[keys]]
 name = "forced_chatgpt_workspace_id"
 tag = "managed"
-source = "docs"
+source = "schema"
 notes = "account identity — cctui mints the credential"
 
 [[keys]]
 name = "oss_provider"
 tag = "managed"
-source = "docs"
+source = "schema"
 notes = "routes off the gateway entirely"
 
 # ---- typed keys, unblocked by the shared TOML emitter -----------------------
@@ -171,34 +174,17 @@ name = "web_search"
 group = "Tools"
 label = "Web search"
 tag = "care"
-source = "docs"
-type = "boolean"
+source = "schema"
+type = "string"
+enum = "disabled, cached, indexed, live"
 notes = "lets the model search the web mid-turn; egress + cost"
-
-[[keys]]
-name = "tools.web_search"
-group = "Tools"
-label = "Web search tool"
-tag = "care"
-source = "docs"
-type = "boolean"
-notes = "the newer `[tools]` spelling of `web_search`; set one or the other"
-
-[[keys]]
-name = "tools.view_image"
-group = "Tools"
-label = "View image"
-tag = "safe"
-source = "docs"
-type = "boolean"
-notes = "lets the model attach a local image file to its context"
 
 [[keys]]
 name = "hide_agent_reasoning"
 group = "Reasoning"
 label = "Hide reasoning"
 tag = "safe"
-source = "docs"
+source = "schema"
 type = "boolean"
 notes = "suppresses reasoning events from the stream"
 
@@ -207,7 +193,7 @@ name = "show_raw_agent_reasoning"
 group = "Reasoning"
 label = "Raw reasoning"
 tag = "care"
-source = "docs"
+source = "schema"
 type = "boolean"
 notes = "emits raw chain-of-thought where the model exposes it; verbose transcripts"
 
@@ -216,7 +202,7 @@ name = "check_for_update_on_startup"
 group = "Quiet"
 label = "Check for updates"
 tag = "safe"
-source = "docs"
+source = "schema"
 type = "boolean"
 default = "true"
 notes = "cctui pins the codex version per machine/pod, so the startup check is pure noise"
@@ -226,7 +212,7 @@ name = "model_context_window"
 group = "Context"
 label = "Context window"
 tag = "care"
-source = "docs"
+source = "schema"
 type = "number"
 notes = "overrides the model's advertised context window; too high and turns fail upstream"
 
@@ -235,7 +221,7 @@ name = "model_auto_compact_token_limit"
 group = "Context"
 label = "Auto-compact limit"
 tag = "care"
-source = "docs"
+source = "schema"
 type = "number"
 notes = "token count at which codex auto-compacts; lower trades context for cost"
 
@@ -244,7 +230,7 @@ notes = "token count at which codex auto-compacts; lower trades context for cost
 [[keys]]
 name = "features.fast_mode"
 tag = "system"
-source = "docs"
+source = "schema"
 type = "boolean"
 default = "true"
 notes = "gates whether the tier selector is offered, NOT the tier itself; a process-level value would mask the per-session toggle"

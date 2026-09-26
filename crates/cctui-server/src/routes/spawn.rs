@@ -167,6 +167,7 @@ pub async fn dispatch_spawn_as(
         crate::auto_archive::remember_intent(state, &token_session_id).await;
     }
     crate::spawn_labels::remember_intent(&state.pool, &token_session_id, &req.label_ids).await;
+    crate::followup::remember_intent(&state.pool, &token_session_id, &req).await;
     let mut env = req.env.clone();
     // The session's model before any per-account remapping. When a
     // named account is selected below, its alias map can rewrite this to a

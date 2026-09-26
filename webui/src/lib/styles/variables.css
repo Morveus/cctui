@@ -21,6 +21,10 @@
      next to the user green without colliding with the amber attention fill. */
   --role-poll: color-mix(in srgb, var(--c-amber) 62%, var(--c-red) 38%);
 
+  /* Prompts waiting in Claude's queue. Cool blue: the amber --warn fill already
+     means "in flight", and a queued prompt has not been sent at all. */
+  --role-queued: color-mix(in srgb, var(--c-blue) 78%, var(--c-violet) 22%);
+
   /* xterm canvas backdrop. Deliberately theme-independent: the terminal renders
      the agent's own ANSI colors, which assume a dark ground. */
   --term-bg: #0b0e14;

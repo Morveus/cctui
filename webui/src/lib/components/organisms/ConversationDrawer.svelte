@@ -1,9 +1,6 @@
 <script lang="ts">
 	import type { SessionListItem } from '@bindings/SessionListItem';
 	import type { AgentEvent } from '@bindings/AgentEvent';
-	import { page } from '$app/state';
-	import { replaceState } from '$app/navigation';
-	import { hrefWithoutDiagnose } from '../../../routes/sessions/sessions.logic';
 	import { ws } from '$lib/ws.svelte';
 	import {
 		useConversation,
@@ -26,14 +23,15 @@
 	import ForkModal from './conversation/ForkModal.svelte';
 	import DrawerHeader from './conversation/DrawerHeader.svelte';
 	import DrawerToolbar from './conversation/DrawerToolbar.svelte';
-	import DiagnosePanel from './conversation/DiagnosePanel.svelte';
 	import ActivityBanner from './conversation/ActivityBanner.svelte';
+	import AutoArchiveNotice from './conversation/AutoArchiveNotice.svelte';
 	import TaskPanel from './conversation/TaskPanel.svelte';
 	import TerminalPane from './conversation/TerminalPane.svelte';
 	import Conversation from './conversation/Conversation.svelte';
 	import AccountSwitchModal from './conversation/AccountSwitchModal.svelte';
 	import ConversationComposer from './conversation/ConversationComposer.svelte';
 	import QueuedBanner from './conversation/QueuedBanner.svelte';
+	import { scheduledTurns, useScheduledMessages } from '$lib/queries/scheduled';
 	import BookmarkSaveModal from './bookmarks/BookmarkSaveModal.svelte';
 	import type { Line, MsgCategory, ViewOpts } from './conversation/types';
 	import { parseViewOpts } from './conversation/filters';
@@ -58,6 +56,7 @@
 		highlight = [],
 		focusSeq = null,
 		onNewFromScript,
+		onFollowup,
 		onNavigate
 	}: {
 		session: SessionListItem;
@@ -68,6 +67,7 @@
 		focusSeq?: number | null;
 		// "New session from same script" for archived sessions.
 		onNewFromScript?: (s: SessionListItem) => void;
+		onFollowup?: (s: SessionListItem, instruction?: string) => void;
 		// Open another session in place by id — used to jump straight to a
 		// freshly forked conversation without a manual refresh.
 		onNavigate?: (sessionId: string) => void;
@@ -97,23 +97,13 @@
 	);
 	const qc = useQueryClient();
 
-	// Session diagnose panel, opened from the toolbar or a failure toast's
-	// Diagnose action (`?diagnose=1`).
-	let diagnoseOpen = $state(false);
-	// Read-only live terminal pane, toggled from the toolbar.
+	// Read-only live terminal pane, toggled from the header menu.
 	let terminalOpen = $state(false);
-	// A navigation to another session must not leave a stale panel open.
+	// A navigation to another session must not leave a stale pane open.
 	$effect(() => {
 		void id;
-		diagnoseOpen = page.url.searchParams.get('diagnose') === '1';
 		terminalOpen = false;
 	});
-
-	function closeDiagnose() {
-		diagnoseOpen = false;
-		const href = hrefWithoutDiagnose(location.href);
-		if (href) replaceState(href, page.state);
-	}
 
 	const DRAWER_MIN_PX = 360;
 	const DRAWER_DEFAULT_PX = 900;
@@ -285,6 +275,8 @@
 		);
 	// Getters, not snapshots: the toggles are read at build time so the derived
 	// below re-runs when they flip.
+	const scheduledQuery = useScheduledMessages(() => id);
+	const scheduledTurnMap = $derived(scheduledTurns(scheduledQuery.data));
 	const lineCtx: LineBuildCtx = {
 		visible,
 		renderMarkdown: mdRender,
@@ -294,6 +286,9 @@
 		},
 		get prettyDiff() {
 			return view.prettyDiff;
+		},
+		get scheduledTurns() {
+			return scheduledTurnMap;
 		}
 	};
 	const lines = $derived.by(() =>
@@ -481,11 +476,13 @@
 
 	// Mobile chat controls collapse behind text buttons that open popovers
 	//; null = no panel open. Desktop shows the controls inline.
-	let mobilePanel = $state<'filters' | 'format' | 'auto' | null>(null);
 	// The agent-side worker is gone once archived, so re-dispatch a fresh session
 	// seeded with this one's config rather than trying to revive it.
 	function newFromScript() {
 		onNewFromScript?.(session);
+	}
+	function followup(instruction?: string) {
+		onFollowup?.(session, instruction);
 	}
 
 	// Nested dialogs and the rename input take Escape for themselves; keep it
@@ -542,10 +539,13 @@
 				oncopymarkdown={sa.copyMarkdown}
 				onexport={sa.export}
 				onfork={fork.openDialog}
+				onfollowup={onFollowup ? () => followup() : undefined}
 				onforkselect={forkable
 					? () => (selectMode ? exitSelect() : (selectMode = true))
 					: undefined}
 				forkSelectActive={selectMode}
+				onterminal={() => (terminalOpen = !terminalOpen)}
+				{terminalOpen}
 				oninterrupt={sa.interrupt}
 				onarchive={sa.archive}
 				onstoparchive={sa.stopAndArchive}
@@ -569,11 +569,7 @@
 				onnexthit={hits.next}
 				bind:view
 				autoApprove={session.auto_approve}
-				bind:mobilePanel
 				ontoggleAuto={sa.toggleAutoApprove}
-				ondiagnose={() => (diagnoseOpen = true)}
-				onterminal={() => (terminalOpen = !terminalOpen)}
-				{terminalOpen}
 				{pins}
 				{lines}
 				onjumpseq={(seq) => void ensureSeqVisible(seq)}
@@ -581,10 +577,6 @@
 			/>
 
 			<TaskPanel sessionId={id} progress={stream.todoProgress} />
-
-			{#if diagnoseOpen}
-				<DiagnosePanel sessionId={id} {session} onclose={closeDiagnose} />
-			{/if}
 
 			{#if terminalOpen}
 				<TerminalPane sessionId={id} onclose={() => (terminalOpen = false)} />
@@ -643,6 +635,7 @@
 			/>
 
 			<ActivityBanner {stream} {archived} />
+			<AutoArchiveNotice {session} onpin={() => togglePin(session)} />
 
 			<ConversationComposer
 				bind:this={composer}
@@ -655,6 +648,7 @@
 				stageFiles={(files) => actions.stageFiles(id, files)}
 				onNewFromScript={newFromScript}
 				onFork={fork.openDialog}
+				onFollowup={onFollowup ? followup : undefined}
 				onResume={sa.resume}
 			/>
 			{/if}
@@ -685,6 +679,7 @@
 				extractLabel={fork.extractLabel}
 				bind:model={fork.model}
 				bind:effort={fork.effort}
+				bind:prompt={fork.prompt}
 				oncancel={fork.cancel}
 				onsubmit={fork.submit}
 			/>
@@ -717,7 +712,7 @@
 		background: var(--bg-elevated-2);
 		border: 1px solid var(--border-strong);
 		border-radius: var(--r-md);
-		box-shadow: var(--shadow-lg, 0 8px 24px rgba(0, 0, 0, 0.5));
+		box-shadow: var(--shadow-lg);
 		white-space: nowrap;
 	}
 	.fork-select-count {

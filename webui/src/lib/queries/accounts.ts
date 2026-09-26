@@ -8,6 +8,8 @@ import { endpoints } from "./endpoints";
 import { qk } from "./keys";
 import type {
   AccountUsageEntry,
+  UsageHistory,
+  UsageWindowCloses,
   CreateAccount,
   CreateProvider,
   GrantShare,
@@ -187,6 +189,37 @@ export const useAllAccountsUsage = (enabled: () => boolean = () => true) =>
     queryKey: usageKeys.all(),
     queryFn: () => api.get<AccountUsageEntry[]>("/accounts/usage"),
     enabled: enabled(),
+    staleTime: USAGE_POLL_MS,
+    refetchInterval: USAGE_POLL_MS,
+    refetchOnWindowFocus: false,
+    retry: false,
+  }));
+
+/** Sampled utilization of one credential since `from` (ISO). */
+export const useUsageHistory = (
+  accountId: () => string | null,
+  windowKey: () => string,
+  from: () => string,
+) =>
+  createQuery(() => ({
+    queryKey: ["account-usage-history", accountId(), windowKey(), from()],
+    queryFn: () =>
+      api.get<UsageHistory>(`/accounts/${accountId()}/usage/history`, {
+        window: windowKey(),
+        from: from(),
+      }),
+    enabled: !!accountId(),
+    staleTime: USAGE_POLL_MS,
+    refetchInterval: USAGE_POLL_MS,
+    refetchOnWindowFocus: false,
+    retry: false,
+  }));
+
+/** Closed quota windows of every owned credential since `from` (ISO). */
+export const useUsageCloses = (from: () => string) =>
+  createQuery(() => ({
+    queryKey: ["account-usage-closes", from()],
+    queryFn: () => api.get<UsageWindowCloses>("/accounts/usage/closes", { from: from() }),
     staleTime: USAGE_POLL_MS,
     refetchInterval: USAGE_POLL_MS,
     refetchOnWindowFocus: false,

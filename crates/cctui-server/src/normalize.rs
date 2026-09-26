@@ -29,6 +29,7 @@ pub fn to_agent_event(adapter_id: &str, event_type: &str, payload: &Value) -> Op
             content: session_ended_line(payload),
             meta: true,
             kind: Some("system_marker".to_owned()),
+            operation: None,
             ts,
             message_id: None,
             usage: None,
@@ -86,6 +87,7 @@ fn message_event(payload: &Value, ts: i64) -> Option<AgentEvent> {
                 content: format!("▷ User: {text}"),
                 meta,
                 kind: None,
+                operation: None,
                 ts,
                 message_id: None,
                 usage: None,
@@ -100,6 +102,7 @@ fn message_event(payload: &Value, ts: i64) -> Option<AgentEvent> {
             content: text.to_owned(),
             meta: false,
             kind: text_kind(role),
+            operation: None,
             ts,
             message_id: payload.get("message_id").and_then(Value::as_str).map(str::to_owned),
             usage: None,
@@ -110,22 +113,39 @@ fn message_event(payload: &Value, ts: i64) -> Option<AgentEvent> {
             content: text.to_owned(),
             meta: true,
             kind: text_kind(role),
+            operation: None,
             ts,
             message_id: None,
             usage: None,
             seq: None,
             turn_id: None,
         }),
-        "system_marker" => Some(AgentEvent::Text {
-            content: format!("· {text}"),
-            meta: true,
-            kind: text_kind(role),
-            ts,
-            message_id: None,
-            usage: None,
-            seq: None,
-            turn_id: None,
-        }),
+        "system_marker" => {
+            if let Some(op) = queue_operation(payload) {
+                return Some(AgentEvent::Text {
+                    content: queue_op_text(payload, text),
+                    meta: true,
+                    kind: Some("queue_op".to_owned()),
+                    operation: Some(op),
+                    ts,
+                    message_id: None,
+                    usage: None,
+                    seq: None,
+                    turn_id: None,
+                });
+            }
+            Some(AgentEvent::Text {
+                content: format!("· {text}"),
+                meta: true,
+                kind: text_kind(role),
+                operation: None,
+                ts,
+                message_id: None,
+                usage: None,
+                seq: None,
+                turn_id: None,
+            })
+        }
         "summary" => turn_summary_parts(payload).map(|(detail, category, needs_action)| {
             AgentEvent::TurnSummary {
                 detail,
@@ -141,6 +161,28 @@ fn message_event(payload: &Value, ts: i64) -> Option<AgentEvent> {
         }
         _ => None,
     }
+}
+
+/// A `queue-operation` marker is not a timeline note: the client renders the
+/// queue state on the queued message itself, so it needs the verb and the
+/// prompt body rather than a rendered marker line.
+fn queue_operation(payload: &Value) -> Option<String> {
+    if payload.get("marker").and_then(Value::as_str)? != "queue-operation" {
+        return None;
+    }
+    Some(payload.get("operation").and_then(Value::as_str).unwrap_or("queued").to_owned())
+}
+
+/// `queue_text` on rows the daemon wrote with the untruncated first line, else
+/// the `"{verb}: "`-prefixed excerpt older rows kept.
+fn queue_op_text(payload: &Value, text: &str) -> String {
+    if let Some(t) = payload.get("queue_text").and_then(Value::as_str) {
+        let t = t.trim();
+        if !t.is_empty() {
+            return t.to_owned();
+        }
+    }
+    text.split_once(": ").map_or_else(String::new, |(_, body)| body.trim().to_owned())
 }
 
 fn text_kind(role: &str) -> Option<String> {
@@ -214,6 +256,7 @@ fn agent_event_from_canonical(v: &Value, ts: i64) -> Option<AgentEvent> {
             content: v.get("content").and_then(Value::as_str).unwrap_or_default().to_owned(),
             meta: v.get("meta").and_then(Value::as_bool).unwrap_or(false),
             kind: v.get("kind").and_then(Value::as_str).map(str::to_owned),
+            operation: v.get("operation").and_then(Value::as_str).map(str::to_owned),
             ts,
             message_id: v.get("message_id").and_then(Value::as_str).map(str::to_owned),
             usage: serde_json::from_value(v.get("usage").cloned().unwrap_or(Value::Null)).ok(),
@@ -570,12 +613,23 @@ fn map_daemon_message(payload: &Value) -> Option<Value> {
             "kind": text_kind(role),
             "message_id": payload.get("message_id"),
         })),
-        "system_marker" => Some(json!({
-            "type": "text",
-            "content": format!("· {text}"),
-            "meta": true,
-            "kind": text_kind(role),
-        })),
+        "system_marker" => {
+            if let Some(op) = queue_operation(payload) {
+                return Some(json!({
+                    "type": "text",
+                    "content": queue_op_text(payload, text),
+                    "meta": true,
+                    "kind": "queue_op",
+                    "operation": op,
+                }));
+            }
+            Some(json!({
+                "type": "text",
+                "content": format!("· {text}"),
+                "meta": true,
+                "kind": text_kind(role),
+            }))
+        }
         "turn_annotation" => Some(json!({
             "type": "text",
             "content": text,
@@ -756,6 +810,71 @@ mod tests {
                 assert!(!error);
             }
             other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queue_operation_markers_become_queue_ops_on_both_paths() {
+        let p = json!({
+            "role": "system_marker",
+            "marker": "queue-operation",
+            "operation": "queued",
+            "queue_text": "deploy the thing",
+            "text": "queued: deploy the thing",
+        });
+        let n = for_client("claude-code", "message", p.clone()).unwrap();
+        assert_eq!(n["kind"], "queue_op");
+        assert_eq!(n["operation"], "queued");
+        assert_eq!(n["content"], "deploy the thing");
+        match to_agent_event("claude-code", "message", &p).unwrap() {
+            AgentEvent::Text { kind, operation, content, .. } => {
+                assert_eq!(kind.as_deref(), Some("queue_op"));
+                assert_eq!(operation.as_deref(), Some("queued"));
+                assert_eq!(content, "deploy the thing");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn historical_queue_rows_recover_the_body_from_the_prefixed_excerpt() {
+        let p = json!({
+            "role": "system_marker",
+            "marker": "queue-operation",
+            "operation": "dequeued",
+            "text": "dequeued: deploy the thing: now",
+        });
+        let n = for_client("claude-code", "message", p).unwrap();
+        assert_eq!(n["kind"], "queue_op");
+        assert_eq!(n["operation"], "dequeued");
+        assert_eq!(n["content"], "deploy the thing: now");
+    }
+
+    #[test]
+    fn a_bodiless_queue_row_maps_to_an_empty_body() {
+        let p = json!({
+            "role": "system_marker",
+            "marker": "queue-operation",
+            "operation": "dequeued",
+            "text": "dequeued",
+        });
+        assert_eq!(for_client("claude-code", "message", p).unwrap()["content"], "");
+    }
+
+    #[test]
+    fn other_markers_are_untouched_by_the_queue_branch() {
+        for marker in ["mode", "worktree-state", "cost-state", "permission-mode"] {
+            let p = json!({ "role": "system_marker", "marker": marker, "text": "mode: normal" });
+            let n = for_client("claude-code", "message", p.clone()).unwrap();
+            assert_eq!(n["kind"], "system_marker", "{marker}");
+            assert_eq!(n["content"], "\u{b7} mode: normal", "{marker}");
+            match to_agent_event("claude-code", "message", &p).unwrap() {
+                AgentEvent::Text { kind, operation, .. } => {
+                    assert_eq!(kind.as_deref(), Some("system_marker"), "{marker}");
+                    assert_eq!(operation, None, "{marker}");
+                }
+                other => panic!("expected Text, got {other:?}"),
+            }
         }
     }
 

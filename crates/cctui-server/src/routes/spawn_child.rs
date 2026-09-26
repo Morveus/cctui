@@ -347,6 +347,18 @@ pub async fn spawn_child(
         bootstrap: serde_json::Value::Null,
         parent_local_id: Some(parent.session_id.clone()),
     };
+    // Before the frame: the child pulls its gateway env the moment it launches,
+    // and a missing row there would hand it the unclamped machine default.
+    let child_cap = cap
+        .as_ref()
+        .map_or_else(SpawnCapability::machine_default, |c| c.inherited(authorized.budget_usd));
+    if let Err(e) =
+        crate::store::spawn_capabilities::upsert(&state.pool, &child_key, &child_cap).await
+    {
+        tracing::error!(child = %child_key, error = %e, "child spawn-capability persist failed");
+    }
+    state.spawn_capabilities.insert(child_key.clone(), child_cap);
+
     let frame = DaemonFrameDown::Command {
         adapter_id: authorized.adapter.clone(),
         command: Box::new(AdapterCommand::Spawn {
@@ -756,6 +768,46 @@ mod tests {
         sqlx::query("DELETE FROM sessions WHERE user_id = $1").bind(uid).execute(&pool).await.ok();
         sqlx::query("DELETE FROM machines WHERE user_id = $1").bind(uid).execute(&pool).await.ok();
         sqlx::query("DELETE FROM users WHERE id = $1").bind(uid).execute(&pool).await.ok();
+    }
+
+    /// The ceiling a child is handed is never larger than the budget it was
+    /// itself granted, so a spawn tree cannot outgrow its root.
+    #[test]
+    fn an_inherited_ceiling_only_shrinks_down_the_tree() {
+        let root = cap(&["claude-code"], Some(20.0), Some(3));
+        let child = root.inherited(Some(5.0));
+        assert_eq!(child.max_budget_usd, Some(5.0));
+        assert_eq!(child.adapters, root.adapters);
+        assert_eq!(child.max_children, Some(3));
+
+        let grandchild = child.inherited(Some(50.0));
+        assert_eq!(
+            grandchild.max_budget_usd,
+            Some(5.0),
+            "a child cannot hand a descendant more than its own ceiling"
+        );
+
+        assert_eq!(root.inherited(None).max_budget_usd, Some(20.0));
+        assert_eq!(cap(&["codex"], None, None).inherited(Some(2.0)).max_budget_usd, Some(2.0));
+        assert_eq!(cap(&["codex"], None, None).inherited(None).max_budget_usd, None);
+    }
+
+    /// A child spawned under the default grant inherits the budget it was
+    /// actually given, not the unclamped default.
+    #[test]
+    fn a_child_of_the_default_grant_inherits_its_own_budget() {
+        let root = SpawnCapability::machine_default();
+        let granted = authorize(Some(&root), &req("claude-code", Some(1.5)), 0).unwrap();
+        let child = root.inherited(granted.budget_usd);
+        assert_eq!(child.max_budget_usd, Some(1.5));
+        assert!(
+            authorize(Some(&child), &req("claude-code", Some(2.0)), 0).is_err(),
+            "the grandchild request must not exceed the child's inherited ceiling"
+        );
+        assert_eq!(
+            authorize(Some(&child), &req("claude-code", None), 0).unwrap().budget_usd,
+            Some(1.5)
+        );
     }
 
     #[test]

@@ -88,6 +88,10 @@ pub struct TracePayload {
     /// Token usage keyed by Langfuse price usage types: `input`, `output`,
     /// `cache_read_input_tokens`, `cache_creation_input_tokens`.
     pub usage: Option<Value>,
+    /// `WARNING` + a message when this turn lost a prompt cache it should have
+    /// hit, so busts read red in the trace view.
+    pub level: Option<&'static str>,
+    pub status_message: Option<String>,
 }
 
 /// The Langfuse sink. Cheap to clone (shares the `reqwest::Client`); present in
@@ -290,6 +294,8 @@ async fn post_ingestion(
         "output": payload.output,
         "usageDetails": payload.usage,
         "metadata": Value::Object(metadata),
+        "level": payload.level,
+        "statusMessage": payload.status_message,
     });
     let gen_event = json!({
         "id": uuid::Uuid::new_v4().to_string(),

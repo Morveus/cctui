@@ -1,8 +1,6 @@
 <script lang="ts">
-	// Conversation toolbar: three visually-separated control groups —
-	// message-category filter, formatting toggles, behavior (auto-approve)
-	// toggle — that on mobile collapse behind three text-button tabs opening
-	// popovers.
+	// Conversation toolbar, one row at every width: message filters on the left,
+	// auto-approve and pins on the right. Narrow drawers drop the labels.
 	import {
 		MSG_CATEGORIES,
 		QUICK_FILTERS,
@@ -22,11 +20,7 @@
 	let {
 		view = $bindable(),
 		autoApprove,
-		mobilePanel = $bindable(),
 		ontoggleAuto,
-		ondiagnose,
-		onterminal,
-		terminalOpen = false,
 		pins = [],
 		lines = [],
 		onjumpseq,
@@ -38,13 +32,7 @@
 	}: {
 		view: ViewOpts;
 		autoApprove: boolean;
-		mobilePanel: 'filters' | 'format' | 'auto' | null;
 		ontoggleAuto: () => void;
-		/** Opens the session diagnose panel; omit to hide the button. */
-		ondiagnose?: () => void;
-		/** Toggles the read-only live terminal; omit to hide (codex). */
-		onterminal?: () => void;
-		terminalOpen?: boolean;
 		pins?: MessagePin[];
 		lines?: Line[];
 		/** Omit both to hide the pins button (e.g. no session context). */
@@ -56,6 +44,10 @@
 		onprevhit?: () => void;
 		onnexthit?: () => void;
 	} = $props();
+
+	// One pinned height for every control, so glyph fonts can't size them.
+	const CTL = 'height:var(--bar-ctl-h);box-sizing:border-box;padding-block:0;line-height:1';
+	const TRIG = 'display:flex;align-items:center;height:var(--bar-ctl-h)';
 
 	const QUICK_TINT: Record<QuickFilterId, string> = {
 		assistant: 'var(--role-assistant)',
@@ -82,57 +74,20 @@
 	function toggleCategory(c: MsgCategory) {
 		view.msgFilter = { ...view.msgFilter, [c]: !view.msgFilter[c] };
 	}
-
-	function togglePanel(p: 'filters' | 'format' | 'auto') {
-		mobilePanel = mobilePanel === p ? null : p;
-	}
 </script>
 
-<div class="toolbar" class:panel-active={mobilePanel !== null}>
-	<!-- Mobile: collapse the three control groups into a single row
-	     of text buttons that each open a popover. Hidden on desktop, where the
-	     groups render inline below. -->
-	<div class="mobile-tabs" role="group" aria-label={m.conversation_chat_controls_aria()}>
-		<Toggle
-			size="md"
-			grow
-			data-journey="mobile-panel"
-			data-journey-key="filters"
-			pressed={mobilePanel === 'filters'}
-			aria-expanded={mobilePanel === 'filters'}
-			onclick={() => togglePanel('filters')}>{m.conversation_filters()}</Toggle
-		>
-		<Toggle
-			size="md"
-			grow
-			data-journey="mobile-panel"
-			data-journey-key="format"
-			pressed={mobilePanel === 'format'}
-			aria-expanded={mobilePanel === 'format'}
-			onclick={() => togglePanel('format')}>{m.conversation_format()}</Toggle
-		>
-		<Toggle
-			size="md"
-			grow
-			data-journey="mobile-panel"
-			data-journey-key="auto"
-			pressed={mobilePanel === 'auto' || autoApprove}
-			style={autoApprove ? '--toggle-accent: var(--warn)' : ''}
-			aria-expanded={mobilePanel === 'auto'}
-			onclick={() => togglePanel('auto')}>{m.conversation_auto_approve_tab()}</Toggle
-		>
-	</div>
+<div class="toolbar">
 	<!-- Quick category toggles + the full per-category picker. A quick chip is
 	     "on" only when every category it covers is on; a partly-on group gets a
 	     dashed border instead. -->
-	<div class="tagbar row row-wrap" data-journey="filters" class:panel-open={mobilePanel === 'filters'} role="group" aria-label={m.conversation_msg_filter_aria()}>
+	<div class="tagbar row" data-journey="filters" role="group" aria-label={m.conversation_msg_filter_aria()}>
 		{#each QUICK_FILTERS as q (q.id)}
 			<Toggle
 				pill
 				data-journey="quick"
 				data-journey-key={q.id}
 				pressed={quickOn(view.msgFilter, q.id)}
-				style={`--toggle-accent: ${QUICK_TINT[q.id]}${quickPartial(view.msgFilter, q.id) ? ';border-style:dashed' : ''}`}
+				style={`${CTL};--toggle-accent: ${QUICK_TINT[q.id]}${quickPartial(view.msgFilter, q.id) ? ';border-style:dashed' : ''}`}
 				title={quickTitle(q.id)}
 				onclick={() => toggleQuick(q.id)}
 			>
@@ -143,13 +98,17 @@
 			label={m.conversation_filter_menu_aria()}
 			placement="bottom-start"
 			bare
+			style={TRIG}
 			triggerClass="toolbar-chip"
 		>
 			{#snippet trigger()}
 				<span class="chip pill" data-journey="filter-menu">
-					{offCount > 0
-						? m.conversation_filters_off_count({ count: offCount })
-						: m.conversation_filters()}
+					<Icon name="filter" size={12} />
+					<span class="wide"
+						>{offCount > 0
+							? m.conversation_filters_off_count({ count: offCount })
+							: m.conversation_filters()}</span
+					>{#if offCount > 0}<span class="narrow">{offCount}</span>{/if}
 				</span>
 			{/snippet}
 			<FilterMenu
@@ -161,80 +120,65 @@
 	</div>
 	{#if hitCount > 0}
 		<div class="hitbar row" role="group" aria-label={m.conversation_hits_aria()}>
-			<Toggle pressed={false} title={m.conversation_hit_prev()} onclick={onprevhit}>↑</Toggle>
-			<Toggle pressed={false} title={m.conversation_hit_next()} onclick={onnexthit}>↓</Toggle>
+			<Toggle pressed={false} style={CTL} title={m.conversation_hit_prev()} onclick={onprevhit}
+				><span class="glyph">↑</span></Toggle
+			>
+			<Toggle pressed={false} style={CTL} title={m.conversation_hit_next()} onclick={onnexthit}
+				><span class="glyph">↓</span></Toggle
+			>
 			<span class="hit-count" aria-live="polite"
 				>{m.conversation_hit_counter({ n: hitIndex + 1, total: hitCount })}</span
 			>
 		</div>
 	{/if}
-	<!-- Formatting toggles: gray when off, colored when on. -->
-	<div class="fmtbar row row-wrap" class:panel-open={mobilePanel === 'format'} role="group" aria-label={m.conversation_formatting_aria()}>
-		<Toggle pressed={view.prettyJson} onclick={() => (view.prettyJson = !view.prettyJson)}>{m.conversation_fmt_json()}</Toggle>
-		<Toggle pressed={view.prettyDiff} onclick={() => (view.prettyDiff = !view.prettyDiff)}>{m.conversation_fmt_diff()}</Toggle>
-		<Toggle pressed={view.prettyTables} onclick={() => (view.prettyTables = !view.prettyTables)} title={m.conversation_fmt_tables_title()}>{m.conversation_fmt_tables()}</Toggle>
-	</div>
-	<!-- Behavior toggle: distinct from filters/formatting. -->
-	<div class="behbar row row-wrap" class:panel-open={mobilePanel === 'auto'} role="group" aria-label={m.conversation_behavior_aria()}>
+	<div class="behbar row" role="group" aria-label={m.conversation_behavior_aria()}>
 		<Toggle
 			pressed={autoApprove}
-			style="--toggle-accent: var(--warn)"
+			style={`${CTL};--toggle-accent: var(--warn)`}
 			title={m.conversation_auto_approve_title()}
 			aria-label={m.conversation_auto_approve_aria()}
 			onclick={ontoggleAuto}
-		>{m.conversation_auto_approve_btn()}</Toggle>
-		{#if ondiagnose}
-			<Toggle
-				pressed={false}
-				title={m.conversation_diagnose_title()}
-				onclick={ondiagnose}
-			>{m.conversation_diagnose_btn()}</Toggle>
-		{/if}
+			><span class="glyph" aria-hidden="true">⚡</span><span class="wide"
+				>{m.conversation_auto_approve_btn()}</span
+			></Toggle
+		>
 		{#if onjumpseq && onunpin}
 			<Popover
 				label={m.conversation_pins_aria()}
 				placement="bottom-end"
 				bare
+				style={TRIG}
 				triggerClass="toolbar-chip"
 			>
 				{#snippet trigger()}
 					<span class="chip">
-						<Icon name="pin" filled={pins.length > 0} />
-						{m.conversation_pins()}{pins.length ? ` ${pins.length}` : ''}
+						<Icon name="pin" size={12} filled={pins.length > 0} />
+						<span class="wide">{m.conversation_pins()}</span>{pins.length ? ` ${pins.length}` : ''}
 					</span>
 				{/snippet}
 				<PinsPanel {pins} {lines} onjump={onjumpseq} {onunpin} />
 			</Popover>
 		{/if}
-		{#if onterminal}
-			<Toggle
-				pressed={terminalOpen}
-				title={m.conversation_terminal_title()}
-				onclick={onterminal}
-			>{m.conversation_terminal_btn()}</Toggle>
-		{/if}
 	</div>
 </div>
 
 <style>
-	/* The Filters and Pins popover triggers must be indistinguishable from the
-	   Toggle chips beside them. `bare` strips the kit's own trigger chrome (its
-	   square floor included) and this local span — authored here, so scoped CSS
-	   reaches it — carries the whole chip restated from Toggle's own tokens.
-	   Keep in step with tsumikit Toggle's `.toggle` + `.pill`. */
+	/* Popover triggers restating kit Toggle chrome; keep in step with `.toggle`. */
 	.chip {
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
 		gap: 4px;
-		padding: 0.15rem var(--sp-2);
+		box-sizing: border-box;
+		height: var(--bar-ctl-h);
+		padding: 0 var(--sp-2);
+		line-height: 1;
 		border: 1px solid var(--border);
 		border-radius: var(--r-sm);
 		background: var(--bg-elevated-2);
 		color: var(--text-muted);
 		font-size: var(--fs-xs);
 		font-weight: var(--fw-medium);
-		line-height: 1.4;
 		white-space: nowrap;
 		user-select: none;
 		cursor: pointer;
@@ -243,7 +187,6 @@
 			border-color 0.12s var(--ease),
 			color 0.12s var(--ease);
 	}
-	/* Filters sits among the pill quick-filter chips; Pins among the square ones. */
 	.chip.pill {
 		border-radius: var(--r-pill);
 	}
@@ -251,25 +194,17 @@
 		border-color: var(--border-strong);
 	}
 
-	/* Toolbar: three visually-separated groups — message-category
-	   filter, formatting toggles, behavior toggle — divided by thin rules. */
 	.toolbar {
 		display: flex;
-		flex-wrap: wrap;
+		flex-wrap: nowrap;
 		align-items: center;
 		gap: var(--sp-2) var(--sp-3);
 		padding: var(--sp-2) var(--sp-3);
 		border-bottom: 1px solid var(--border);
-		overflow-x: auto;
 		font-size: var(--fs-xs);
-		/* This bar hosts a UI-scale slider, and the app scales by
-		   changing the ROOT font-size — so every rem here (button font-size +
-		   horizontal padding) grew while dragging, widening the buttons left of
-		   the slider and shoving the slider out from under the cursor → the same
-		   "seizure" the header had. Pin the bar's size tokens to px (the exact
-		   rem values at the 16px base) so the toolbar's geometry is scale-immune:
-		   the chat messages in `.conv` still rescale live, the slider's row does
-		   not move. Mirrors the `.hd` fix in Header.svelte. */
+		container: drawer-toolbar / inline-size;
+		/* Px, not rem: the text-size control must not shift the bar under the cursor. */
+		--bar-ctl-h: 24px;
 		--fs-xs: 12px;
 		--fs-sm: 13px;
 		--sp-1: 4px;
@@ -277,10 +212,28 @@
 		--sp-3: 12px;
 	}
 	.tagbar,
-	.fmtbar,
 	.behbar,
 	.hitbar {
 		gap: var(--sp-1);
+		flex-wrap: nowrap;
+		align-items: center;
+	}
+	.glyph {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-width: 1em;
+		line-height: 1;
+	}
+	/* Overflow is absorbed by the filters group, never by auto-approve or pins. */
+	.tagbar {
+		min-width: 0;
+		flex: 0 1 auto;
+		overflow: hidden;
+	}
+	.behbar,
+	.hitbar {
+		flex: none;
 	}
 	.hitbar {
 		align-items: center;
@@ -290,52 +243,26 @@
 		font-variant-numeric: tabular-nums;
 		white-space: nowrap;
 	}
-	.fmtbar,
 	.behbar,
 	.hitbar {
 		padding-left: var(--sp-3);
 		border-left: 1px solid var(--border);
 	}
-	/* Mobile-tab triggers: hidden on desktop where the groups inline. */
-	.mobile-tabs {
+	.narrow {
 		display: none;
 	}
-	@media (max-width: 959px) {
-		.toolbar {
-			position: relative;
-			/* The popovers float above the message log; keep the bar itself a single
-			   tidy row of triggers and let panels overlay rather than push content. */
-			overflow: visible;
-		}
-		.mobile-tabs {
-			display: flex;
-			gap: var(--sp-2);
-			width: 100%;
-		}
-		/* Collapse the inline groups; each reappears as an absolute popover when
-		   its trigger is active. */
-		.tagbar,
-		.fmtbar,
-		.behbar {
+	/* The full form needs ~940px in the longest locale with search hits shown. */
+	@container drawer-toolbar (max-width: 1000px) {
+		.wide {
 			display: none;
 		}
-		.tagbar.panel-open,
-		.fmtbar.panel-open,
-		.behbar.panel-open {
-			display: flex;
-			position: absolute;
-			top: calc(100% + var(--sp-1));
-			left: 0;
-			right: 0;
-			z-index: 5;
-			padding: var(--sp-2);
-			/* Drop the desktop divider that separated fmt/beh from the filters. */
-			padding-left: var(--sp-2);
+		.narrow {
+			display: inline;
+		}
+		.behbar {
+			margin-left: auto;
+			padding-left: 0;
 			border-left: none;
-			background: var(--bg-elevated-2);
-			border: 1px solid var(--border-strong);
-			border-radius: var(--r-md);
-			box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
 		}
 	}
 </style>

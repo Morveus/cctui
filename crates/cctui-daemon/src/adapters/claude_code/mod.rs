@@ -27,11 +27,12 @@ mod kickstart;
 mod mode;
 mod oneshot;
 mod pty_view;
+mod session_registry;
 mod socket;
 pub(crate) mod state;
 mod streamjson;
 mod transcript;
-mod version_gate;
+pub(crate) mod version_gate;
 
 use mode::Mode;
 

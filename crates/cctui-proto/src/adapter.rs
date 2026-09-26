@@ -386,6 +386,30 @@ pub enum AdapterEvent {
         local_id: String,
         offset: u64,
     },
+    /// Account rate-limit windows the agent itself reported (codex sends them
+    /// with every token count), recorded as usage samples of the credential
+    /// the session is bound to.
+    RateLimits {
+        local_id: String,
+        windows: Vec<RateLimitWindow>,
+        /// Unix seconds the agent observed them at; `None` means just now.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_at: Option<i64>,
+    },
+}
+
+/// One rate-limit window as reported by the agent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitWindow {
+    pub used_percent: f64,
+    /// Window length; `None` when the agent did not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_minutes: Option<i64>,
+    /// Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+    /// `primary` or `secondary`, the agent's own naming.
+    pub slot: String,
 }
 
 /// Child reference attached to a session — typically a linked PR. Drives the
@@ -583,6 +607,10 @@ pub enum AdapterCommand {
         /// job was actually removed. `None` for the reconcile path.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         command_id: Option<Uuid>,
+        /// Who asked. A claude job cctui did not start is removed only on
+        /// [`RemoveInitiator::User`]; an automatic sweep leaves it alone.
+        #[serde(default)]
+        initiator: RemoveInitiator,
     },
     /// Change the model and/or reasoning effort of an already-running session
     /// **in place**, without spawning a new conversation. Applies to
@@ -663,6 +691,40 @@ impl AdapterCommand {
     }
 }
 
+/// Who asked for an [`AdapterCommand::Remove`].
+///
+/// Defaults to [`Self::Automatic`] so a peer that predates the field, or any
+/// path that forgets to say, gets the conservative reading.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoveInitiator {
+    User,
+    /// A TTL sweep, a spawn-intent auto-archive, or the reconcile purge.
+    #[default]
+    Automatic,
+}
+
+impl RemoveInitiator {
+    /// The persisted `sessions.archived_by` value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Automatic => "automatic",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "user" => Some(Self::User),
+            "automatic" => Some(Self::Automatic),
+            _ => None,
+        }
+    }
+}
+
 /// Which slice of a parent conversation a subset fork keeps.
 ///
 /// All modes anchor on an assistant `message_id` (`msg_…`) — the only
@@ -709,7 +771,7 @@ pub enum PermissionMode {
     /// `sandbox_mode=workspace-write` + `approval_policy=never`.
     Auto,
     /// Prompt on every action. claude `--permission-mode default`; codex
-    /// `sandbox_mode=workspace-write` + `approval_policy=untrusted`.
+    /// `sandbox_mode=workspace-write` + `approval_policy=on-request`.
     Ask,
     /// "Whip" (🐎) — yolo on steroids. Same permission posture as
     /// [`Self::Yolo`] (no prompts, no sandbox), plus two enforcement hooks
@@ -737,7 +799,7 @@ impl PermissionMode {
         match self {
             Self::Yolo | Self::Whip => ("danger-full-access", "never"),
             Self::Auto => ("workspace-write", "never"),
-            Self::Ask => ("workspace-write", "untrusted"),
+            Self::Ask => ("workspace-write", "on-request"),
         }
     }
 
@@ -864,14 +926,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_permission_mode_maps_to_an_approval_policy_codex_accepts() {
+        for mode in
+            [PermissionMode::Yolo, PermissionMode::Whip, PermissionMode::Auto, PermissionMode::Ask]
+        {
+            let (_, approval) = mode.codex_sandbox_approval();
+            assert!(matches!(approval, "on-request" | "never"), "{mode:?} → {approval}");
+        }
+    }
+
+    #[test]
     fn remove_carries_its_correlation_id() {
         let id = Uuid::new_v4();
-        let cmd = AdapterCommand::Remove { local_id: "sess-1".into(), command_id: Some(id) };
+        let cmd = AdapterCommand::Remove {
+            local_id: "sess-1".into(),
+            command_id: Some(id),
+            initiator: RemoveInitiator::User,
+        };
         assert_eq!(cmd.command_id(), Some(id));
         assert_eq!(cmd.local_id(), Some("sess-1"));
         let back: AdapterCommand =
             serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
         assert_eq!(back.command_id(), Some(id));
+        assert!(matches!(back, AdapterCommand::Remove { initiator: RemoveInitiator::User, .. }));
+    }
+
+    #[test]
+    fn remove_without_an_initiator_deserializes_as_automatic() {
+        let cmd: AdapterCommand =
+            serde_json::from_str(r#"{"kind":"remove","local_id":"sess-1"}"#).unwrap();
+        assert!(matches!(
+            cmd,
+            AdapterCommand::Remove { initiator: RemoveInitiator::Automatic, .. }
+        ));
     }
 
     fn spec(parent: Option<&str>) -> SessionSpec {
@@ -937,7 +1024,9 @@ mod tests {
                     default_effort: "medium".into(),
                     input_modalities: vec!["text".into()],
                     upgrade: None,
+                    minimal_client_version: None,
                 }],
+                client_version: None,
             },
         };
         let json = serde_json::to_string(&evt).unwrap();
@@ -1204,6 +1293,15 @@ mod tests {
             }
             other => panic!("expected Diagnose, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn remove_initiator_persists_as_its_wire_name() {
+        for i in [RemoveInitiator::User, RemoveInitiator::Automatic] {
+            assert_eq!(serde_json::to_value(i).unwrap(), serde_json::json!(i.as_str()));
+            assert_eq!(RemoveInitiator::parse(i.as_str()), Some(i));
+        }
+        assert_eq!(RemoveInitiator::parse("reaper"), None);
     }
 
     #[test]

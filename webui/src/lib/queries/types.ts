@@ -208,6 +208,52 @@ export interface AccountUsageEntry extends AccountUsage {
   header_pin: boolean;
 }
 
+export interface UsageHistorySample {
+  window_key: string;
+  utilization: number;
+  amount_usd: number | null;
+  resets_at: string | null;
+  sampled_at: string;
+  source: string;
+}
+
+export interface UsageHistory {
+  account_id: string;
+  samples: UsageHistorySample[];
+}
+
+/** A quota window instance that reset, with how much of it went unused. */
+export interface UsageWindowClose {
+  account_id: string;
+  window_key: string;
+  resets_at: string;
+  final_utilization: number;
+  wasted_pct: number;
+  closed_at: string;
+  source: string;
+}
+
+/** Dollars lost to prompt-cache busts on one local day, by reason. */
+export interface DailyCacheLoss {
+  day: string;
+  ttl_expired: number;
+  gateway_rewrote_body: number;
+  unknown: number;
+  total: number;
+  busts: number;
+}
+
+export interface WastedSummary {
+  window_key: string;
+  windows: number;
+  mean_wasted_pct: number;
+}
+
+export interface UsageWindowCloses {
+  closes: UsageWindowClose[];
+  summary: WastedSummary[];
+}
+
 /** Codex reset credits (`kind: codex`) or Claude Code's `/limit-reset`
  *  (`kind: claude`), normalized for the button in the usage row. */
 export interface LimitResetStatus {

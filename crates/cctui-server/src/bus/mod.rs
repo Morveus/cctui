@@ -1114,6 +1114,7 @@ mod tests {
             content: content.into(),
             meta: false,
             kind: None,
+            operation: None,
             ts: 0,
             message_id: None,
             usage: None,

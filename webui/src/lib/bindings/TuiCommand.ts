@@ -12,7 +12,7 @@ export type TuiCommand = { "type": "subscribe", session_id: string, } | { "type"
  */
 ask_picks?: Array<Array<number>> | null, 
 /**
- * UUIDv7 minted by the client when the human hit send, carried through
+ * `UUIDv7` minted by the client when the human hit send, carried through
  * the daemon onto every event this turn produces so clients dedup by
  * identity. Absent from older clients, which fall back to content.
  */

@@ -62,15 +62,15 @@ export default defineJourney({
 		{
 			id: 'actions',
 			when: { viewport: 'desktop' },
-			target: 'conversation/fork',
+			target: 'conversation/actions',
 			say: {
 				title: { en: 'Branch instead of starting over', fr: 'Bifurquer plutôt que tout recommencer' },
 				body: {
-					en: 'Forking copies the history up to a message and continues from there — how you try a second approach without losing the first. Rename, copy a link, export and the stop and archive controls sit alongside it, folding into a ⋯ menu on a narrow window.',
-					fr: 'Bifurquer copie l’historique jusqu’à un message et repart de là — pour tenter une seconde approche sans perdre la première. Renommer, copier un lien, exporter, interrompre et archiver l’accompagnent, repliés dans un menu ⋯ sur une fenêtre étroite.'
+					en: 'The ⋯ menu holds the less-used actions: fork, which copies the history up to a message and continues from there — how you try a second approach without losing the first — plus copy a link, export, and the read-only live terminal.',
+					fr: 'Le menu ⋯ regroupe les actions moins courantes : bifurquer, qui copie l’historique jusqu’à un message et repart de là — pour tenter une seconde approche sans perdre la première —, copier un lien, exporter et le terminal en direct en lecture seule.'
 				}
 			},
-			expect: [{ visible: 'conversation/fork' }]
+			expect: [{ visible: 'conversation/actions' }]
 		},
 		{
 			id: 'kinds',
@@ -97,20 +97,6 @@ export default defineJourney({
 			},
 			expect: [{ visible: FIRST_LINE_ACTIONS }],
 			capture: 'line'
-		},
-		{
-			id: 'mobile-filters',
-			when: { viewport: 'mobile' },
-			target: 'mobile-panel[filters]',
-			do: { kind: 'click' },
-			say: {
-				title: { en: 'Open the filters', fr: 'Ouvrir les filtres' },
-				body: {
-					en: 'On a phone the controls collapse into three tabs; this one holds the message filters.',
-					fr: 'Sur téléphone les contrôles se replient en trois onglets ; celui-ci contient les filtres de messages.'
-				}
-			},
-			expect: [{ visible: 'filters/quick[assistant]' }]
 		},
 		{
 			id: 'filters',

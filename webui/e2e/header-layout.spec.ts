@@ -91,12 +91,9 @@ test('the system bar carries neither the ? nor a bell button (CCT-1012)', async 
 	await expect(tail.getByText('🔕')).toHaveCount(0);
 });
 
-test('notification state stays visible on the pill at both widths (CCT-1012)', async ({ page }) => {
+test('the user pill carries no notification bell at either width', async ({ page }) => {
 	for (const viewport of [DESKTOP, MOBILE]) {
 		await openSessions(page, viewport);
-		const bell = page.locator('header.hd .pill .bell');
-		await expect(bell).toBeVisible();
-		await expect(bell).toHaveAttribute('data-notify', /on|off/);
-		await expect(bell.locator('svg')).toBeVisible();
+		await expect(page.locator('header.hd .pill .bell')).toHaveCount(0);
 	}
 });

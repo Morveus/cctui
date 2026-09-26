@@ -48,6 +48,7 @@ export class ForkController {
 	open = $state(false);
 	model = $state('');
 	effort = $state('');
+	prompt = $state('');
 	// Conversation-extract selector. Null → full-history fork.
 	extract = $state<ForkExtract | null>(null);
 
@@ -94,6 +95,7 @@ export class ForkController {
 		this.model = s.model ?? '';
 		this.effort = s.effort ?? '';
 		this.extract = null;
+		this.prompt = '';
 		this.open = true;
 	};
 
@@ -104,6 +106,7 @@ export class ForkController {
 		this.model = s.model ?? '';
 		this.effort = s.effort ?? '';
 		this.extract = extract;
+		this.prompt = '';
 		this.open = true;
 	};
 
@@ -126,7 +129,7 @@ export class ForkController {
 			const res = await this.#opts.fork(this.#opts.id(), {
 				model: this.model.trim() || null,
 				effort: this.effort.trim() || null,
-				prompt: null,
+				prompt: this.prompt.trim() || null,
 				name: null,
 				extract: this.extract
 			});

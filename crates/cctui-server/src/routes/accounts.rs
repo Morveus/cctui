@@ -1127,15 +1127,19 @@ fn prepare_provider_write(
 
 /// Gateway settings must be a JSON object — the gateway deep-merges them over
 /// the family defaults, and a scalar/array would silently replace the whole
-/// blob instead of overriding one knob.
+/// blob instead of overriding one knob. `thinking_display` is dropped: the
+/// gateway forwards bytes verbatim and cannot apply it.
 fn validate_provider_settings(
     v: &serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    if v.is_object() {
-        Ok(v.clone())
-    } else {
-        Err(err(StatusCode::BAD_REQUEST, "provider_settings must be a JSON object"))
-    }
+    v.as_object().map_or_else(
+        || Err(err(StatusCode::BAD_REQUEST, "provider_settings must be a JSON object")),
+        |obj| {
+            let mut obj = obj.clone();
+            obj.remove("thinking_display");
+            Ok(serde_json::Value::Object(obj))
+        },
+    )
 }
 
 /// INSERT one provider row under an account. Bubbles the raw `sqlx::Error` so
@@ -2747,6 +2751,13 @@ mod tests {
             !PROVIDER_SELECT.contains("GROUP BY st.account_id"),
             "a grouped subquery aggregates every provider's rows on a single-id lookup"
         );
+    }
+
+    #[test]
+    fn provider_settings_drop_the_inert_thinking_display() {
+        let v = serde_json::json!({ "thinking_display": "summarized", "other": 1 });
+        assert_eq!(validate_provider_settings(&v).unwrap(), serde_json::json!({ "other": 1 }));
+        assert!(validate_provider_settings(&serde_json::json!("x")).is_err());
     }
 
     fn soft_now() -> DateTime<Utc> {

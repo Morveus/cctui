@@ -72,6 +72,10 @@ export type SpawnPrefill = Partial<Form> & {
 	draft_id?: string;
 	env_keys?: string;
 	label_ids?: string;
+	relation?: string;
+	parent_session_id?: string;
+	archive_source?: string;
+	followup_file?: string;
 };
 
 /** One env-secret row of the spawn form. Values never reach a draft. */

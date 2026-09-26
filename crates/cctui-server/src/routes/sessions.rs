@@ -6,7 +6,7 @@ use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use cctui_proto::adapter::SessionChild;
+use cctui_proto::adapter::{RemoveInitiator, SessionChild};
 use cctui_proto::api::{
     ApiError, Label, MessageRequest, RegisterRequest, RegisterResponse, RenameRequest,
     SessionListItem, SessionListResponse, SpawnRequest, SpawnResponse,
@@ -368,6 +368,7 @@ pub async fn list_sessions(
                         name: None,
                         model: None,
                         effort: None,
+                        permission_mode: None,
                         auto_approve: false,
                         match_snippet: None,
                         match_seq: None,
@@ -391,6 +392,10 @@ pub async fn list_sessions(
                         end_reason: None,
                         end_detail: None,
                         ended_at: None,
+                        auto_archive_at: None,
+                        archived_by: None,
+                        keepalive: None,
+                        last_keepalive_at: None,
                     },
                 )
             })
@@ -471,6 +476,7 @@ pub async fn list_sessions(
                 name: None,
                 model: None,
                 effort: None,
+                permission_mode: None,
                 auto_approve: false,
                 match_snippet: None,
                 match_seq: None,
@@ -494,6 +500,10 @@ pub async fn list_sessions(
                 end_reason: None,
                 end_detail: None,
                 ended_at: None,
+                auto_archive_at: None,
+                archived_by: None,
+                keepalive: None,
+                last_keepalive_at: None,
             },
         ));
     }
@@ -510,7 +520,7 @@ fn cap_unread(n: i64) -> u32 {
 
 /// The model catalog each session's usage is priced against, from the provider
 /// row its newest session token binds to. Ungatewayed sessions are absent.
-async fn session_catalogs(
+pub async fn session_catalogs(
     state: &AppState,
     session_ids: &[String],
 ) -> std::collections::HashMap<String, serde_json::Value> {
@@ -721,28 +731,36 @@ async fn enrich_and_sort(
     // uniformly to live + historical items: the ✋ attention glyph (from the
     // classifier) and the name/model/effort columns.
     if !session_ids.is_empty() {
-        type SignalRow = (
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            bool,
-            Option<String>,
-            Option<DateTime<Utc>>,
-            Option<String>,
-            i32,
-            serde_json::Value,
-            Option<String>,
-            Option<String>,
-            Option<DateTime<Utc>>,
-        );
+        // A struct, not a tuple: sqlx only implements `FromRow` for tuples up
+        // to 16 columns and this select is past that.
+        #[derive(sqlx::FromRow)]
+        struct SignalRow {
+            id: String,
+            tempo: Option<String>,
+            agent_state: Option<String>,
+            activity: Option<String>,
+            session_name: Option<String>,
+            model: Option<String>,
+            effort: Option<String>,
+            pinned: bool,
+            soft_limit_reason: Option<String>,
+            last_tool_at: Option<DateTime<Utc>>,
+            last_tool_name: Option<String>,
+            tool_use_count: i32,
+            children: serde_json::Value,
+            end_reason: Option<String>,
+            end_detail: Option<String>,
+            ended_at: Option<DateTime<Utc>>,
+            permission_mode: Option<String>,
+            archived_by: Option<String>,
+            keepalive_json: Option<serde_json::Value>,
+            last_keepalive_at: Option<DateTime<Utc>>,
+        }
         let rows: Vec<SignalRow> = sqlx::query_as(
             "SELECT id, tempo, agent_state, activity, session_name, model, effort, pinned, \
                     soft_limit_reason, last_tool_at, last_tool_name, tool_use_count, \
-                    children, end_reason, end_detail, ended_at \
+                    children, end_reason, end_detail, ended_at, permission_mode, archived_by, \
+                    keepalive_json, last_keepalive_at \
              FROM sessions WHERE id = ANY($1)",
         )
         .bind(&session_ids)
@@ -755,40 +773,22 @@ async fn enrich_and_sort(
         let mut by_session: std::collections::HashMap<String, SignalRow> =
             std::collections::HashMap::new();
         for row in rows {
-            by_session.insert(row.0.clone(), row);
+            by_session.insert(row.id.clone(), row);
         }
         let pr_snapshot = state.pr_status_cache.snapshot();
         let pr_cache = PrStatusCache::borrow_map(&pr_snapshot);
         for (_, s) in &mut with_ts {
-            if let Some((
-                _,
-                tempo,
-                agent_state,
-                activity,
-                name,
-                model,
-                effort,
-                pinned,
-                soft_limit_reason,
-                last_tool_at,
-                last_tool_name,
-                tool_use_count,
-                children,
-                end_reason,
-                end_detail,
-                ended_at,
-            )) = by_session.remove(&s.id)
-            {
-                s.end_reason = end_reason.as_deref().map(SessionEndReason::parse);
-                s.end_detail = end_detail;
-                s.ended_at = ended_at;
+            if let Some(row) = by_session.remove(&s.id) {
+                s.end_reason = row.end_reason.as_deref().map(SessionEndReason::parse);
+                s.end_detail = row.end_detail;
+                s.ended_at = row.ended_at;
                 let children: Vec<SessionChild> =
-                    serde_json::from_value(children).unwrap_or_default();
+                    serde_json::from_value(row.children).unwrap_or_default();
                 let bucket = bucket_from_signals(
-                    tempo.as_deref(),
-                    agent_state.as_deref(),
-                    activity.as_deref(),
-                    soft_limit_reason.as_deref(),
+                    row.tempo.as_deref(),
+                    row.agent_state.as_deref(),
+                    row.activity.as_deref(),
+                    row.soft_limit_reason.as_deref(),
                     &children,
                     &pr_cache,
                 );
@@ -799,15 +799,25 @@ async fn enrich_and_sort(
                 // Worker exited but resumable on reply. The adapter
                 // parks the marker in `tempo`; the next live snapshot after a
                 // resume overwrites it.
-                s.hibernated = tempo.as_deref() == Some("hibernated");
-                s.name = name;
-                s.model = model;
-                s.effort = effort;
-                s.pinned = pinned;
-                s.activity_detail = activity;
-                s.last_tool_at = last_tool_at;
-                s.last_tool_name = last_tool_name;
-                s.tool_use_count = tool_use_count.clamp(0, i32::MAX) as u32;
+                s.hibernated = row.tempo.as_deref() == Some("hibernated");
+                s.name = row.session_name;
+                s.model = row.model;
+                s.effort = row.effort;
+                s.permission_mode = row.permission_mode;
+                s.pinned = row.pinned;
+                s.archived_by = row.archived_by.as_deref().and_then(RemoveInitiator::parse);
+                s.auto_archive_at = crate::auto_archive::stale_archive_due(
+                    s.status,
+                    s.pinned,
+                    s.last_heartbeat,
+                    state.config.archive_after_secs,
+                );
+                s.keepalive = row.keepalive_json.and_then(|v| serde_json::from_value(v).ok());
+                s.last_keepalive_at = row.last_keepalive_at;
+                s.activity_detail = row.activity;
+                s.last_tool_at = row.last_tool_at;
+                s.last_tool_name = row.last_tool_name;
+                s.tool_use_count = row.tool_use_count.clamp(0, i32::MAX) as u32;
             }
         }
     }
@@ -928,9 +938,12 @@ async fn enrich_and_sort(
 
     // Cold-cache surfacing. The per-message cache split lives in
     // `session_token_usage`; the SUM() aggregate above flattens it, so here we
-    // pull only the *most recent* row per session to derive:
-    //   - `cache_cold`     — that turn re-billed the full context
-    //                        (cache_creation > 0 && cache_read == 0).
+    // pull the two most recent rows per session to derive:
+    //   - `cache_cold`     — that turn re-billed a prefix it should have read
+    //                        back (`cache_read < 0.5 * previous context`).
+    //                        `cache_creation > 0 && cache_read == 0` misses the
+    //                        common case: tools+system always match, so
+    //                        `cache_read` is never actually 0.
     //   - `last_activity_at` — its timestamp, so the client can predict cache
     //                        expiry (Anthropic's ~5-min sliding window) before
     //                        the next send.
@@ -938,13 +951,17 @@ async fn enrich_and_sort(
     //                        turn (≈ cache_read + cache_creation), i.e. how
     //                        many tokens get re-written on the next send.
     if !session_ids.is_empty() {
-        type LastRow = (String, i64, i64, DateTime<Utc>);
+        type LastRow = (String, i64, i64, i64, DateTime<Utc>, i64);
         let rows: Vec<LastRow> = sqlx::query_as(
-            "SELECT DISTINCT ON (session_id) session_id, \
-                    cache_read_tokens, cache_creation_tokens, created_at \
-             FROM session_token_usage \
-             WHERE session_id = ANY($1) \
-             ORDER BY session_id, created_at DESC",
+            "SELECT session_id, input_tokens, cache_read_tokens, cache_creation_tokens, \
+                    created_at, rn \
+             FROM (SELECT session_id, input_tokens, cache_read_tokens, cache_creation_tokens, \
+                          created_at, \
+                          row_number() OVER ( \
+                              PARTITION BY session_id ORDER BY created_at DESC) AS rn \
+                   FROM session_token_usage WHERE session_id = ANY($1)) t \
+             WHERE rn <= 2 \
+             ORDER BY session_id, rn",
         )
         .bind(&session_ids)
         .fetch_all(&state.pool)
@@ -953,15 +970,30 @@ async fn enrich_and_sort(
             tracing::error!("db error (last token usage lookup): {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "database error".into() }))
         })?;
-        let mut by_session: std::collections::HashMap<String, (i64, i64, DateTime<Utc>)> =
+        // The last turn, plus the previous one's context to judge it against.
+        let mut by_session: std::collections::HashMap<String, (i64, i64, DateTime<Utc>, i64)> =
             std::collections::HashMap::new();
-        for (sid, cr, cc, ts) in rows {
-            by_session.insert(sid, (cr, cc, ts));
+        for (sid, input, cr, cc, ts, rn) in rows {
+            match rn {
+                1 => {
+                    by_session.entry(sid).or_insert((cr, cc, ts, 0));
+                }
+                2 => {
+                    if let Some(entry) = by_session.get_mut(&sid) {
+                        entry.3 = input.max(0) + cr.max(0) + cc.max(0);
+                    }
+                }
+                _ => {}
+            }
         }
         for (_, s) in &mut with_ts {
-            if let Some((cr, cc, ts)) = by_session.remove(&s.id) {
+            if let Some((cr, cc, ts, prev_context)) = by_session.remove(&s.id) {
                 s.last_activity_at = Some(ts);
-                s.cache_cold = cc > 0 && cr == 0;
+                s.cache_cold = if prev_context > 0 {
+                    (cr.max(0) as f64) < (prev_context as f64 * 0.5)
+                } else {
+                    cc > 0 && cr == 0
+                };
                 // Context size that would be re-written to cache on the next
                 // send (≈ the full cached prefix from the last turn).
                 let burst_tokens = u64::try_from(cr.saturating_add(cc)).unwrap_or(0);
@@ -1312,6 +1344,7 @@ pub async fn search_sessions(
                     name: None,
                     model: None,
                     effort: None,
+                    permission_mode: None,
                     auto_approve: false,
                     match_snippet: None,
                     match_seq: None,
@@ -1335,6 +1368,10 @@ pub async fn search_sessions(
                     end_reason: None,
                     end_detail: None,
                     ended_at: None,
+                    auto_archive_at: None,
+                    archived_by: None,
+                    keepalive: None,
+                    last_keepalive_at: None,
                 },
             )
         })
@@ -1488,7 +1525,15 @@ pub async fn search_field_values(
     Ok(Json(rows.into_iter().map(|(v,)| v).collect()))
 }
 
-type EndRow = (Option<String>, Option<String>, Option<DateTime<Utc>>, Option<serde_json::Value>);
+type EndRow = (
+    Option<String>,
+    Option<String>,
+    Option<DateTime<Utc>>,
+    Option<serde_json::Value>,
+    Option<String>,
+    bool,
+    Option<String>,
+);
 
 #[allow(clippy::too_many_lines)]
 pub async fn get_session(
@@ -1499,6 +1544,15 @@ pub async fn get_session(
     {
         let registry = state.registry.read().await;
         if let Some(handle) = registry.get(&session_id) {
+            let permission_mode: Option<String> = sqlx::query_as::<_, (Option<String>,)>(
+                "SELECT permission_mode FROM sessions WHERE id = $1",
+            )
+            .bind(&session_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|(m,)| m);
             let item = SessionListItem {
                 id: handle.session.id.clone(),
                 parent_id: handle.session.parent_id.clone(),
@@ -1520,6 +1574,7 @@ pub async fn get_session(
                 name: None,
                 model: None,
                 effort: None,
+                permission_mode,
                 auto_approve: state
                     .permission_store
                     .read()
@@ -1547,6 +1602,10 @@ pub async fn get_session(
                 end_reason: None,
                 end_detail: None,
                 ended_at: None,
+                auto_archive_at: None,
+                archived_by: None,
+                keepalive: None,
+                last_keepalive_at: None,
             };
             return Ok(Json(item));
         }
@@ -1589,6 +1648,7 @@ pub async fn get_session(
         name: None,
         model: None,
         effort: None,
+        permission_mode: None,
         auto_approve: state.permission_store.read().await.is_auto_approve(&row.id),
         match_snippet: None,
         match_seq: None,
@@ -1612,9 +1672,14 @@ pub async fn get_session(
         end_reason: None,
         end_detail: None,
         ended_at: None,
+        auto_archive_at: None,
+        archived_by: None,
+        keepalive: None,
+        last_keepalive_at: None,
     };
     let end: Option<EndRow> = sqlx::query_as(
-        "SELECT end_reason, end_detail, ended_at, todos FROM sessions WHERE id = $1",
+        "SELECT end_reason, end_detail, ended_at, todos, permission_mode, pinned, archived_by \
+         FROM sessions WHERE id = $1",
     )
     .bind(&item.id)
     .fetch_optional(&state.pool)
@@ -1623,11 +1688,22 @@ pub async fn get_session(
         tracing::error!("db error: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "database error".into() }))
     })?;
-    if let Some((end_reason, end_detail, ended_at, todos)) = end {
+    if let Some((end_reason, end_detail, ended_at, todos, permission_mode, pinned, archived_by)) =
+        end
+    {
         item.end_reason = end_reason.as_deref().map(SessionEndReason::parse);
         item.end_detail = end_detail;
         item.ended_at = ended_at;
         item.todos = todos.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        item.permission_mode = permission_mode;
+        item.pinned = pinned;
+        item.archived_by = archived_by.as_deref().and_then(RemoveInitiator::parse);
+        item.auto_archive_at = crate::auto_archive::stale_archive_due(
+            item.status,
+            pinned,
+            item.last_heartbeat,
+            state.config.archive_after_secs,
+        );
     }
     Ok(Json(item))
 }
@@ -1729,6 +1805,71 @@ async fn fetch_renderable_rows(
     }
 }
 
+/// Per-message token usage for one session, each turn carrying the cache bust it
+/// suffered (if any) against the previous turn of its own agent stream.
+async fn message_usage(
+    state: &AppState,
+    session_id: &str,
+) -> Result<HashMap<String, cctui_proto::models::TokenUsage>, (StatusCode, Json<ApiError>)> {
+    type UsageRow = (String, Option<String>, i64, i64, i64, i64, bool, DateTime<Utc>);
+    let usage_rows: Vec<UsageRow> = sqlx::query_as(
+        "SELECT message_id, model, \
+                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, \
+                gateway_rewrote_body, created_at \
+         FROM session_token_usage WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("db error (message usage): {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "database error".into() }))
+    })?;
+    let owned_id = session_id.to_owned();
+    let catalog = session_catalogs(state, std::slice::from_ref(&owned_id)).await.remove(session_id);
+    let turns: Vec<crate::cache_bust::Turn> = usage_rows
+        .iter()
+        .map(|(message_id, model, input, _, cache_read, cache_creation, rewrote, at)| {
+            crate::cache_bust::Turn {
+                message_id: message_id.clone(),
+                model: model.clone(),
+                input: *input,
+                cache_read: *cache_read,
+                cache_creation: *cache_creation,
+                created_at: *at,
+                gateway_rewrote_body: *rewrote,
+            }
+        })
+        .collect();
+    let mut busts = crate::cache_bust::compute(&turns, catalog.as_ref());
+    Ok(usage_rows
+        .into_iter()
+        .map(|(message_id, model, input, output, cache_read, cache_creation, _, _)| {
+            let to_u64 = |v: i64| u64::try_from(v).unwrap_or(0);
+            let cost = crate::cost::tallies_cost_usd(
+                catalog.as_ref(),
+                &[(model, crate::cost::TokenUsage { input, cached_input: cache_read, output })],
+            );
+            let cache_bust = busts.remove(&message_id).map(|b| cctui_proto::models::CacheBust {
+                lost_tokens: b.lost_tokens,
+                lost_usd: b.lost_usd,
+                reason: b.reason.as_str().to_owned(),
+            });
+            (
+                message_id,
+                cctui_proto::models::TokenUsage {
+                    tokens_in: to_u64(input),
+                    tokens_out: to_u64(output),
+                    cost_usd: cost,
+                    cache_read_tokens: to_u64(cache_read),
+                    cache_creation_tokens: to_u64(cache_creation),
+                    cache_bust,
+                },
+            )
+        })
+        .collect())
+}
+
 pub async fn get_conversation(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -1752,41 +1893,13 @@ pub async fn get_conversation(
         rows.reverse();
     }
 
-    let usage_rows: Vec<(String, Option<String>, i64, i64, i64, i64)> = sqlx::query_as(
-        "SELECT message_id, model, \
-                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens \
-         FROM session_token_usage WHERE session_id = $1",
-    )
-    .bind(&session_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("db error (message usage): {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "database error".into() }))
-    })?;
-    let catalog = session_catalogs(&state, std::slice::from_ref(&session_id))
+    let usage_by_message = message_usage(&state, &session_id).await?;
+    let scheduled_turns = crate::scheduled_messages::scheduled_turns(&state.pool, &session_id)
         .await
-        .remove(session_id.as_str());
-    let usage_by_message: HashMap<String, cctui_proto::models::TokenUsage> = usage_rows
-        .into_iter()
-        .map(|(message_id, model, input, output, cache_read, cache_creation)| {
-            let to_u64 = |v: i64| u64::try_from(v).unwrap_or(0);
-            let cost = crate::cost::tallies_cost_usd(
-                catalog.as_ref(),
-                &[(model, crate::cost::TokenUsage { input, cached_input: cache_read, output })],
-            );
-            (
-                message_id,
-                cctui_proto::models::TokenUsage {
-                    tokens_in: to_u64(input),
-                    tokens_out: to_u64(output),
-                    cost_usd: cost,
-                    cache_read_tokens: to_u64(cache_read),
-                    cache_creation_tokens: to_u64(cache_creation),
-                },
-            )
-        })
-        .collect();
+        .map_err(|e| {
+            tracing::error!("db error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "database error".into() }))
+        })?;
 
     // Stamp each event with `ts` (unix millis, matching the live `AgentEvent`
     // shape) derived from `created_at`, so the client renders real timestamps
@@ -1800,6 +1913,12 @@ pub async fn get_conversation(
                 obj.insert("seq".to_owned(), serde_json::json!(id));
                 if let Some(turn_id) = turn_id {
                     obj.insert("turn_id".to_owned(), serde_json::json!(turn_id));
+                    if let Some(at) = scheduled_turns.get(&turn_id) {
+                        obj.insert(
+                            "metadata".to_owned(),
+                            serde_json::json!({ "scheduled_at": at.to_rfc3339() }),
+                        );
+                    }
                 }
                 if let Some(message_id) = obj.get("message_id").and_then(serde_json::Value::as_str)
                     && let Some(usage) = usage_by_message.get(message_id)
@@ -1815,6 +1934,7 @@ pub async fn get_conversation(
 
 pub async fn send_message(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path(session_id): Path<String>,
     Json(req): Json<MessageRequest>,
 ) -> Result<(StatusCode, Json<cctui_proto::api::SpawnResponse>), (StatusCode, Json<ApiError>)> {
@@ -1844,6 +1964,16 @@ pub async fn send_message(
                 ),
             }),
         ));
+    }
+    if let Some(raw) = req.deliver_at.as_deref() {
+        return crate::routes::scheduled_messages::schedule(
+            &state,
+            &ctx,
+            &session_id,
+            &req.content,
+            raw,
+        )
+        .await;
     }
     // Carry re-minted gateway env so a reply-driven cold-resume revives the
     // worker with a fresh valid token rather than empty env.
@@ -2485,10 +2615,11 @@ pub async fn archive_session(
     Path(session_id): Path<String>,
     Query(q): Query<ArchiveQuery>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
-    let outcome = archive_one(&state, &session_id, q.force).await.map_err(|e| {
-        tracing::error!("db error: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "database error".into() }))
-    })?;
+    let outcome =
+        archive_one(&state, &session_id, q.force, RemoveInitiator::User).await.map_err(|e| {
+            tracing::error!("db error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: "database error".into() }))
+        })?;
     match outcome {
         ArchiveOutcome::Archived => Ok(StatusCode::NO_CONTENT),
         ArchiveOutcome::SkippedPinned => Err((
@@ -2519,7 +2650,10 @@ pub enum ArchiveOutcome {
 /// refusal surfaces as a `ServerEvent::CommandResult` rather than reading as a
 /// clean archive; an undeliverable dispatch leaves the job for the daemon's
 /// `ResumeMarks` reconcile to remove on reconnect.
-pub async fn dispatch_remove(state: &AppState, session_id: &str) {
+///
+/// `initiator` decides whether a claude job cctui did not start is removed at
+/// all: only a human's archive may, an automatic sweep leaves it running.
+pub async fn dispatch_remove(state: &AppState, session_id: &str, initiator: RemoveInitiator) {
     let command_id = uuid::Uuid::new_v4();
     crate::state::track_command(
         &state.pending_commands,
@@ -2527,15 +2661,9 @@ pub async fn dispatch_remove(state: &AppState, session_id: &str) {
         Some(session_id.to_owned()),
         None,
     );
-    if let Err(err) = crate::bus::dispatch(
-        state,
-        session_id,
-        cctui_proto::adapter::AdapterCommand::Remove {
-            local_id: session_id.to_owned(),
-            command_id: Some(command_id),
-        },
-    )
-    .await
+    if let Err(err) =
+        crate::bus::dispatch(state, session_id, remove_command(session_id, command_id, initiator))
+            .await
     {
         state.pending_commands.remove(&command_id);
         tracing::warn!(
@@ -2543,6 +2671,19 @@ pub async fn dispatch_remove(state: &AppState, session_id: &str) {
             %err,
             "archive could not reach the owning daemon; job removal deferred to reconcile"
         );
+    }
+}
+
+/// The `Remove` a [`dispatch_remove`] puts on the wire.
+fn remove_command(
+    session_id: &str,
+    command_id: uuid::Uuid,
+    initiator: RemoveInitiator,
+) -> cctui_proto::adapter::AdapterCommand {
+    cctui_proto::adapter::AdapterCommand::Remove {
+        local_id: session_id.to_owned(),
+        command_id: Some(command_id),
+        initiator,
     }
 }
 
@@ -2558,6 +2699,7 @@ pub async fn archive_one(
     state: &AppState,
     session_id: &str,
     force: bool,
+    initiator: RemoveInitiator,
 ) -> Result<ArchiveOutcome, sqlx::Error> {
     if !force {
         let pinned: Option<bool> = sqlx::query_scalar("SELECT pinned FROM sessions WHERE id = $1")
@@ -2569,32 +2711,37 @@ pub async fn archive_one(
             return Ok(ArchiveOutcome::SkippedPinned);
         }
     }
-    dispatch_remove(state, session_id).await;
-    // Archive the session AND every child nested under it: a parent's
-    // children should never outlive it in the list. Archiving a *child* does
-    // not touch the parent (no `parent_id` cascade upward), and a pinned child
-    // is never swept along with its parent unless forced.
+    // Archive the session AND every descendant nested under it, at any depth: a
+    // parent's children should never outlive it in the list. Archiving a
+    // *child* does not touch the parent (no `parent_id` cascade upward), and a
+    // pinned descendant is never swept along unless forced.
     let children =
-        crate::store::sessions::children(&state.pool, session_id).await.unwrap_or_default();
+        crate::store::sessions::descendants(&state.pool, session_id).await.unwrap_or_default();
+    let descendant_ids: Vec<String> = children.iter().map(|c| c.id.clone()).collect();
     // Clear the classifier signals on archive so a session that was waiting on
     // input doesn't keep its ✋ "needs input" glyph in the archived view — an
     // archived session is, by definition, no longer waiting on anyone.
     let archived: Vec<String> = sqlx::query_scalar(
         "UPDATE sessions SET status = 'archived', tempo = NULL, agent_state = NULL, \
-                activity = NULL, soft_limit_reason = NULL \
-         WHERE (id = $1 OR parent_id = $1) AND (pinned = false OR $2) \
+                activity = NULL, soft_limit_reason = NULL, archived_by = $4 \
+         WHERE (id = $1 OR id = ANY($3)) AND (pinned = false OR $2) \
          RETURNING id",
     )
     .bind(session_id)
     .bind(force)
+    .bind(&descendant_ids)
+    .bind(initiator.as_str())
     .fetch_all(&state.pool)
     .await?;
-    // Task-tool subagents are observe-only and covered by the parent's
-    // `Remove`; CctuiAgent children and forks own a claude job each, which
-    // stays in `claude agents` until removed.
+    // Deepest first, and always before the parent: a live descendant holds its
+    // parent's worktree, and `claude rm` refuses a job whose worktree is the
+    // working directory of a live session. Task-tool subagents are observe-only
+    // and covered by their parent's `Remove`; CctuiAgent children and forks own
+    // a claude job each, which stays in `claude agents` until removed.
     for child in crate::store::sessions::job_children(&children, &archived) {
-        dispatch_remove(state, child).await;
+        dispatch_remove(state, child, initiator).await;
     }
+    dispatch_remove(state, session_id, initiator).await;
     let children: Vec<String> =
         children.into_iter().map(|c| c.id).filter(|c| archived.contains(c)).collect();
     {
@@ -2605,10 +2752,8 @@ pub async fn archive_one(
         }
     }
     state.bus.deregister_session_stream(session_id);
-    crate::state::drop_usage_notice_buckets(&state.usage_notice_buckets, session_id);
     for child in &children {
         state.bus.deregister_session_stream(child);
-        crate::state::drop_usage_notice_buckets(&state.usage_notice_buckets, child);
     }
     tracing::info!(session_id = %session_id, children = children.len(), "session archived");
     Ok(ArchiveOutcome::Archived)
@@ -2684,6 +2829,29 @@ async fn unpin_one(state: &AppState, session_id: &str) -> Result<(), sqlx::Error
         .await?;
     tracing::info!(session_id = %session_id, "session unpinned");
     Ok(())
+}
+
+/// `POST /api/v1/sessions/{id}/keepalive` — set or clear the prompt-cache
+/// keep-alive schedule; answers with the stored schedule (`null` when off).
+pub async fn set_keepalive(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<cctui_proto::api::SessionKeepaliveRequest>,
+) -> Result<Json<Option<cctui_proto::api::KeepaliveState>>, (StatusCode, Json<ApiError>)> {
+    match crate::keepalive::apply(&state, &session_id, &req).await {
+        Ok(Some(Ok(schedule))) => Ok(Json(schedule)),
+        Ok(Some(Err(msg))) => Err((StatusCode::BAD_REQUEST, Json(ApiError { error: msg }))),
+        Ok(None) => {
+            Err((StatusCode::NOT_FOUND, Json(ApiError { error: "session not found".into() })))
+        }
+        Err(e) => {
+            tracing::error!("db error: {e}");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError { error: "database error".into() }),
+            ))
+        }
+    }
 }
 
 /// `POST /api/v1/sessions/pin` — pin many sessions in one request. Mirrors the
@@ -2768,7 +2936,7 @@ pub async fn archive_sessions(
     let mut ok = 0usize;
     let mut pinned = 0usize;
     for id in &ids {
-        match archive_one(&state, id, false).await {
+        match archive_one(&state, id, false, RemoveInitiator::User).await {
             Ok(ArchiveOutcome::Archived) => ok += 1,
             Ok(ArchiveOutcome::SkippedPinned) => pinned += 1,
             Err(e) => tracing::error!(session_id = %id, "batch archive db error: {e}"),
@@ -2921,9 +3089,9 @@ impl<'a> DraftRowFields<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Bucket, SessionChild, SqlParam, attention_from_bucket, bucket_from_signals, cap_unread,
-        compile_node, derive_liveness, field_values_sql, make_snippet, normalize_last_message,
-        snippet_sql,
+        Bucket, EndRow, RemoveInitiator, SessionChild, SqlParam, attention_from_bucket,
+        bucket_from_signals, cap_unread, compile_node, derive_liveness, field_values_sql,
+        make_snippet, normalize_last_message, remove_command, snippet_sql,
     };
     use cctui_proto::models::{Attention, Liveness};
     use chrono::{Duration, Utc};
@@ -3556,5 +3724,70 @@ mod tests {
         // `(SELECT s.id)` is what stops the planner hoisting the sublink into a
         // hashed subplan that rechecks every matching event in the table.
         assert!(sql.contains("e.session_id = (SELECT s.id)"), "{sql}");
+    }
+
+    /// CCT-1080: the persisted posture reaches the sessions payload and the
+    /// wire shape only carries the key when it is known.
+    #[test]
+    fn permission_mode_rides_the_session_payload() {
+        let mut item = bare_session("perm-1");
+        assert!(item.permission_mode.is_none());
+        let bare = serde_json::to_value(&item).unwrap();
+        assert!(bare.get("permission_mode").is_none(), "an unknown posture must not be serialized");
+
+        item.permission_mode = Some("yolo".into());
+        let wire = serde_json::to_value(&item).unwrap();
+        assert_eq!(wire["permission_mode"], serde_json::json!("yolo"));
+
+        let back: cctui_proto::api::SessionListItem = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.permission_mode.as_deref(), Some("yolo"));
+    }
+
+    /// The get-one fallback selects the column, so an archived session still
+    /// reports the posture it ran under.
+    #[tokio::test]
+    async fn get_session_selects_the_persisted_permission_mode() {
+        let Some((pool, sid)) = seeded_session("get_session_permission_mode").await else {
+            return;
+        };
+        sqlx::query("UPDATE sessions SET permission_mode = 'plan' WHERE id = $1")
+            .bind(&sid)
+            .execute(&pool)
+            .await
+            .expect("set posture");
+
+        let row: Option<EndRow> = sqlx::query_as(
+            "SELECT end_reason, end_detail, ended_at, todos, permission_mode, pinned, archived_by \
+             FROM sessions WHERE id = $1",
+        )
+        .bind(&sid)
+        .fetch_optional(&pool)
+        .await
+        .expect("read session");
+        assert_eq!(row.expect("session row").4.as_deref(), Some("plan"));
+
+        sqlx::query("DELETE FROM sessions WHERE id = $1")
+            .bind(&sid)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+    }
+
+    #[test]
+    fn the_remove_command_carries_who_asked() {
+        let id = uuid::Uuid::new_v4();
+        for initiator in [RemoveInitiator::User, RemoveInitiator::Automatic] {
+            let cctui_proto::adapter::AdapterCommand::Remove {
+                local_id,
+                command_id,
+                initiator: got,
+            } = remove_command("sess-1", id, initiator)
+            else {
+                panic!("remove_command must build a Remove")
+            };
+            assert_eq!(local_id, "sess-1");
+            assert_eq!(command_id, Some(id));
+            assert_eq!(got, initiator);
+        }
     }
 }

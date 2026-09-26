@@ -1,8 +1,10 @@
 import { createQuery, useQueryClient } from "@tanstack/svelte-query";
 import type { AgentEvent } from "@bindings/AgentEvent";
 import type { MessagePin } from "@bindings/MessagePin";
+import { api } from "../api";
 import { endpoints } from "./endpoints";
 import { qk } from "./keys";
+import type { DailyCacheLoss } from "./types";
 
 export const useSessions = (
   archived: () => boolean,
@@ -45,6 +47,17 @@ export const useUsageAnalytics = (days: () => number) =>
     queryFn: () =>
       endpoints.usageAnalytics(days(), new Date().getTimezoneOffset()),
     refetchInterval: 60_000,
+  }));
+
+export const useCacheLoss = (days: () => number) =>
+  createQuery(() => ({
+    queryKey: ["cache-loss", { days: days() }],
+    queryFn: () =>
+      api.get<DailyCacheLoss[]>("/sessions/stats/cache-busts", {
+        days: days(),
+        tz_offset: new Date().getTimezoneOffset(),
+      }),
+    refetchInterval: 300_000,
   }));
 
 /** Older pages (`before` cursor) deliberately bypass the query cache. */
@@ -162,9 +175,9 @@ export function useMessagePinActions() {
   };
 }
 
-/** Session diagnose panel. Fetched only while the panel is open;
- *  no polling — the panel offers an explicit refresh instead, since the call
- *  round-trips through the daemon. */
+/** Session diagnose facts for the activity dot tooltip. Fetched only once the
+ *  tooltip has been opened; the call round-trips through the daemon, so a short
+ *  stale time serves repeated hovers from cache instead. */
 export const useSessionDiagnose = (
   id: () => string,
   enabled: () => boolean = () => true,
@@ -173,7 +186,7 @@ export const useSessionDiagnose = (
     queryKey: ["session-diagnose", id()],
     queryFn: () => endpoints.sessionDiagnose(id()),
     enabled: enabled() && !!id(),
-    staleTime: 0,
+    staleTime: 30_000,
     retry: false,
   }));
 

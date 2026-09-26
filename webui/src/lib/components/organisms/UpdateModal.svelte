@@ -208,8 +208,8 @@
 	.out {
 		margin: 0;
 		padding: var(--sp-2);
-		background: var(--bg-sunken, rgba(127, 127, 127, 0.12));
-		border-radius: var(--radius-sm, 4px);
+		background: var(--bg);
+		border-radius: var(--r-sm);
 		font-size: var(--fs-xs);
 		white-space: pre-wrap;
 		overflow-wrap: anywhere;

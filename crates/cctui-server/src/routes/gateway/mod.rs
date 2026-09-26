@@ -18,9 +18,11 @@
 //!      session is rebound to it and the worker's own 429 retry lands there
 //!      ([`failover`], opt-in via `CCTUI_GATEWAY_FAILOVER`).
 //!
-//! Request bodies stream through unread unless an account opts into shaping
-//! ([`FireworksSettings`], [`AnthropicSettings`]) or Langfuse samples the call;
-//! those buffer and re-serialize. Response bodies are never rewritten.
+//! Request bodies stream through unread unless Langfuse samples the call or a
+//! Fireworks account opts into shaping ([`FireworksSettings`]); those buffer,
+//! and only Fireworks re-serializes. The anthropic path forwards the client's
+//! bytes verbatim under every feature — re-serializing sorts JSON keys and
+//! destroys the prompt cache. Response bodies are never rewritten.
 //!
 //! Stats are opportunistic: request count + byte count, never buffered parsing.
 //! Raw OAuth tokens never enter worker env, logs, or session records.
@@ -69,12 +71,11 @@ pub fn test_db_url(test_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnthropicSettings, AuthStage, Family, FireworksSettings, OrphanSpamMap,
-        access_token_is_fresh, apply_anthropic_cache_defaults, apply_gateway_env, auth_error,
-        bump_orphan_401, clear_orphan_fingerprint, failover_retry_response, map_wham_usage,
-        merge_session_budget, needs_rebind, orphan_is_blocked_at, resolve_catalog_model,
-        skip_request_header, skip_response_header, tees_response, ttl_hours_from,
-        usage_cache_stale, window_utilization,
+        AuthStage, Family, FireworksSettings, OrphanSpamMap, access_token_is_fresh,
+        apply_anthropic_cache_defaults, apply_gateway_env, auth_error, bump_orphan_401,
+        clear_orphan_fingerprint, failover_retry_response, map_wham_usage, merge_session_budget,
+        needs_rebind, orphan_is_blocked_at, resolve_catalog_model, skip_request_header,
+        skip_response_header, tees_response, ttl_hours_from, usage_cache_stale, window_utilization,
     };
     use chrono::{Duration as ChronoDuration, Utc};
     use std::collections::BTreeMap;
@@ -388,74 +389,6 @@ mod tests {
         for other in [&anthropic, &openai] {
             assert!(other.keys().all(|k| !fireworks.contains_key(k)));
         }
-    }
-
-    #[test]
-    fn anthropic_settings_default_to_no_rewrite() {
-        for stored in [
-            None,
-            Some(serde_json::json!({})),
-            Some(serde_json::json!({ "thinking_display": null })),
-            Some(serde_json::json!({ "thinking_display": "" })),
-            Some(serde_json::json!("not-an-object")),
-        ] {
-            let s = AnthropicSettings::resolve(stored.as_ref());
-            assert!(s.thinking_display.is_none());
-            assert!(!s.rewrites_body(), "must keep the zero-copy path: {stored:?}");
-        }
-    }
-
-    #[test]
-    fn anthropic_settings_reject_values_outside_the_api_enum() {
-        for bad in ["visible", "full", "raw", "SUMMARIZED"] {
-            let stored = serde_json::json!({ "thinking_display": bad });
-            let s = AnthropicSettings::resolve(Some(&stored));
-            assert!(s.thinking_display.is_none(), "{bad} must not reach upstream");
-        }
-        for good in ["summarized", "omitted"] {
-            let stored = serde_json::json!({ "thinking_display": good });
-            assert_eq!(
-                AnthropicSettings::resolve(Some(&stored)).thinking_display.as_deref(),
-                Some(good)
-            );
-        }
-    }
-
-    #[test]
-    fn anthropic_overrides_the_display_claude_code_hardcodes() {
-        let settings = AnthropicSettings::resolve(Some(
-            &serde_json::json!({ "thinking_display": "summarized" }),
-        ));
-        let mut body = serde_json::json!({
-            "model": "claude-opus-5",
-            "thinking": { "type": "adaptive", "display": "omitted" },
-        });
-        settings.apply_body(&mut body);
-        assert_eq!(body["thinking"]["display"], serde_json::json!("summarized"));
-        assert_eq!(body["thinking"]["type"], serde_json::json!("adaptive"));
-    }
-
-    #[test]
-    fn anthropic_leaves_non_adaptive_thinking_alone() {
-        let settings = AnthropicSettings::resolve(Some(
-            &serde_json::json!({ "thinking_display": "summarized" }),
-        ));
-
-        // Thinking off entirely (CLAUDE_CODE_DISABLE_THINKING) must not gain a param.
-        let mut disabled = serde_json::json!({ "model": "claude-opus-5", "thinking": null });
-        settings.apply_body(&mut disabled);
-        assert_eq!(disabled["thinking"], serde_json::Value::Null);
-
-        let mut absent = serde_json::json!({ "model": "claude-opus-5" });
-        settings.apply_body(&mut absent);
-        assert!(absent.get("thinking").is_none());
-
-        // `display` is not a valid key on the classic budget form.
-        let mut classic = serde_json::json!({
-            "thinking": { "type": "enabled", "budget_tokens": 4000 },
-        });
-        settings.apply_body(&mut classic);
-        assert!(classic["thinking"].get("display").is_none());
     }
 
     #[test]
@@ -1118,6 +1051,7 @@ mod tests {
                 message_id: Some("gw-cap-1".to_owned()),
                 usage: crate::cost::TokenUsage { input: 2_000_000, cached_input: 0, output: 0 },
             },
+            false,
         )
         .await;
 

@@ -484,20 +484,9 @@ export function sessionIdFromLocation(pathname: string, search: URLSearchParams)
 export function sessionHrefFor(currentHref: string, id: string | null): string | null {
 	const url = new URL(currentHref);
 	const pathname = id ? `/sessions/${encodeURIComponent(id)}` : '/sessions';
-	// `?diagnose=1` belongs to the navigation that carried it, so it must not
-	// survive a move to another session.
-	if (pathname !== url.pathname) url.searchParams.delete('diagnose');
 	url.searchParams.delete('session');
 	url.pathname = pathname;
 	return url.href === currentHref ? null : url.href;
-}
-
-// Current URL with `?diagnose=1` stripped, or null when it carries none.
-export function hrefWithoutDiagnose(currentHref: string): string | null {
-	const url = new URL(currentHref);
-	if (!url.searchParams.has('diagnose')) return null;
-	url.searchParams.delete('diagnose');
-	return url.href;
 }
 
 // Freshest object for the open drawer: refetches churn the object, so prefer a

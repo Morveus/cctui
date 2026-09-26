@@ -959,7 +959,7 @@ mod tests {
         let mut v = json!({
             "spec": { "containers": [{
                 "name": "worker",
-                "image": "harbor.dorsk.dev/cyberia/cctui-worker:0.8.14",
+                "image": "harbor.dorsk.dev/homelab/cctui-worker:0.8.14",
                 "env": [
                     { "name": "CCTUI_MACHINE_KEY", "value": "cctui_m_QRSTUVWXYZ0123456789abcdefgh" },
                     { "name": "ANTHROPIC_AUTH_TOKEN", "value": "cctui_s_e143d90d82244ae99b945fe74ff5" },
@@ -985,7 +985,7 @@ mod tests {
         assert_eq!(env[5]["value"], json!("https://cctui.dorsk.dev"), "benign env rewritten");
         assert_eq!(
             v["spec"]["containers"][0]["image"],
-            json!("harbor.dorsk.dev/cyberia/cctui-worker:0.8.14"),
+            json!("harbor.dorsk.dev/homelab/cctui-worker:0.8.14"),
         );
         let once = v.clone();
         assert_eq!(redact_json(&mut v, &p()), 0, "rescrub must be idempotent");
@@ -1150,7 +1150,7 @@ mod tests {
             "https://github.com/DorskFR/cctui/pull/340",
             "cargo test -p cctui-crypto redact",
             "let x = 42; // see AGENTS.md for details",
-            "image: harbor.dorsk.dev/cyberia/cctui-worker:0.8.14",
+            "image: harbor.dorsk.dev/homelab/cctui-worker:0.8.14",
             "GET /api/v1/sessions?limit=50&order=desc",
         ];
         for b in BUILTINS {

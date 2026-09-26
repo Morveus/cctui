@@ -13,14 +13,14 @@ const rule = (o: Partial<AccountRedirect>): AccountRedirect =>
 	}) as AccountRedirect;
 
 const accounts = [
-	{ id: 'a1', name: 'hirobot' },
-	{ id: 'a2', name: 'pafin' }
+	{ id: 'a1', name: 'alpha' },
+	{ id: 'a2', name: 'beta' }
 ];
 
 describe('redirectChipsFor', () => {
 	it('resolves the target uuid to its account name', () => {
 		expect(redirectChipsFor([rule({ expires_at: 'later' })], accounts, 'a1')).toEqual([
-			{ id: 'r1', family: 'anthropic', targetName: 'pafin', until: 'later' }
+			{ id: 'r1', family: 'anthropic', targetName: 'beta', until: 'later' }
 		]);
 	});
 

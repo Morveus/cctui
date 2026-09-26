@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { attachmentStore, dropMissingTokens, isStale, MAX_AGE_MS } from './attachmentStore';
+import {
+	attachmentDraftSync,
+	attachmentStore,
+	dropMissingTokens,
+	isStale,
+	MAX_AGE_MS
+} from './attachmentStore';
 import { MAX_TOTAL_BYTES } from './attachments';
 
 const KEY = 'cctui_spawn_draft';
@@ -138,5 +144,27 @@ describe('dropMissingTokens', () => {
 
 	it('trims a trailing token', () => {
 		expect(dropMissingTokens('prompt [paste-1.txt]', ['paste-1.txt']).text).toBe('prompt');
+	});
+});
+
+describe('attachmentDraftSync', () => {
+	it('a restore in flight when the draft is sent does not bring the files back', async () => {
+		const sync = attachmentDraftSync();
+		await sync.persist(KEY, [file('paste-1.txt')]);
+		const pending = sync.restore(KEY);
+		await sync.discard(KEY);
+		expect(await pending).toBeNull();
+		expect(await attachmentStore.get(KEY)).toEqual({ files: [], missing: [] });
+		const next = await sync.restore(KEY);
+		expect(next).toEqual({ files: [], missing: [] });
+	});
+
+	it('only the latest of overlapping restores applies', async () => {
+		const sync = attachmentDraftSync();
+		await sync.persist(KEY, [file('a.txt')]);
+		const first = sync.restore(KEY);
+		const second = sync.restore(KEY);
+		expect(await first).toBeNull();
+		expect((await second)?.files.map((f) => f.name)).toEqual(['a.txt']);
 	});
 });

@@ -36,6 +36,9 @@ pub struct CodexModel {
     /// superseded (codex `upgrade`). Drives a disabled/label hint in the UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade: Option<String>,
+    /// Lowest codex release the model is offered to; a machine below it cannot run it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimal_client_version: Option<String>,
 }
 
 /// The full machine/account-scoped model catalog, as reported by one
@@ -44,4 +47,7 @@ pub struct CodexModel {
 #[ts(export)]
 pub struct CodexModelCatalog {
     pub models: Vec<CodexModel>,
+    /// The `client_version` the catalog was read under; set on responses only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
 }

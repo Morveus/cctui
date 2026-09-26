@@ -15,6 +15,7 @@
 	import NetStatsChip from '$lib/components/molecules/NetStatsChip.svelte';
 	import UpdateModal from '$lib/components/organisms/UpdateModal.svelte';
 	import StorageSection from './StorageSection.svelte';
+	import HarnessUpdateGroup from './HarnessUpdateGroup.svelte';
 	import { useVersion, useAllMachines, endpoints, qk } from '$lib/queries';
 	import type { SelfUpdateTargetInfo } from '@bindings/SelfUpdateTargetInfo';
 	import { toasts } from '$lib/toast.svelte';
@@ -218,6 +219,7 @@
 				</div>
 			</SettingRow>
 		</SettingGroup>
+		<HarnessUpdateGroup />
 	{/if}
 
 	<StorageSection />

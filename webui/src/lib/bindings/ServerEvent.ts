@@ -32,10 +32,4 @@ session_id?: string | null, } | { "type": "session_ended", session_id: string, r
  * frame was queued toward a daemon; the client awaits the adapter's
  * [`ServerEvent::CommandResult`] under this id for actual delivery.
  */
-command_id?: string | null, } | { "type": "archive_manifest", machine_id: string, count: number, } | { "type": "machine_liveness", machine_id: string, liveness: MachineLiveness, } | { "type": "machine_resources", machine_id: string, resources: MachineResources, } | { "type": "account_usage", account_id: string, usage: JsonValue, } | { "type": "dispatcher_liveness", dispatcher_id: string, liveness: MachineLiveness, } | { "type": "archive_uploaded", machine_id: string, project_dir: string, session_id: string, size_bytes: number, sha256: string, } | { "type": "github_event", kind: GithubEventKind, payload: GithubEventPayload, } | { "type": "soft_limit_reached", session_id: string, account_id: string, account_name: string, reason: string, retry_after_secs: number, } | { "type": "soft_limit_cleared", session_id: string, } | { "type": "pty_chunk", session_id: string, data: string, } |
-/**
- * Liveness tick for the browser socket, on the same interval as the
- * WebSocket `Ping`. The JS `WebSocket` API exposes no ping/pong event, so a
- * client watchdog can only be fed by an application frame.
- */
-{ "type": "heartbeat", };
+command_id?: string | null, } | { "type": "archive_manifest", machine_id: string, count: number, } | { "type": "machine_liveness", machine_id: string, liveness: MachineLiveness, } | { "type": "machine_resources", machine_id: string, resources: MachineResources, } | { "type": "account_usage", account_id: string, usage: JsonValue, } | { "type": "dispatcher_liveness", dispatcher_id: string, liveness: MachineLiveness, } | { "type": "archive_uploaded", machine_id: string, project_dir: string, session_id: string, size_bytes: number, sha256: string, } | { "type": "github_event", kind: GithubEventKind, payload: GithubEventPayload, } | { "type": "soft_limit_reached", session_id: string, account_id: string, account_name: string, reason: string, retry_after_secs: number, } | { "type": "soft_limit_cleared", session_id: string, } | { "type": "pty_chunk", session_id: string, data: string, } | { "type": "heartbeat", };

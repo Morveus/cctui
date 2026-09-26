@@ -207,6 +207,8 @@ pub async fn launch(
         attachment_names: Vec::new(),
         label_ids: Vec::new(),
         spawn_capability: None,
+        relation: None,
+        parent_session_id: None,
     };
     match spawn::dispatch_spawn(&state, &ctx, req, Vec::new(), Vec::new()).await {
         Ok((status, Json(res))) => {

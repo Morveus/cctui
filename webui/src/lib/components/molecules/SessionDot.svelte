@@ -4,33 +4,36 @@
 	import { m } from '$lib/paraglide/messages';
 	import { sessionDebugRows } from '../../../routes/sessions/sessions.logic';
 	import { sessionEnd } from '$lib/sessionEnd';
+	import SessionDotFacts from './SessionDotFacts.svelte';
 
 	// Activity dot: the liveness dot carries a rich debug tooltip —
-	// session id (surfaced nowhere else, click-to-copy) plus account, created,
-	// machine, keepalive, credentials and status. `livenessClass` and `now` are
-	// derived by the caller (SessionCard / DrawerHeader) so the dot color and the
-	// stale/relative-age words stay in sync with the row.
+	// session id (surfaced nowhere else, click-to-copy) plus the Process /
+	// Transport / Account blocks and the session's own debug rows.
+	// `livenessClass` and `now` are derived by the caller (SessionCard /
+	// DrawerHeader) so the dot color and the stale/relative-age words stay in
+	// sync with the row.
 	let {
 		session,
 		livenessClass,
 		now = Date.now()
 	}: { session: SessionListItem; livenessClass: string; now?: number } = $props();
 
+	// The daemon report costs a server → daemon round trip, so the facts child —
+	// and its query — mounts only once the tooltip is armed.
+	let armed = $state(false);
+
 	const rows = $derived.by((): { label: string; value: string; at?: string }[] => {
 		const base = sessionDebugRows(session, now);
 		const end = sessionEnd(session);
 		if (!end) return base;
-		const extra: { label: string; value: string; at?: string }[] = [
-			{ label: m.sessions_dot_ended(), value: end.endedAt ? '' : '—', at: end.endedAt ?? undefined },
-			{ label: m.sessions_dot_end_reason(), value: end.label }
+		return [
+			...base,
+			{ label: m.sessions_dot_ended(), value: end.endedAt ? '' : '—', at: end.endedAt ?? undefined }
 		];
-		if (end.detail) extra.push({ label: m.sessions_dot_end_detail(), value: end.detail });
-		return [...base, ...extra];
 	});
-
 </script>
 
-<Tooltip>
+<Tooltip maxWidth="26rem">
 	{#snippet trigger()}
 		<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 		<span
@@ -38,6 +41,8 @@
 			role="img"
 			tabindex="0"
 			aria-label={m.sessions_dot_aria()}
+			onmouseenter={() => (armed = true)}
+			onfocus={() => (armed = true)}
 		></span>
 	{/snippet}
 	{#snippet content()}
@@ -51,6 +56,9 @@
 					label={m.sessions_copy_id_title()}
 				/>
 			</div>
+			{#if armed}
+				<div class="blocks"><SessionDotFacts {session} {now} /></div>
+			{/if}
 			<dl class="grid">
 				{#each rows as r (r.label)}
 					<dt>{r.label}</dt>
@@ -77,6 +85,9 @@
 		user-select: all;
 		word-break: break-all;
 		color: var(--text);
+	}
+	.blocks {
+		margin-bottom: var(--sp-2);
 	}
 	.grid {
 		display: grid;

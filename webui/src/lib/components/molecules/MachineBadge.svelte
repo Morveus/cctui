@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { hashHue, machineInitial } from '$lib/format';
+	import { machineInitial, machineTint } from '$lib/format';
 	import { Badge } from '@dorsk/tsumikit';
 
 	// Deterministic-color machine badge, shared by the session list and the
@@ -23,16 +23,7 @@
 	} = $props();
 
 	const label = $derived(name || id.slice(0, 8));
-	// Compose the tint inline, on the element where --mh is set: the
-	// theme supplies only `<sat%> <light%>` pairs, so the per-machine hue and the
-	// theme's saturation/lightness resolve together in a real property. Inline
-	// styles apply across the component boundary regardless of Badge's scope.
-	const tint = $derived(
-		`--mh:${hue ?? hashHue(label)};` +
-			'background:hsl(var(--mh) var(--mach-bg-sl));' +
-			'color:hsl(var(--mh) var(--mach-fg-sl));' +
-			'border-color:hsl(var(--mh) var(--mach-border-sl))'
-	);
+	const tint = $derived(machineTint(label, hue));
 </script>
 
 <Badge class={mono ? 'mono' : ''} style={tint} title={dense ? label : undefined}>

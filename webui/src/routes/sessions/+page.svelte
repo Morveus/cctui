@@ -43,6 +43,7 @@
 	import { settings } from '$lib/settings.svelte';
 	import { tokenizeQuery } from '$lib/search';
 	import { m } from '$lib/paraglide/messages';
+	import { BRIEF_FETCH_MAX_BYTES, followupPrefill } from '$lib/followup';
 	import { freeText, parse } from '@dorsk/tsumikit';
 	import {
 		buildSessionSearchSchema,
@@ -179,6 +180,15 @@
 	function newFromScript(s: SessionListItem) {
 		openSession = null;
 		openSpawn(scriptPrefill(s));
+	}
+	async function followUp(s: SessionListItem, instruction?: string) {
+		try {
+			const brief = await endpoints.brief(s.id, BRIEF_FETCH_MAX_BYTES);
+			openSession = null;
+			openSpawn(followupPrefill(s, brief.markdown, { instruction }));
+		} catch (e) {
+			toasts.error(m.followup_brief_failed({ error: errMessage(e) }));
+		}
 	}
 
 	// ── Deep-linkable session ─────────────────────────────────────
@@ -1134,6 +1144,7 @@
 		highlight={searchTerms}
 		{focusSeq}
 		onNewFromScript={newFromScript}
+		onFollowup={followUp}
 		onNavigate={(sid) => void navigateToForked(sid)}
 	/>
 {/if}

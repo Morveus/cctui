@@ -30,6 +30,11 @@ export default defineConfig({
 			use: { baseURL: headerUrl, storageState: resolve(webui, 'journeys/.auth/state.json') }
 		},
 		{
+			name: 'mobile-fields',
+			testMatch: 'mobile-inline-fields.spec.ts',
+			use: { baseURL: headerUrl, storageState: resolve(webui, 'journeys/.auth/state.json') }
+		},
+		{
 			name: 'spawn',
 			testMatch: 'spawn-prompt-history.spec.ts',
 			use: { baseURL: process.env.SPAWN_E2E_URL ?? 'http://localhost:5311' }

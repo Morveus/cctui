@@ -1,7 +1,17 @@
 <script lang="ts">
 	import type { UserRow } from '@bindings/UserRow';
 	import type { MenuItem } from '@dorsk/tsumikit';
-	import { ConfirmModal, Dot, Heading, Icon, Menu, Tabs, Text, Timestamp } from '@dorsk/tsumikit';
+	import {
+		Avatar,
+		ConfirmModal,
+		Dot,
+		Heading,
+		Icon,
+		Menu,
+		Tabs,
+		Text,
+		Timestamp
+	} from '@dorsk/tsumikit';
 	import EditEntityModal from '$lib/components/molecules/EditEntityModal.svelte';
 	import { hashHue } from '$lib/format';
 	import { type OAuthAccount, useMachines, useTokens, useUserAcls, useUserActions, useUserKeys } from '$lib/queries';
@@ -13,7 +23,7 @@
 	import AccessMachinesTab from './AccessMachinesTab.svelte';
 	import AccessTokensTab from './AccessTokensTab.svelte';
 	import KeyScopesModal from './KeyScopesModal.svelte';
-	import { ALL_SCOPES, initial } from './access.logic';
+	import { ALL_SCOPES } from './access.logic';
 
 	let {
 		user,
@@ -142,8 +152,8 @@
 </script>
 
 <div class="detail">
-	<header class="dhead" style:--h={hashHue(user.name)}>
-		<span class="av" aria-hidden="true">{initial(user.name)}</span>
+	<header class="dhead">
+		<Avatar name={user.name} hue={hashHue(user.name)} size={40} decorative />
 		<div class="who">
 			<div class="line">
 				<Heading level={2} size="lg">{user.name}</Heading>
@@ -254,18 +264,6 @@
 		display: flex;
 		align-items: center;
 		gap: var(--sp-3);
-	}
-	.av {
-		flex: none;
-		display: grid;
-		place-items: center;
-		width: 40px;
-		height: 40px;
-		border-radius: 50%;
-		background: hsl(var(--h) var(--mach-bg-sl));
-		color: hsl(var(--h) var(--mach-fg-sl));
-		font-size: var(--fs-base);
-		font-weight: var(--fw-bold);
 	}
 	.who {
 		min-width: 0;

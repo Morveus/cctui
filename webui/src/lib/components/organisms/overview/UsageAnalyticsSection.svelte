@@ -5,6 +5,7 @@
 	import TokensOverTime from './TokensOverTime.svelte';
 	import ModelBreakdown from './ModelBreakdown.svelte';
 	import ActivityHeatmap from './ActivityHeatmap.svelte';
+	import CacheLossCard from './CacheLossCard.svelte';
 	import { RANGES, hasUsage, type Granularity } from './usage-analytics';
 
 	let { rangeKey = '30d' }: { rangeKey?: string } = $props();
@@ -54,6 +55,7 @@
 				<ActivityHeatmap cells={data.heatmap} />
 			</Stack>
 		</Card>
+		<CacheLossCard />
 	</Stack>
 {/if}
 

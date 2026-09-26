@@ -6,7 +6,9 @@ mod authz;
 mod auto_archive;
 mod auto_resume;
 mod bandwidth_watch;
+mod brief;
 mod bus;
+mod cache_bust;
 mod config;
 mod cost;
 mod crypto;
@@ -14,7 +16,9 @@ mod db;
 mod dispatchers;
 mod error;
 mod fireworks_billing;
+mod followup;
 mod http_cache;
+mod keepalive;
 mod langfuse;
 mod live_sessions;
 mod machine_liveness;
@@ -28,6 +32,7 @@ mod pool_usage;
 mod presence;
 mod registry;
 mod routes;
+mod scheduled_messages;
 mod session_emoji;
 mod settings_catalog;
 mod skill_store;
@@ -37,6 +42,7 @@ mod state;
 mod store;
 mod update_check;
 mod uploads;
+mod usage_history;
 mod webauthn;
 mod webhook;
 mod ws;
@@ -133,11 +139,11 @@ async fn main() -> anyhow::Result<()> {
         pending_oauth_logins: Arc::new(dashmap::DashMap::new()),
         account_usage_cache: Arc::new(dashmap::DashMap::new()),
         pr_status_cache: cctui_proto::classifier::PrStatusCache::new(),
-        usage_notice_buckets: Arc::new(dashmap::DashMap::new()),
         gateway_orphan_spam: Arc::new(dashmap::DashMap::new()),
         account_reauth: Arc::new(dashmap::DashMap::new()),
         codex_catalogs: Arc::new(dashmap::DashMap::new()),
         codex_account_catalogs: Arc::new(dashmap::DashMap::new()),
+        codex_latest_version: Arc::new(std::sync::Mutex::new(None)),
         eviction_tracker: Arc::new(bandwidth_watch::EvictionTracker::default()),
         connect_tracker: Arc::new(bandwidth_watch::ConnectTracker::default()),
         divergence_tracker: Arc::new(bandwidth_watch::DivergenceTracker::default()),
@@ -571,6 +577,14 @@ fn build_api_routes() -> Routes {
         )
         .add(
             &[GET],
+            "/sessions/stats/cache-busts",
+            "Dollars lost to prompt-cache busts per day, by reason.",
+            get(routes::cache_loss::cache_loss),
+            Authn::Bearer,
+            Authenticated,
+        )
+        .add(
+            &[GET],
             "/sessions/search",
             "Full-text search across your sessions.",
             get(routes::sessions::search_sessions),
@@ -668,6 +682,30 @@ fn build_api_routes() -> Routes {
             "/sessions/{id}/message",
             "Send a message to a live session.",
             post(routes::sessions::send_message),
+            Authn::Bearer,
+            sess_write(),
+        )
+        .add(
+            &[GET],
+            "/sessions/{id}/messages/scheduled",
+            "List a session's scheduled messages.",
+            get(routes::scheduled_messages::list),
+            Authn::Bearer,
+            sess_read(),
+        )
+        .add(
+            &[Method::PATCH, Method::DELETE],
+            "/sessions/{id}/messages/scheduled/{queue_id}",
+            "Edit/reschedule or cancel a scheduled message.",
+            patch(routes::scheduled_messages::update).delete(routes::scheduled_messages::cancel),
+            Authn::Bearer,
+            sess_write(),
+        )
+        .add(
+            &[Method::POST],
+            "/sessions/{id}/messages/scheduled/{queue_id}/send-now",
+            "Deliver a scheduled message immediately.",
+            post(routes::scheduled_messages::send_now),
             Authn::Bearer,
             sess_write(),
         )
@@ -778,6 +816,14 @@ fn build_api_routes() -> Routes {
             sess_read(),
         )
         .add(
+            &[Method::GET],
+            "/sessions/{id}/brief",
+            "Render a session's user/assistant transcript as a capped markdown brief.",
+            get(brief::session_brief),
+            Authn::Bearer,
+            sess_read(),
+        )
+        .add(
             &[Method::POST],
             "/sessions/{id}/fork",
             "Fork a session into a new one.",
@@ -822,6 +868,14 @@ fn build_api_routes() -> Routes {
             "/sessions/{id}/unpin",
             "Unpin a single session.",
             post(routes::sessions::unpin_session),
+            Authn::Bearer,
+            sess_write(),
+        )
+        .add(
+            &[Method::POST],
+            "/sessions/{id}/keepalive",
+            "Set or clear the session's prompt-cache keep-alive schedule.",
+            post(routes::sessions::set_keepalive),
             Authn::Bearer,
             sess_write(),
         )
@@ -1119,6 +1173,30 @@ fn build_api_routes() -> Routes {
             Authenticated,
         )
         .add(
+            &[GET],
+            "/accounts/{id}/usage/history",
+            "Sampled usage of one provider credential over time.",
+            get(routes::usage_history::account_usage_history),
+            Authn::Bearer,
+            Authenticated,
+        )
+        .add(
+            &[GET],
+            "/accounts/{id}/usage/closes",
+            "Closed usage windows of one provider credential, with unused share.",
+            get(routes::usage_history::account_usage_closes),
+            Authn::Bearer,
+            Authenticated,
+        )
+        .add(
+            &[GET],
+            "/accounts/usage/closes",
+            "Closed usage windows of every owned credential, with unused share.",
+            get(routes::usage_history::all_usage_closes),
+            Authn::Bearer,
+            Authenticated,
+        )
+        .add(
             &[Method::POST],
             "/accounts/{id}/limit-reset",
             "Claim a usage-limit reset on a provider credential.",
@@ -1324,6 +1402,22 @@ fn build_api_routes() -> Routes {
             "/admin/instance/self-update",
             "Read or set the machine + directory the self-update agent runs on (admin).",
             get(routes::instance::get_self_update_target).put(routes::instance::update_self_update_target),
+            Authn::Bearer,
+            ScopeAz(auth::Scope::Admin),
+        )
+        .add(
+            &[GET, Method::PUT],
+            "/admin/harness-autoupdate",
+            "Read the harness auto-update settings of every machine, or set the instance default (admin).",
+            get(routes::harness_update::read).put(routes::harness_update::set_instance),
+            Authn::Bearer,
+            ScopeAz(auth::Scope::Admin),
+        )
+        .add(
+            &[Method::PUT],
+            "/admin/harness-autoupdate/{machine_id}",
+            "Set or clear one machine's harness auto-update override (admin).",
+            put(routes::harness_update::set_machine),
             Authn::Bearer,
             ScopeAz(auth::Scope::Admin),
         )
@@ -1535,38 +1629,6 @@ fn init_dispatchers(config: &Config) -> Arc<dispatchers::Registry> {
     Arc::new(registry)
 }
 
-#[allow(clippy::cognitive_complexity)]
-/// Backstop for the usage-notice buckets the per-session drop can't reach: the
-/// auto-archive UPDATE above, a row deleted out from under us, or an entry this
-/// replica recorded for a session another replica ended.
-async fn sweep_usage_notice_buckets(state: &AppState) {
-    let sessions: std::collections::HashSet<String> =
-        state.usage_notice_buckets.iter().map(|e| e.key().0.clone()).collect();
-    if sessions.is_empty() {
-        return;
-    }
-    let ids: Vec<String> = sessions.into_iter().collect();
-    let live = match sqlx::query_scalar::<_, String>(concat!(
-        "SELECT id FROM sessions WHERE id = ANY($1) AND ",
-        live_sessions_predicate!(),
-        " AND status NOT IN ('archived', 'ended')"
-    ))
-    .bind(&ids)
-    .fetch_all(&state.pool)
-    .await
-    {
-        Ok(live) => live.into_iter().collect(),
-        Err(err) => {
-            tracing::warn!(%err, "usage notice bucket sweep failed");
-            return;
-        }
-    };
-    let dropped = state::sweep_usage_notice_buckets(&state.usage_notice_buckets, &live);
-    if dropped > 0 {
-        tracing::debug!(dropped, "swept usage notice buckets for dead sessions");
-    }
-}
-
 /// Auto-archive sessions silent past the TTL so the default list stays
 /// self-cleaning, asking the daemon to remove each underlying job. `0` disables.
 async fn auto_archive_stale(state: &AppState) {
@@ -1580,7 +1642,7 @@ async fn auto_archive_stale(state: &AppState) {
     match sqlx::query_scalar::<_, String>(
         // Drafts and queued spawns are not running: never auto-archive them.
         concat!(
-            "UPDATE sessions SET status = 'archived', \
+            "UPDATE sessions SET status = 'archived', archived_by = 'automatic', \
                  ended_at = COALESCE(ended_at, now()), \
                  end_reason = COALESCE(end_reason, 'reaped_inactive') \
              WHERE ",
@@ -1597,7 +1659,12 @@ async fn auto_archive_stale(state: &AppState) {
         Ok(ids) if !ids.is_empty() => {
             tracing::info!(count = ids.len(), "auto-archived stale sessions");
             for id in &ids {
-                crate::routes::sessions::dispatch_remove(state, id).await;
+                crate::routes::sessions::dispatch_remove(
+                    state,
+                    id,
+                    cctui_proto::adapter::RemoveInitiator::Automatic,
+                )
+                .await;
             }
         }
         Ok(_) => {}
@@ -1625,6 +1692,8 @@ async fn reaper_task(state: AppState) {
         auto_archive::sweep(&state).await;
         admission::drain(&state).await;
         spawn_labels::sweep(&state.pool).await;
+        usage_history::sweep(&state);
+        followup::sweep(&state.pool).await;
 
         // Soft-delete ephemeral (dispatch/worker) machines that have gone
         // quiet past the TTL — pods that died before self-deenroll.
@@ -1704,8 +1773,8 @@ async fn reaper_task(state: AppState) {
         // crash-coverage path the worker's REPLY_URL exit trap can miss.
         webhook::sweep(&state).await;
         auto_resume::sweep(&state).await;
-
-        sweep_usage_notice_buckets(&state).await;
+        scheduled_messages::sweep(&state).await;
+        keepalive::sweep(&state).await;
 
         state.permission_store.write().await.reap_stale(300); // seconds
     }

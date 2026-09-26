@@ -8,6 +8,7 @@
 	import { ws } from '$lib/ws.svelte';
 	import { m } from '$lib/paraglide/messages';
 	import { resolveTerminalFont, resolveTerminalBg, BUNDLED_TERMINAL_FONT } from './terminalFont';
+	import { fitScale, PHONE_QUERY } from './terminalFit';
 
 	// The daemon's held/viewer attach is fixed at 120x40 (ATTACH_COLS/ROWS); size
 	// the viewport to match so the geometry never fights the PTY.
@@ -18,8 +19,20 @@
 
 	let host = $state<HTMLDivElement | null>(null);
 	let live = $state(false);
+	let fit = $state<HTMLDivElement | null>(null);
+	let available = $state(0);
+	let natural = $state({ width: 0, height: 0 });
+	let phone = $state(false);
+	// On a phone the fixed 120-column frame is scaled down to the pane width
+	// rather than resized, so the daemon's attach geometry is untouched.
+	const scale = $derived(phone ? fitScale(available, natural.width) : 1);
+	const scaled = $derived(scale < 1);
 
 	onMount(() => {
+		const mq = window.matchMedia(PHONE_QUERY);
+		const onMq = () => (phone = mq.matches);
+		onMq();
+		mq.addEventListener('change', onMq);
 		let disposed = false;
 		let term: import('@xterm/xterm').Terminal | null = null;
 		let offPty: (() => void) | null = null;
@@ -54,6 +67,7 @@
 				theme: { background: resolveTerminalBg() }
 			});
 			term.open(host);
+			if (fit) natural = { width: fit.offsetWidth, height: fit.offsetHeight };
 			offPty = ws.onPty(sessionId, (bytes) => term?.write(bytes));
 			ws.watchPty(sessionId);
 			live = true;
@@ -62,6 +76,7 @@
 		return () => {
 			disposed = true;
 			live = false;
+			mq.removeEventListener('change', onMq);
 			offPty?.();
 			ws.unwatchPty(sessionId);
 			term?.dispose();
@@ -77,7 +92,17 @@
 		</span>
 		<button type="button" class="term-close" onclick={onclose} aria-label={m.conversation_terminal_close_aria()}>✕</button>
 	</div>
-	<div class="term-host" bind:this={host}></div>
+	<div class="term-host" bind:clientWidth={available}>
+		<div class="term-sizer" class:scaled style:height={scaled ? `${natural.height * scale}px` : undefined}>
+			<div
+				class="term-fit"
+				bind:this={fit}
+				style:transform={scaled ? `scale(${scale})` : undefined}
+			>
+				<div bind:this={host}></div>
+			</div>
+		</div>
+	</div>
 </div>
 
 <style>
@@ -123,7 +148,19 @@
 		font-size: var(--fs-sm);
 	}
 	.term-host {
-		padding: var(--sp-1);
 		overflow: auto;
+	}
+	.term-sizer.scaled {
+		overflow: hidden;
+	}
+	.term-fit {
+		display: inline-block;
+		padding: var(--sp-1);
+		transform-origin: top left;
+	}
+	@media (max-width: 959px) {
+		.term-host {
+			max-height: 50svh;
+		}
 	}
 </style>

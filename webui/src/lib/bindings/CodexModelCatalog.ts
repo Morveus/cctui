@@ -5,4 +5,8 @@ import type { CodexModel } from "./CodexModel";
  * The full machine/account-scoped model catalog, as reported by one
  * machine's `codex app-server`.
  */
-export type CodexModelCatalog = { models: Array<CodexModel>, };
+export type CodexModelCatalog = { models: Array<CodexModel>, 
+/**
+ * The `client_version` the catalog was read under; set on responses only.
+ */
+client_version?: string | null, };

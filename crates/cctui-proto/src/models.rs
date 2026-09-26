@@ -167,6 +167,9 @@ pub struct TokenUsage {
     pub cache_read_tokens: u64,
     #[serde(default)]
     pub cache_creation_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub cache_bust: Option<CacheBust>,
 }
 
 impl Default for TokenUsage {
@@ -177,8 +180,19 @@ impl Default for TokenUsage {
             cost_usd: 0.0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            cache_bust: None,
         }
     }
+}
+
+/// What a turn lost when its prompt cache did not match.
+/// `reason` is `ttl_expired` | `gateway_rewrote_body` | `unknown`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[ts(export)]
+pub struct CacheBust {
+    pub lost_tokens: u64,
+    pub lost_usd: f64,
+    pub reason: String,
 }
 
 /// `seq` is the `stream_events.id` insert sequence: the only stable address of

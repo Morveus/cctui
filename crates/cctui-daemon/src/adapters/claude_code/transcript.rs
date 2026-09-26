@@ -585,22 +585,34 @@ fn turn_annotation(local_id: &str, annotation: &str, detail: &str) -> AdapterEve
     }
 }
 
-/// Reminder attachments the harness injects on its own; they annotate nothing a
-/// reader wants to count.
-const REMINDER_ATTACHMENTS: &[&str] =
-    &["total_tokens_reminder", "task_reminder", "batching_reminder_sent"];
-
+/// `attachment` records are the harness's own per-turn bookkeeping (context
+/// rehydration, prompt snapshots, hook errors), never a user upload: a real
+/// upload arrives as an `image` block or an `Attached file(s):` prose block.
+/// Counted so the diagnose report still shows what the transcript carried.
+/// `queued_command` is the exception: a prompt absorbed into a running turn gets
+/// no `type:"user"` record at all, so this is the only copy of its body.
 fn attachment_annotation(local_id: &str, line: &Value, out: &mut Vec<AdapterEvent>) {
-    let att = line
-        .get("attachment")
-        .and_then(|a| a.get("type"))
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    if REMINDER_ATTACHMENTS.contains(&att) {
-        record_ignored(&format!("attachment/{att}"));
+    let att = line.get("attachment");
+    let kind =
+        att.and_then(|a| a.get("type")).and_then(Value::as_str).unwrap_or("unknown").to_owned();
+    if kind == "queued_command"
+        && let Some(att) = att
+        && let Some(prompt) =
+            first_str(att, &["prompt", "command", "text", "content"]).map(str::trim)
+        && !prompt.is_empty()
+    {
+        let mut payload =
+            json!({"role": "user", "text": prompt, "meta": user_text_is_meta(prompt)});
+        let id = first_str(att, &["source_uuid", "sourceUuid", "uuid"])
+            .or_else(|| first_str(line, &["uuid", "timestamp"]))
+            .filter(|s| !s.is_empty());
+        if let (Some(id), Some(obj)) = (id, payload.as_object_mut()) {
+            obj.insert("line_id".to_owned(), Value::String(id.to_owned()));
+        }
+        out.push(AdapterEvent::Message { local_id: local_id.to_owned(), payload, turn_id: None });
         return;
     }
-    out.push(turn_annotation(local_id, "attachment", att));
+    record_ignored(&format!("attachment/{kind}"));
 }
 
 fn file_history_detail(kind: &str, line: &Value) -> String {
@@ -722,19 +734,27 @@ fn session_state_marker(marker: &str, line: &Value) -> Option<Value> {
         }
         "queue-operation" => {
             let op = first_str(line, &["operation", "op", "action"]).unwrap_or("queue");
+            let reason = first_str(line, &["reason"]).unwrap_or_default();
             let verb = match op {
                 "enqueue" | "add" | "queued" => "queued",
-                "dequeue" | "remove" | "dequeued" => "dequeued",
+                "dequeue" | "dequeued" => "dequeued",
+                "remove" | "removed" if reason == "absorbed_mid_turn" => "absorbed",
+                "remove" | "removed" => "removed",
+                "popAll" | "clear" => "cleared",
                 other => other,
             };
-            let body = first_str(line, &["prompt", "text", "content", "value"])
-                .map(excerpt)
-                .unwrap_or_default();
+            let raw = first_str(line, &["prompt", "text", "content", "value"]).unwrap_or_default();
+            let body = excerpt(raw);
             let text = if body.is_empty() { verb.to_owned() } else { format!("{verb}: {body}") };
+            // The client correlates a queued prompt with its delivered user turn
+            // by first line, which `excerpt` truncates; carry it untruncated.
+            let queue_text = raw.trim().lines().next().unwrap_or_default().trim();
             json!({
                 "role": "system_marker",
                 "marker": marker,
                 "operation": verb,
+                "reason": reason,
+                "queue_text": queue_text,
                 "text": text,
             })
         }
@@ -2016,17 +2036,122 @@ mod tests {
     }
 
     #[test]
-    fn attachment_bodies_never_flow_through() {
+    fn queue_verbs_distinguish_remove_from_dequeue() {
+        let cases = [
+            ("enqueue", "queued"),
+            ("add", "queued"),
+            ("dequeue", "dequeued"),
+            ("remove", "removed"),
+            ("popAll", "cleared"),
+        ];
+        for (op, want) in cases {
+            let mut out = Vec::new();
+            parse_line(
+                "s",
+                &json!({"type":"queue-operation","operation":op,"prompt":"deploy the thing"}),
+                &mut out,
+            );
+            let msgs = message_payloads(&out);
+            assert_eq!(msgs.len(), 1, "{op}");
+            assert_eq!(msgs[0].get("operation").and_then(Value::as_str), Some(want), "{op}");
+        }
+    }
+
+    #[test]
+    fn a_remove_keeps_its_reason_and_absorbed_mid_turn_is_not_a_cancel() {
         let mut out = Vec::new();
         parse_line(
             "s",
-            &json!({"type":"attachment","attachment":{"type":"skill_listing","content":"huge blob"}}),
+            &json!({"type":"queue-operation","operation":"remove","reason":"absorbed_mid_turn","prompt":"ship it"}),
+            &mut out,
+        );
+        let msgs = message_payloads(&out);
+        assert_eq!(msgs[0].get("operation").and_then(Value::as_str), Some("absorbed"));
+        assert_eq!(msgs[0].get("reason").and_then(Value::as_str), Some("absorbed_mid_turn"));
+
+        let mut out = Vec::new();
+        parse_line(
+            "s",
+            &json!({"type":"queue-operation","operation":"remove","reason":"user_cancelled","prompt":"ship it"}),
+            &mut out,
+        );
+        let msgs = message_payloads(&out);
+        assert_eq!(msgs[0].get("operation").and_then(Value::as_str), Some("removed"));
+        assert_eq!(msgs[0].get("reason").and_then(Value::as_str), Some("user_cancelled"));
+    }
+
+    #[test]
+    fn a_queued_command_attachment_becomes_a_user_event() {
+        let mut out = Vec::new();
+        parse_line(
+            "s",
+            &json!({"type":"attachment","attachment":{
+                "type":"queued_command",
+                "source_uuid":"6cf018f9",
+                "prompt":"just testing\n\nAttached file:\n- /tmp/cctui-uploads/s/paste-1-2.txt"
+            }}),
             &mut out,
         );
         let msgs = message_payloads(&out);
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].get("text").and_then(Value::as_str), Some("attachment:skill_listing"));
-        assert!(msgs[0].get("content").is_none(), "attachment body must not flow through");
+        assert_eq!(msgs[0].get("role").and_then(Value::as_str), Some("user"));
+        assert_eq!(msgs[0].get("line_id").and_then(Value::as_str), Some("6cf018f9"));
+        let text = msgs[0].get("text").and_then(Value::as_str).unwrap();
+        assert!(text.starts_with("just testing"));
+        assert!(text.contains("paste-1-2.txt"), "the staged-path block survives: {text}");
+    }
+
+    #[test]
+    fn a_bodiless_queued_command_attachment_is_still_dropped() {
+        let mut out = Vec::new();
+        parse_line(
+            "s",
+            &json!({"type":"attachment","attachment":{"type":"queued_command","prompt":"  "}}),
+            &mut out,
+        );
+        assert!(out.is_empty());
+        assert!(tally_for("ignored:attachment/queued_command") >= 1);
+    }
+
+    #[test]
+    fn queue_operations_carry_the_untruncated_first_line() {
+        let first = "x".repeat(200);
+        let mut out = Vec::new();
+        parse_line(
+            "s",
+            &json!({"type":"queue-operation","operation":"enqueue","prompt":format!("{first}\nsecond line")}),
+            &mut out,
+        );
+        let msgs = message_payloads(&out);
+        let queue_text = msgs[0].get("queue_text").and_then(Value::as_str).unwrap();
+        assert_eq!(queue_text, first, "queue_text keeps the whole first line");
+        let text = msgs[0].get("text").and_then(Value::as_str).unwrap();
+        assert!(text.starts_with("queued: "), "the legacy excerpt stays: {text}");
+        assert!(text.chars().count() < queue_text.chars().count(), "excerpt is still truncated");
+    }
+
+    #[test]
+    fn a_bodiless_queue_operation_carries_an_empty_queue_text() {
+        let mut out = Vec::new();
+        parse_line("s", &json!({"type":"queue-operation","operation":"dequeue"}), &mut out);
+        let msgs = message_payloads(&out);
+        assert_eq!(msgs[0].get("queue_text").and_then(Value::as_str), Some(""));
+        assert_eq!(msgs[0].get("text").and_then(Value::as_str), Some("dequeued"));
+    }
+
+    #[test]
+    fn attachment_records_are_dropped_and_counted() {
+        for subtype in ["skill_listing", "prompt_snapshot", "environment", "total_tokens_reminder"]
+        {
+            let mut out = Vec::new();
+            parse_line(
+                "s",
+                &json!({"type":"attachment","attachment":{"type":subtype,"content":"huge blob"}}),
+                &mut out,
+            );
+            assert!(out.is_empty(), "{subtype} must emit nothing");
+            assert!(tally_for(&format!("ignored:attachment/{subtype}")) >= 1, "{subtype} counted");
+        }
     }
 
     #[test]
@@ -2165,10 +2290,6 @@ mod tests {
     fn turn_bookkeeping_becomes_annotations_on_the_owning_turn() {
         let cases = [
             (
-                json!({"type":"attachment","attachment":{"type":"prompt_snapshot"}}),
-                "attachment:prompt_snapshot",
-            ),
-            (
                 json!({"type":"system","subtype":"turn_duration","durationMs":1200}),
                 "turn_duration:1200",
             ),
@@ -2196,16 +2317,6 @@ mod tests {
                 "{line} must not be a timeline bubble"
             );
             assert_eq!(msgs[0].get("text").and_then(Value::as_str), Some(*want), "{line}");
-        }
-    }
-
-    #[test]
-    fn reminder_attachments_are_dropped_outright() {
-        for subtype in REMINDER_ATTACHMENTS {
-            let mut out = Vec::new();
-            parse_line("s", &json!({"type":"attachment","attachment":{"type":subtype}}), &mut out);
-            assert!(out.is_empty(), "{subtype} must emit nothing");
-            assert!(tally_for(&format!("ignored:attachment/{subtype}")) >= 1, "{subtype} counted");
         }
     }
 

@@ -11,6 +11,7 @@
 	import TokenWindows from './TokenWindows.svelte';
 	import OverviewTiles from './OverviewTiles.svelte';
 	import UsageCharts from './UsageCharts.svelte';
+	import WindowHistory from './WindowHistory.svelte';
 	import { m } from '$lib/paraglide/messages';
 
 	// The stats panel pinned to one edge of the Sessions screen (Settings ›
@@ -47,6 +48,7 @@
 		{ key: 'accounts', title: () => m.stats_dock_accounts(), open: true },
 		{ key: 'tokens', title: () => m.home_token_usage(), open: true },
 		{ key: 'overview', title: () => m.home_overview_title(), open: true },
+		{ key: 'history', title: () => m.stats_dock_window_history(), open: false },
 		{ key: 'usage', title: () => m.home_usage_title(), open: false }
 	];
 </script>
@@ -98,6 +100,8 @@
 						<TokenWindows />
 					{:else if s.key === 'overview'}
 						<OverviewTiles />
+					{:else if s.key === 'history'}
+						<WindowHistory />
 					{:else}
 						<UsageCharts />
 					{/if}

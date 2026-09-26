@@ -9,7 +9,7 @@ import { toasts } from '$lib/toast.svelte';
 // machine-scoped read-file route; the response's content type decides what
 // happens: images and text/markdown open in an overlay, anything else is
 // downloaded. Refusals (too large, outside the allow-list, daemon offline)
-// surface as a toast instead of a bare error page.
+// surface next to the link instead of navigating the tab to the API's body.
 let installed = false;
 
 export function installFileViewer(): void {
@@ -24,8 +24,46 @@ export function installFileViewer(): void {
 		if (!href) return;
 		e.preventDefault();
 		e.stopPropagation();
-		void openLocalFile(href, link.dataset.fileName ?? link.textContent ?? 'file');
+		const name = link.dataset.fileName ?? link.textContent ?? 'file';
+		void attemptOpen(href, name).then((refusal) => {
+			const text = refusal
+				? refusalMessage(refusal.status, name, 'machine', refusal.detail)
+				: null;
+			showInlineRefusal(link, text);
+		});
 	});
+}
+
+/** Put `text` in the link's own refusal slot, or clear it when `text` is null,
+ * so a retry that succeeds takes the message away with it. */
+function showInlineRefusal(link: HTMLAnchorElement, text: string | null): void {
+	const existing = link.nextElementSibling;
+	if (existing?.classList.contains('md-file-error')) existing.remove();
+	if (!text) return;
+	const span = document.createElement('span');
+	span.className = 'md-file-error';
+	span.setAttribute('role', 'status');
+	span.textContent = text;
+	link.after(span);
+}
+
+/** A read the route refused: the HTTP status (`0` for a network failure) and
+ * the server's `{"error": …}` body, which for a denial names the roots the
+ * path was checked against. */
+export interface Refusal {
+	status: number;
+	detail: string;
+}
+
+/** The roots a denial was checked against, as the daemon listed them. */
+export function deniedRoots(detail: string): string[] {
+	const at = detail.indexOf('allowed roots:');
+	if (at < 0) return [];
+	return detail
+		.slice(at + 'allowed roots:'.length)
+		.split(',')
+		.map((r) => r.trim())
+		.filter(Boolean);
 }
 
 export type FileKind = 'image' | 'text' | 'markdown' | 'download';
@@ -47,12 +85,14 @@ export function classify(contentType: string | null): FileKind {
  */
 export type FileSource = 'machine' | 'blob';
 
-/** Toast text for a refused read, by HTTP status and route. */
+/** User-facing text for a refused read, by HTTP status and route. */
 export function refusalMessage(
 	status: number,
 	name: string,
-	source: FileSource = 'machine'
+	source: FileSource = 'machine',
+	detail = ''
 ): string {
+	if (status === 0) return m.conversation_file_open_failed({ name, status: 'network' });
 	if (source === 'blob') {
 		return status === 404
 			? m.conversation_attachment_gone({ name })
@@ -61,8 +101,12 @@ export function refusalMessage(
 	switch (status) {
 		case 413:
 			return m.conversation_file_too_large({ name });
-		case 403:
-			return m.conversation_file_denied({ name });
+		case 403: {
+			const roots = deniedRoots(detail);
+			return roots.length
+				? m.conversation_file_denied_roots({ name, roots: roots.join(', ') })
+				: m.conversation_file_denied({ name });
+		}
 		case 404:
 			return m.conversation_file_not_found({ name });
 		case 503:
@@ -74,23 +118,39 @@ export function refusalMessage(
 }
 
 /**
- * Open `href`, returning `null` on success and the HTTP status (`0` for a
- * network failure) on refusal — without toasting, so a caller with a fallback
- * chain can try the next source before saying anything.
+ * [`attemptOpen`] reduced to the status, for a caller with a fallback chain
+ * that only needs to know whether to try the next source.
  */
 export async function tryOpenLocalFile(
 	href: string,
 	name: string
 ): Promise<number | null> {
+	return (await attemptOpen(href, name))?.status ?? null;
+}
+
+/** Open `href`, returning `null` on success and the [`Refusal`] otherwise —
+ * without surfacing anything, so the caller decides between a fallback source,
+ * a toast and an inline message. */
+export async function attemptOpen(href: string, name: string): Promise<Refusal | null> {
 	let res: Response;
 	try {
 		res = await fetch(href, { credentials: 'same-origin' });
 	} catch {
-		return 0;
+		return { status: 0, detail: '' };
 	}
-	if (!res.ok) return res.status;
+	if (!res.ok) return { status: res.status, detail: await errorDetail(res) };
 	await present(res, name);
 	return null;
+}
+
+async function errorDetail(res: Response): Promise<string> {
+	try {
+		const body: unknown = await res.json();
+		const err = (body as { error?: unknown }).error;
+		return typeof err === 'string' ? err : '';
+	} catch {
+		return '';
+	}
 }
 
 export async function openLocalFile(
@@ -98,12 +158,8 @@ export async function openLocalFile(
 	name: string,
 	source: FileSource = 'machine'
 ): Promise<void> {
-	const status = await tryOpenLocalFile(href, name);
-	if (status === 0) {
-		toasts.error(m.conversation_file_open_failed({ name, status: 'network' }));
-	} else if (status !== null) {
-		toasts.error(refusalMessage(status, name, source));
-	}
+	const refusal = await attemptOpen(href, name);
+	if (refusal) toasts.error(refusalMessage(refusal.status, name, source, refusal.detail));
 }
 
 async function present(res: Response, name: string): Promise<void> {

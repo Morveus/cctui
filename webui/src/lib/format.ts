@@ -120,3 +120,14 @@ export function hashHue(s: string): number {
 	for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
 	return h % 360;
 }
+
+/** Inline machine tint: the theme supplies only `<sat%> <light%>` pairs, so the
+ *  hue has to be set on the same element that reads them. */
+export function machineTint(label: string, hue?: number | null): string {
+	return (
+		`--mh:${hue ?? hashHue(label)};` +
+		'background:hsl(var(--mh) var(--mach-bg-sl));' +
+		'color:hsl(var(--mh) var(--mach-fg-sl));' +
+		'border-color:hsl(var(--mh) var(--mach-border-sl))'
+	);
+}
